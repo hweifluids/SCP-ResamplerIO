@@ -84,10 +84,6 @@ auto bounds = streamcenterplus::resample::ReadDataSetBounds(frames.at(0));
 
 `examples/smoke` provides no-argument Windows and Linux entrypoints. It consumes the published private `SCP-examples/hemi_resampled` dataset and independently reads all 20 frames to check geometry, `Velocity(float3)`, the valid-point mask, time ordering, PVD references, and JSON syntax. The integrated superproject uses its `examples/SCP-examples` submodule; detached use resolves a sibling checkout or an authenticated private `smoke-data-v1` Release download.
 
-Only `SCP-examples` uses Git LFS. This repository uses ordinary Git and writes its prepared smoke copy only to the fixed ignored `.tests/smoke/SCP-ResamplerIO/data` path. The original 1,000-frame Nek5000 sequence is maintainer-only provenance and is not required on a target machine.
+The smoke runner writes its prepared data only to the fixed ignored `.tests/smoke/SCP-ResamplerIO/data` path. The original 1,000-frame Nek5000 sequence is maintainer-only provenance and is not required on a target machine.
 
 The no-argument CTest integration target `SCPResamplerIO.Nek5000Integration` separately exercises the generic adapter and solver on advertised source frames 490 and 491 with a small `16 x 8 x 6` grid. Its output is fixed at `.tests/integration/SCP-ResamplerIO/nek5000-general-adapter`. The test is reported as skipped when the fixed source dataset is not available; it never writes into the source or release trees.
-
-## License
-
-`LICENSE` is an intentionally empty placeholder until the repository license is selected.

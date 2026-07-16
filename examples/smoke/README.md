@@ -22,17 +22,15 @@ Linux:
 bash ./examples/smoke/run.sh
 ```
 
-The private `hweifluids/SCP-examples` repository versions the dataset under
-`hemi_resampled/`; only its 20 VTI payloads use Git LFS. In the Streamcenter+
-superproject the runner uses `examples/SCP-examples`. A detached
+In the Streamcenter+ superproject the runner uses
+`examples/SCP-examples/hemi_resampled`. A detached
 `SCP-ResamplerIO` checkout uses a sibling `SCP-examples` checkout when present.
-If neither exists, authenticated GitHub CLI downloads and verifies the private
+If neither exists, authenticated GitHub CLI downloads the private
 `smoke-data-v1` Release ZIP.
 
 Prepared test data is copied to the fixed ignored path
 `.tests/smoke/SCP-ResamplerIO/data` at the superproject root, or to the same
-relative path below the detached module. No dependency, data, build, or output
-path parameter is accepted, and no project environment variable is required.
+relative path below the detached module.
 
 The original 1,000-frame Nek5000 sequence is maintainer-only source provenance;
 it is not needed by this portable smoke test. The `scp_nek5000_smoke` generator

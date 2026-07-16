@@ -1,0 +1,48 @@
+{
+  "schema": "streamcenterplus.smoke_dataset.v1",
+  "status": "published",
+  "repository": "hweifluids/SCP-examples",
+  "release_tag": "smoke-data-v1",
+  "data_subdirectory": "hemi_resampled",
+  "asset_name": "scp-hemisphere-re1370-f0490-f0509-250x80x50.zip",
+  "url": "https://github.com/hweifluids/SCP-examples/releases/download/smoke-data-v1/scp-hemisphere-re1370-f0490-f0509-250x80x50.zip",
+  "sha256": "cc25abb0ed9ca5a0875b8145b642f108aa5caed5c1b875a2b9aec41009cd7c3b",
+  "manifest_sha256": "df825431348cd4693400e0ed343cc7b314d7c256221b5c156c7b7acb776d03e9",
+  "collection_sha256": "764ba970e96262da4521b4741512eaac5a5876107e6f24eb3413fb6bc975b364",
+  "archive_bytes": 213953250,
+  "source_provenance": "Z:/Hemisphere/5_Results/2_Re1370/260614_HM1370_500_550_N1000",
+  "source_format": "Nek5000",
+  "source_descriptor": "hemi.nek5000",
+  "source_frame_indices": [490, 509],
+  "source_frame_count": 20,
+  "source_time_range": [524.5499999911, 525.499999991],
+  "physical_dt": 0.05,
+  "target_format": "VTK XML ImageData + PVD",
+  "target_dimensions": [250, 80, 50],
+  "target_bounds": [
+    -3.470588207244873,
+    12.45714282989502,
+    -2.858823537826538,
+    2.858823537826538,
+    0.0,
+    3.418181896209717
+  ],
+  "target_origin": [
+    -3.470588207244873,
+    -2.858823537826538,
+    0.0
+  ],
+  "target_spacing": [
+    0.0639667913138148,
+    0.0723752794386465,
+    0.0697588142083616
+  ],
+  "required_point_arrays": {
+    "Velocity": {"components": 3, "type": "float32"},
+    "vtkValidPointMask": {"components": 1, "type": "int8"}
+  },
+  "required_field_arrays": ["TimeValue"],
+  "valid_point_count_per_frame": 993170,
+  "point_count_per_frame": 1000000,
+  "archive_layout": "The archive root contains exactly 20 chronological VTI frames, hemisphere_re1370_250x80x50.pvd, and dataset.json."
+}

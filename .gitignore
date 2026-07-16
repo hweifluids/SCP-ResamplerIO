@@ -1,0 +1,12 @@
+.build/
+.deps/
+.tests/
+release/
+vcpkg_installed/
+build/
+codexlog/
+CMakeUserPresets.json
+.vs/
+.vscode/
+*.user
+*.suo

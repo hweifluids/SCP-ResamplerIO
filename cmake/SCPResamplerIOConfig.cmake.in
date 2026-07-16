@@ -1,0 +1,28 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(NOT TARGET SCP::SolverSDK)
+  find_dependency(SCPSolverSDK CONFIG)
+endif()
+if(NOT TARGET Qt6::Core)
+  find_dependency(Qt6 6.5 COMPONENTS Core)
+endif()
+set(_scp_resampler_io_vtk_components @SCP_RESAMPLER_IO_VTK_COMPONENTS@)
+set(_scp_resampler_io_needs_vtk FALSE)
+foreach(_scp_resampler_io_component IN LISTS _scp_resampler_io_vtk_components)
+  if(NOT TARGET "VTK::${_scp_resampler_io_component}")
+    set(_scp_resampler_io_needs_vtk TRUE)
+    break()
+  endif()
+endforeach()
+if(_scp_resampler_io_needs_vtk)
+  find_dependency(VTK CONFIG COMPONENTS @SCP_RESAMPLER_IO_VTK_COMPONENTS@)
+endif()
+unset(_scp_resampler_io_component)
+unset(_scp_resampler_io_needs_vtk)
+unset(_scp_resampler_io_vtk_components)
+
+include("${CMAKE_CURRENT_LIST_DIR}/SCPResamplerIOTargets.cmake")
+
+check_required_components(SCPResamplerIO)

@@ -1,5 +1,7 @@
 #include "streamcenterplus_resample/Core.h"
+#include "streamcenterplus/io/DataSetReader.h"
 
+#include <vtkAbstractArray.h>
 #include <vtkCellData.h>
 #include <vtkBox.h>
 #include <vtkCharArray.h>
@@ -12,6 +14,7 @@
 #include <vtkIdList.h>
 #include <vtkImageData.h>
 #include <vtkMultiThreader.h>
+#include <vtkNew.h>
 #include <vtkPointSet.h>
 #include <vtkPointData.h>
 #include <vtkPointInterpolator.h>
@@ -570,10 +573,12 @@ vtkSmartPointer<vtkDataSet> ApplyInputDomainTransform(vtkDataSet* preparedInput,
 
     vtkSmartPointer<vtkDataSet> working = preparedInput;
     const bool needsPointSetForScale = scaleInput && vtkPointSet::SafeDownCast(working) == nullptr;
+    const bool spectralNek =
+        streamcenterplus::io::HasNek5000SpectralMetadata(working);
     const bool shouldClipInput =
-        (params.method != InterpolationMethod::VtkResampleToImage &&
+        (!spectralNek && params.method != InterpolationMethod::VtkResampleToImage &&
          (cropInput || vtkPointSet::SafeDownCast(working) == nullptr)) ||
-        needsPointSetForScale;
+        (!spectralNek && needsPointSetForScale);
     if (shouldClipInput) {
         const std::array<double, 6> cropBounds = ResolveCropBounds(params, inputBounds);
         working = ClipDataSetToBounds(working, params, cropBounds);
@@ -656,6 +661,18 @@ ImageStats MarkGhostArrays(vtkImageData* image, const std::vector<unsigned char>
     if (static_cast<vtkIdType>(validMask.size()) != pointCount) {
         throw std::runtime_error("Internal error: valid mask size does not match image point count.");
     }
+
+    image->GetPointData()->RemoveArray(kValidPointMaskName);
+    auto pointMask = vtkSmartPointer<vtkCharArray>::New();
+    pointMask->SetName(kValidPointMaskName);
+    pointMask->SetNumberOfComponents(1);
+    pointMask->SetNumberOfTuples(pointCount);
+    for (vtkIdType pointId = 0; pointId < pointCount; ++pointId) {
+        pointMask->SetValue(
+            pointId,
+            validMask[static_cast<std::size_t>(pointId)] != 0 ? 1 : 0);
+    }
+    image->GetPointData()->AddArray(pointMask);
 
     image->GetPointData()->RemoveArray(vtkDataSetAttributes::GhostArrayName());
     auto pointGhost = vtkSmartPointer<vtkUnsignedCharArray>::New();
@@ -880,7 +897,9 @@ bool IsInterpolatableArray(vtkDataArray* array) {
         return false;
     }
     const std::string name = array->GetName();
-    return name != vtkDataSetAttributes::GhostArrayName() && name != kValidPointMaskName;
+    return name != vtkDataSetAttributes::GhostArrayName() &&
+           name != kValidPointMaskName &&
+           name.rfind("SCP_Nek5000", 0) != 0;
 }
 
 std::vector<SourceArray> PrepareOutputArrays(vtkPointData* sourcePointData,
@@ -910,6 +929,97 @@ std::vector<SourceArray> PrepareOutputArrays(vtkPointData* sourcePointData,
         arrays.push_back({inputArray, outputArray});
     }
     return arrays;
+}
+
+void CopyNonSpectralFieldData(vtkDataSet* source, vtkDataSet* target) {
+    if (source == nullptr || target == nullptr || source->GetFieldData() == nullptr ||
+        target->GetFieldData() == nullptr) {
+        return;
+    }
+    target->GetFieldData()->Initialize();
+    vtkFieldData* fieldData = source->GetFieldData();
+    for (int i = 0; i < fieldData->GetNumberOfArrays(); ++i) {
+        vtkAbstractArray* array = fieldData->GetAbstractArray(i);
+        const std::string name =
+            array == nullptr || array->GetName() == nullptr
+                ? std::string()
+                : std::string(array->GetName());
+        if (array != nullptr && name.rfind("SCP_Nek5000", 0) != 0) {
+            target->GetFieldData()->AddArray(array);
+        }
+    }
+}
+
+vtkSmartPointer<vtkImageData> ResampleNek5000Spectral(
+    vtkDataSet* preparedInput,
+    const Parameters& params,
+    const std::array<double, 6>& bounds) {
+    vtkSmartPointer<vtkImageData> output = CreateTargetImage(params, bounds);
+    CopyNonSpectralFieldData(preparedInput, output);
+
+    const vtkIdType outputPointCount = output->GetNumberOfPoints();
+    std::vector<SourceArray> arrays =
+        PrepareOutputArrays(preparedInput->GetPointData(), output->GetPointData(),
+                            outputPointCount, 0.0);
+    std::size_t totalComponents = 0;
+    for (const SourceArray& array : arrays) {
+        totalComponents +=
+            static_cast<std::size_t>(array.input->GetNumberOfComponents());
+    }
+    if (totalComponents > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(
+            "Nek5000 source has too many point-array components to interpolate.");
+    }
+
+    std::vector<unsigned char> validMask(
+        static_cast<std::size_t>(outputPointCount), 0);
+    if (totalComponents == 0) {
+        MarkGhostArrays(output, validMask);
+        return output;
+    }
+
+    vtkNew<vtkDoubleArray> packed;
+    packed->SetName("SCP_Nek5000PackedInterpolationInput");
+    packed->SetNumberOfComponents(static_cast<int>(totalComponents));
+    packed->SetNumberOfTuples(preparedInput->GetNumberOfPoints());
+    for (vtkIdType pointId = 0; pointId < preparedInput->GetNumberOfPoints();
+         ++pointId) {
+        int packedComponent = 0;
+        for (const SourceArray& array : arrays) {
+            for (int component = 0;
+                 component < array.input->GetNumberOfComponents(); ++component) {
+                packed->SetComponent(pointId, packedComponent++,
+                                     array.input->GetComponent(pointId, component));
+            }
+        }
+    }
+
+    streamcenterplus::io::Nek5000SpectralPointEvaluator evaluator(
+        preparedInput, packed);
+    vtkSMPTools::For(
+        static_cast<vtkIdType>(0), outputPointCount,
+        [&](vtkIdType begin, vtkIdType end) {
+            std::vector<double> tuple(totalComponents, 0.0);
+            int elementHint = -1;
+            double point[3] = {};
+            for (vtkIdType pointId = begin; pointId < end; ++pointId) {
+                output->GetPoint(pointId, point);
+                if (!evaluator.Evaluate(point, tuple.data(), &elementHint)) {
+                    continue;
+                }
+                validMask[static_cast<std::size_t>(pointId)] = 1;
+                std::size_t packedComponent = 0;
+                for (const SourceArray& array : arrays) {
+                    const int components = array.input->GetNumberOfComponents();
+                    for (int component = 0; component < components; ++component) {
+                        array.output->SetComponent(
+                            pointId, component, tuple[packedComponent++]);
+                    }
+                }
+            }
+        });
+    MarkGhostArrays(output, validMask);
+    return output;
 }
 
 double SquaredDistance(vtkDataSet* dataSet, vtkIdType pointId, const double point[3]) {
@@ -1576,6 +1686,10 @@ vtkSmartPointer<vtkImageData> ResampleFrame(vtkDataSet* preparedInput,
         throw std::runtime_error("Internal error: null prepared input.");
     }
     EnsureVtkSmpConfigured();
+    if (streamcenterplus::io::HasNek5000SpectralMetadata(preparedInput)) {
+        (void)streamcenterplus::io::GetNek5000SpectralMetadata(preparedInput);
+        return ResampleNek5000Spectral(preparedInput, params, bounds);
+    }
     switch (params.method) {
     case InterpolationMethod::Linear:
         return ResampleLinear(preparedInput, params, bounds);

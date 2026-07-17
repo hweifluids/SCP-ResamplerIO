@@ -1,4 +1,5 @@
 #include "streamcenterplus_resample/Core.h"
+#include <streamcenterplus/io/DataSetReader.h>
 #include <streamcenterplus/VtkHdfIO.h>
 
 #include <vtkCellData.h>
@@ -11,11 +12,8 @@
 #include <vtkFieldData.h>
 #include <vtkGenericDataObjectReader.h>
 #include <vtkImageData.h>
-#include <vtkInformation.h>
-#include <vtkNek5000Reader.h>
 #include <vtkPointData.h>
 #include <vtkSmartPointer.h>
-#include <vtkStreamingDemandDrivenPipeline.h>
 #include <vtkXMLGenericDataObjectReader.h>
 #include <vtkXMLImageDataWriter.h>
 
@@ -47,43 +45,47 @@ bool IsSupportedDataFile(const std::filesystem::path& path) {
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(path));
     return ext == ".vtk" || ext == ".vti" || ext == ".vtr" ||
            ext == ".vts" || ext == ".vtu" || ext == ".vtp" ||
-           ext == ".vtkhdf" || ext == ".nek5000";
+           ext == ".vtkhdf" || ext == ".nek5000" || ext == ".nek" ||
+           ext == ".case" || ext == ".foam";
 }
 
-std::vector<double> Nek5000TimeSteps(const std::filesystem::path& descriptor) {
-    if (!std::filesystem::is_regular_file(descriptor)) {
-        throw std::runtime_error("Nek5000 descriptor does not exist: " + descriptor.string());
+DataSetFrameKind FromIoFrameKind(streamcenterplus::io::DataSetFrameKind kind) {
+    switch (kind) {
+    case streamcenterplus::io::DataSetFrameKind::File:
+        return DataSetFrameKind::File;
+    case streamcenterplus::io::DataSetFrameKind::Nek5000TimeStep:
+        return DataSetFrameKind::Nek5000TimeStep;
+    case streamcenterplus::io::DataSetFrameKind::EnSightGoldTimeStep:
+        return DataSetFrameKind::EnSightGoldTimeStep;
+    case streamcenterplus::io::DataSetFrameKind::OpenFoamTimeStep:
+        return DataSetFrameKind::OpenFoamTimeStep;
     }
+    throw std::runtime_error("Unknown shared dataset frame kind.");
+}
 
-    auto reader = vtkSmartPointer<vtkNek5000Reader>::New();
-    reader->SetFileName(descriptor.string().c_str());
-    reader->SetCleanGrid(0);
-    reader->UpdateInformation();
-
-    vtkInformation* information = reader->GetOutputInformation(0);
-    auto* timeStepsKey = vtkStreamingDemandDrivenPipeline::TIME_STEPS();
-    if (information == nullptr || !information->Has(timeStepsKey)) {
-        throw std::runtime_error("Nek5000 descriptor does not advertise VTK time steps: " +
-                                 descriptor.string());
+streamcenterplus::io::DataSetFrame ToIoFrame(const FrameInfo& frame) {
+    streamcenterplus::io::DataSetFrame out;
+    out.path = frame.path;
+    out.time = frame.time;
+    out.readerTime = frame.readerTime;
+    out.coordinatePath = frame.coordinatePath;
+    out.sourceIndex = frame.sourceIndex;
+    out.coordinateSourceIndex = frame.coordinateSourceIndex;
+    switch (frame.kind) {
+    case DataSetFrameKind::File:
+        out.kind = streamcenterplus::io::DataSetFrameKind::File;
+        break;
+    case DataSetFrameKind::Nek5000TimeStep:
+        out.kind = streamcenterplus::io::DataSetFrameKind::Nek5000TimeStep;
+        break;
+    case DataSetFrameKind::EnSightGoldTimeStep:
+        out.kind = streamcenterplus::io::DataSetFrameKind::EnSightGoldTimeStep;
+        break;
+    case DataSetFrameKind::OpenFoamTimeStep:
+        out.kind = streamcenterplus::io::DataSetFrameKind::OpenFoamTimeStep;
+        break;
     }
-
-    const int count = information->Length(timeStepsKey);
-    if (count <= 0) {
-        throw std::runtime_error("Nek5000 descriptor advertises an empty time sequence: " +
-                                 descriptor.string());
-    }
-
-    std::vector<double> times;
-    times.reserve(static_cast<std::size_t>(count));
-    for (int index = 0; index < count; ++index) {
-        const double value = information->Get(timeStepsKey, index);
-        if (!std::isfinite(value)) {
-            throw std::runtime_error("Nek5000 descriptor advertises a non-finite time step at index " +
-                                     std::to_string(index) + ": " + descriptor.string());
-        }
-        times.push_back(value);
-    }
-    return times;
+    return out;
 }
 
 std::string XmlEscape(const std::string& value) {
@@ -277,35 +279,6 @@ vtkSmartPointer<vtkDataSet> RetainDataSet(vtkDataObject* dataObject,
     return retained;
 }
 
-vtkSmartPointer<vtkDataSet> ReadNek5000Frame(const FrameInfo& frame,
-                                             bool readPointArrays) {
-    if (ToLower(streamcenterplus::vtkhdf::Extension(frame.path)) != ".nek5000") {
-        throw std::runtime_error("Nek5000 frame source must be a .nek5000 descriptor: " +
-                                 frame.path.string());
-    }
-    if (!frame.readerTime.has_value() || !std::isfinite(*frame.readerTime)) {
-        throw std::runtime_error("Nek5000 frame is missing a finite reader time: " +
-                                 frame.path.string());
-    }
-
-    auto reader = vtkSmartPointer<vtkNek5000Reader>::New();
-    reader->SetFileName(frame.path.string().c_str());
-    reader->SetCleanGrid(0);
-    reader->UpdateInformation();
-    if (readPointArrays) {
-        reader->EnableAllPointArrays();
-    } else {
-        reader->DisableAllPointArrays();
-    }
-    if (reader->UpdateTimeStep(*frame.readerTime) == 0) {
-        std::ostringstream message;
-        message << "VTK failed to read Nek5000 time " << std::setprecision(17)
-                << *frame.readerTime << " from " << frame.path.string();
-        throw std::runtime_error(message.str());
-    }
-    return RetainDataSet(reader->GetOutputDataObject(0), frame.path);
-}
-
 void ExpandBounds(const double frameBounds[6], std::array<double, 6>* bounds, bool* initialized) {
     if (!IsFiniteBounds(frameBounds)) {
         throw std::runtime_error("Input data has invalid bounds.");
@@ -375,41 +348,20 @@ void ApplyFrameRange(const Parameters& params, std::vector<FrameInfo>* frames) {
 
 std::vector<FrameInfo> EnumerateDataSetFrames(const std::filesystem::path& sourcePath,
                                               double physicalDt) {
-    if (!std::isfinite(physicalDt) || physicalDt <= 0.0) {
-        throw std::runtime_error("Physical time step must be positive while enumerating dataset frames.");
-    }
-    if (!std::filesystem::is_regular_file(sourcePath)) {
-        throw std::runtime_error("Dataset source does not exist: " + sourcePath.string());
-    }
-
-    const std::string extension = ToLower(streamcenterplus::vtkhdf::Extension(sourcePath));
-    if (extension == ".nek5000") {
-        const std::vector<double> times = Nek5000TimeSteps(sourcePath);
-        std::vector<FrameInfo> frames;
-        frames.reserve(times.size());
-        for (const double time : times) {
-            FrameInfo frame{sourcePath, time};
-            frame.kind = DataSetFrameKind::Nek5000TimeStep;
-            frame.readerTime = time;
-            frames.push_back(std::move(frame));
-        }
-        return frames;
-    }
-
-    if (!IsSupportedDataFile(sourcePath)) {
-        throw std::runtime_error("Unsupported dataset source extension: " + sourcePath.string());
-    }
-    const std::vector<std::filesystem::path> expanded =
-        streamcenterplus::vtkhdf::ExpandTimeSteps(sourcePath);
-    if (expanded.empty()) {
-        throw std::runtime_error("Dataset source does not advertise any readable frames: " +
-                                 sourcePath.string());
-    }
-
+    const std::vector<streamcenterplus::io::DataSetFrame> sharedFrames =
+        streamcenterplus::io::EnumerateDataSetFrames(sourcePath, physicalDt);
     std::vector<FrameInfo> frames;
-    frames.reserve(expanded.size());
-    for (std::size_t index = 0; index < expanded.size(); ++index) {
-        frames.push_back({expanded[index], static_cast<double>(index) * physicalDt});
+    frames.reserve(sharedFrames.size());
+    for (const auto& shared : sharedFrames) {
+        FrameInfo frame;
+        frame.path = shared.path;
+        frame.time = shared.time;
+        frame.kind = FromIoFrameKind(shared.kind);
+        frame.readerTime = shared.readerTime;
+        frame.coordinatePath = shared.coordinatePath;
+        frame.sourceIndex = shared.sourceIndex;
+        frame.coordinateSourceIndex = shared.coordinateSourceIndex;
+        frames.push_back(std::move(frame));
     }
     return frames;
 }
@@ -452,19 +404,8 @@ std::array<double, 6> ResolveConfiguredBounds(const Parameters& params,
 }
 
 SequenceInfo CollectInputSequence(const Parameters& params) {
-    std::vector<FrameInfo> frames;
-    if (std::filesystem::is_directory(params.inputPath)) {
-        frames = CollectFolderFiles(params.inputPath, params.physicalDt);
-    } else if (std::filesystem::is_regular_file(params.inputPath) &&
-               ToLower(params.inputPath.extension().string()) == ".pvd") {
-        frames = CollectPvdFiles(params.inputPath, params.physicalDt);
-    } else if (std::filesystem::is_regular_file(params.inputPath) && IsSupportedDataFile(params.inputPath)) {
-        frames = EnumerateDataSetFrames(params.inputPath, params.physicalDt);
-    } else {
-        throw std::runtime_error("Input must be a VTK data file, a .nek5000 descriptor, "
-                                 "a VTK time-series folder, or a .pvd file: " +
-                                 params.inputPath.string());
-    }
+    std::vector<FrameInfo> frames =
+        EnumerateDataSetFrames(params.inputPath, params.physicalDt);
 
     if (frames.empty()) {
         throw std::runtime_error("No supported dataset frames were found in input: " +
@@ -472,6 +413,9 @@ SequenceInfo CollectInputSequence(const Parameters& params) {
     }
     ApplyFrameRange(params, &frames);
     for (const FrameInfo& frame : frames) {
+        if (frame.kind != DataSetFrameKind::File) {
+            continue;
+        }
         const std::filesystem::path realPath = streamcenterplus::vtkhdf::RealPath(frame.path);
         if (!std::filesystem::exists(realPath)) {
             throw std::runtime_error("Referenced VTK frame does not exist: " + frame.path.string());
@@ -497,7 +441,10 @@ SequenceInfo CollectInputSequence(const Parameters& params) {
 }
 
 std::array<double, 6> ReadDataSetBounds(const std::filesystem::path& filePath) {
-    if (ToLower(streamcenterplus::vtkhdf::Extension(filePath)) == ".nek5000") {
+    const std::string extension =
+        ToLower(streamcenterplus::vtkhdf::Extension(filePath));
+    if (extension == ".nek5000" || extension == ".nek" ||
+        extension == ".case" || extension == ".foam") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSetBounds(frames.front());
     }
@@ -507,12 +454,22 @@ std::array<double, 6> ReadDataSetBounds(const std::filesystem::path& filePath) {
 std::array<double, 6> ReadDataSetBounds(const FrameInfo& frame) {
     const std::filesystem::path& filePath = frame.path;
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
-    if (frame.kind == DataSetFrameKind::Nek5000TimeStep || ext == ".nek5000") {
+    if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
+        ext == ".nek" ||
+        ext == ".case" || ext == ".foam") {
         if (!frame.readerTime.has_value()) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSetBounds(frames.front());
         }
-        return BoundsFromDataObject(ReadNek5000Frame(frame, false), filePath);
+        streamcenterplus::io::ReadOptions options;
+        options.readAllArrays = false;
+        options.attachSourceBlockIds = false;
+        options.attachNek5000SpectralMetadata = false;
+        options.buildNek5000LinearizedTopology = false;
+        options.attachNek5000QuadratureArrays = false;
+        return BoundsFromDataObject(
+            streamcenterplus::io::ReadDataSet(ToIoFrame(frame), options),
+            filePath);
     }
     if (ext == ".vtkhdf") {
         return BoundsFromDataObject(streamcenterplus::vtkhdf::ReadDataSet(filePath), filePath);
@@ -555,7 +512,10 @@ std::array<double, 6> ReadDataSetBounds(const FrameInfo& frame) {
 }
 
 vtkSmartPointer<vtkDataSet> ReadDataSet(const std::filesystem::path& filePath) {
-    if (ToLower(streamcenterplus::vtkhdf::Extension(filePath)) == ".nek5000") {
+    const std::string extension =
+        ToLower(streamcenterplus::vtkhdf::Extension(filePath));
+    if (extension == ".nek5000" || extension == ".nek" ||
+        extension == ".case" || extension == ".foam") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSet(frames.front());
     }
@@ -565,12 +525,23 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const std::filesystem::path& filePath) {
 vtkSmartPointer<vtkDataSet> ReadDataSet(const FrameInfo& frame) {
     const std::filesystem::path& filePath = frame.path;
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
-    if (frame.kind == DataSetFrameKind::Nek5000TimeStep || ext == ".nek5000") {
+    if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
+        ext == ".nek" ||
+        ext == ".case" || ext == ".foam") {
         if (!frame.readerTime.has_value()) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSet(frames.front());
         }
-        return ReadNek5000Frame(frame, true);
+        streamcenterplus::io::ReadOptions options;
+        if (frame.kind == DataSetFrameKind::Nek5000TimeStep ||
+            ext == ".nek5000" || ext == ".nek") {
+            // Spectral resampling uses the element-local GLL coordinates and
+            // its own AABB/Newton locator.  Tens of millions of visualization
+            // subcells and three quadrature arrays are therefore unnecessary.
+            options.buildNek5000LinearizedTopology = false;
+            options.attachNek5000QuadratureArrays = false;
+        }
+        return streamcenterplus::io::ReadDataSet(ToIoFrame(frame), options);
     }
 
     if (ext == ".vtkhdf") {

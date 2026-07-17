@@ -7,6 +7,9 @@ include(CMakePackageConfigHelpers)
 
 option(SCP_RESAMPLER_IO_BUILD_TOOL "Build the Resample command-line tool." ${PROJECT_IS_TOP_LEVEL})
 option(SCP_RESAMPLER_IO_BUILD_TESTS "Build SCP-ResamplerIO tests." ${PROJECT_IS_TOP_LEVEL})
+option(SCP_RESAMPLER_IO_BUILD_FULL_LIBRARY
+  "Build the Qt-facing inspector and resampling library in addition to the lightweight native readers."
+  ON)
 
 if(SCP_RESAMPLER_IO_BUILD_TESTS)
   include(CTest)
@@ -25,9 +28,6 @@ set(SCP_RESAMPLER_IO_VTK_COMPONENTS
   IOParallel
   IOXML
 )
-
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core)
-find_package(VTK CONFIG REQUIRED COMPONENTS ${SCP_RESAMPLER_IO_VTK_COMPONENTS})
 
 if(NOT TARGET SCP::SolverSDK)
   set(scp_solver_sdk_sibling "${CMAKE_CURRENT_SOURCE_DIR}/../SCP-SolverSDK")
@@ -66,6 +66,72 @@ if(NOT TARGET SCP::SolverSDK)
   endif()
 endif()
 
+find_package(VTK CONFIG REQUIRED COMPONENTS ${SCP_RESAMPLER_IO_VTK_COMPONENTS})
+
+add_library(SCP_ResamplerReaders STATIC
+  src/DataSetReader.cpp
+)
+add_library(SCP::ResamplerReaders ALIAS SCP_ResamplerReaders)
+set_target_properties(SCP_ResamplerReaders PROPERTIES EXPORT_NAME ResamplerReaders)
+target_compile_features(SCP_ResamplerReaders PUBLIC cxx_std_17)
+target_include_directories(SCP_ResamplerReaders PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(SCP_ResamplerReaders PUBLIC
+  SCP::SolverSDK
+  ${VTK_LIBRARIES}
+)
+if(WIN32)
+  target_compile_definitions(SCP_ResamplerReaders PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(MSVC)
+  target_compile_options(SCP_ResamplerReaders PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+endif()
+vtk_module_autoinit(
+  TARGETS SCP_ResamplerReaders
+  MODULES ${VTK_LIBRARIES}
+)
+
+if(NOT SCP_RESAMPLER_IO_BUILD_FULL_LIBRARY)
+  if(SCP_RESAMPLER_IO_BUILD_TOOL OR SCP_RESAMPLER_IO_BUILD_TESTS)
+    message(FATAL_ERROR
+      "SCP_RESAMPLER_IO_BUILD_TOOL/TESTS require SCP_RESAMPLER_IO_BUILD_FULL_LIBRARY=ON.")
+  endif()
+  install(TARGETS SCP_ResamplerReaders
+    EXPORT SCPResamplerIOTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+  )
+  install(DIRECTORY include/streamcenterplus/
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/streamcenterplus"
+  )
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SCPResamplerIOConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/SCPResamplerIOConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SCPResamplerIO"
+  )
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/SCPResamplerIOConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+  )
+  install(EXPORT SCPResamplerIOTargets
+    FILE SCPResamplerIOTargets.cmake
+    NAMESPACE SCP::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SCPResamplerIO"
+  )
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/SCPResamplerIOConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/SCPResamplerIOConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SCPResamplerIO"
+  )
+  return()
+endif()
+
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core)
+
 add_library(SCP_ResamplerIO STATIC
   src/FlowDataInspector.cpp
   resample/src/Parameters.cpp
@@ -82,6 +148,7 @@ target_include_directories(SCP_ResamplerIO PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(SCP_ResamplerIO PUBLIC
+  SCP::ResamplerReaders
   SCP::SolverSDK
   Qt6::Core
   ${VTK_LIBRARIES}
@@ -149,6 +216,34 @@ if(SCP_RESAMPLER_IO_BUILD_TOOL)
 endif()
 
 if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
+  add_executable(scp_resampler_io_native_readers
+    tests/native-readers/main.cpp
+  )
+  target_link_libraries(scp_resampler_io_native_readers PRIVATE SCP::ResamplerReaders)
+  target_compile_definitions(scp_resampler_io_native_readers PRIVATE
+    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+  )
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_native_readers
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.NativeReaders
+    COMMAND scp_resampler_io_native_readers
+  )
+
+  add_executable(scp_resampler_io_nek_resample
+    tests/nek-resample/main.cpp
+  )
+  target_link_libraries(scp_resampler_io_nek_resample PRIVATE SCP::ResamplerIO)
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_nek_resample
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.NekSpectralResample
+    COMMAND scp_resampler_io_nek_resample
+  )
+  set_tests_properties(SCPResamplerIO.NativeReaders PROPERTIES TIMEOUT 120)
+
   add_executable(scp_resampler_io_nek5000_integration
     tests/nek5000-integration/main.cpp
   )
@@ -169,7 +264,7 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
   )
 endif()
 
-install(TARGETS SCP_ResamplerIO
+install(TARGETS SCP_ResamplerReaders SCP_ResamplerIO
   EXPORT SCPResamplerIOTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

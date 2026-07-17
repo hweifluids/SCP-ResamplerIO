@@ -720,6 +720,10 @@ std::string ToString(DataSetFrameKind value) {
         return "file";
     case DataSetFrameKind::Nek5000TimeStep:
         return "nek5000_time_step";
+    case DataSetFrameKind::EnSightGoldTimeStep:
+        return "ensight_gold_time_step";
+    case DataSetFrameKind::OpenFoamTimeStep:
+        return "openfoam_time_step";
     }
     return "unknown";
 }

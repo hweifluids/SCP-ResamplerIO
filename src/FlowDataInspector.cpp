@@ -89,7 +89,8 @@ bool supportedVtkExtension(const QString& suffix, bool includeNek5000) {
         || ext == QStringLiteral("vtu")
         || ext == QStringLiteral("vtm")
         || ext == QStringLiteral("vtkhdf")
-        || (includeNek5000 && ext == QStringLiteral("nek5000"));
+        || (includeNek5000 &&
+            (ext == QStringLiteral("nek5000") || ext == QStringLiteral("nek")));
 }
 
 QString normalizedOpenFoamCaseType(QString caseType) {
@@ -732,7 +733,7 @@ vtkSmartPointer<vtkDataSet> readAnyVtk(const QString& filePath, QString* errorMe
     const QString realPath = realVtkPath(filePath);
     const QByteArray realPathBytes = QFile::encodeName(realPath);
 
-    if (ext == QStringLiteral("nek5000")) {
+    if (ext == QStringLiteral("nek5000") || ext == QStringLiteral("nek")) {
         if (!validateNek5000Descriptor(filePath, errorMessage)) {
             return nullptr;
         }
@@ -2212,13 +2213,15 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
     result.files = collectVtkFiles(folder, dataKind == FlowDataKind::Raw);
     if (result.files.isEmpty()) {
         const QString extensions = dataKind == FlowDataKind::Raw
-            ? QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.nek5000")
+            ? QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.nek5000, *.nek")
             : QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf");
         result.errorMessage = QString("No VTK series files (%1) were found in %2.").arg(extensions, folder);
         return result;
     }
     if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
-            return vtkExtensionSuffix(file).compare(QStringLiteral("nek5000"), Qt::CaseInsensitive) == 0;
+            const QString suffix = vtkExtensionSuffix(file);
+            return suffix.compare(QStringLiteral("nek5000"), Qt::CaseInsensitive) == 0 ||
+                   suffix.compare(QStringLiteral("nek"), Qt::CaseInsensitive) == 0;
         })) {
         result.entry.fileType = QStringLiteral("nek5000 series");
     } else if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
@@ -2347,8 +2350,11 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
         result.errorMessage = QString("Nek5000 descriptor does not exist: %1").arg(filePath);
         return result;
     }
-    if (fileInfo.suffix().compare(QStringLiteral("nek5000"), Qt::CaseInsensitive) != 0) {
-        result.errorMessage = QString("Nek5000 import expects a *.nek5000 descriptor file: %1").arg(filePath);
+    const QString suffix = fileInfo.suffix();
+    if (suffix.compare(QStringLiteral("nek5000"), Qt::CaseInsensitive) != 0 &&
+        suffix.compare(QStringLiteral("nek"), Qt::CaseInsensitive) != 0) {
+        result.errorMessage = QString("Nek5000 import expects a *.nek5000 or *.nek descriptor file: %1")
+                                  .arg(filePath);
         return result;
     }
 

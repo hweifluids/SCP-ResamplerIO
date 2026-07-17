@@ -62,6 +62,8 @@ enum class BoundsMode {
 enum class DataSetFrameKind {
     File,
     Nek5000TimeStep,
+    EnSightGoldTimeStep,
+    OpenFoamTimeStep,
 };
 
 struct LinearParameters {
@@ -130,6 +132,9 @@ struct FrameInfo {
     double time = 0.0;
     DataSetFrameKind kind = DataSetFrameKind::File;
     std::optional<double> readerTime;
+    std::filesystem::path coordinatePath;
+    int sourceIndex = 0;
+    int coordinateSourceIndex = -1;
 };
 
 struct SequenceInfo {

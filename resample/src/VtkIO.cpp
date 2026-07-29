@@ -12,8 +12,10 @@
 #include <vtkFieldData.h>
 #include <vtkGenericDataObjectReader.h>
 #include <vtkImageData.h>
+#include <vtkIdList.h>
 #include <vtkPointData.h>
 #include <vtkSmartPointer.h>
+#include <vtkUnsignedCharArray.h>
 #include <vtkXMLGenericDataObjectReader.h>
 #include <vtkXMLImageDataWriter.h>
 
@@ -46,7 +48,7 @@ bool IsSupportedDataFile(const std::filesystem::path& path) {
     return ext == ".vtk" || ext == ".vti" || ext == ".vtr" ||
            ext == ".vts" || ext == ".vtu" || ext == ".vtp" ||
            ext == ".vtkhdf" || ext == ".nek5000" || ext == ".nek" ||
-           ext == ".case" || ext == ".foam";
+           ext == ".case" || ext == ".foam" || ext == ".scpm";
 }
 
 DataSetFrameKind FromIoFrameKind(streamcenterplus::io::DataSetFrameKind kind) {
@@ -59,6 +61,8 @@ DataSetFrameKind FromIoFrameKind(streamcenterplus::io::DataSetFrameKind kind) {
         return DataSetFrameKind::EnSightGoldTimeStep;
     case streamcenterplus::io::DataSetFrameKind::OpenFoamTimeStep:
         return DataSetFrameKind::OpenFoamTimeStep;
+    case streamcenterplus::io::DataSetFrameKind::MultiZoneManifestTimeStep:
+        return DataSetFrameKind::MultiZoneManifestTimeStep;
     }
     throw std::runtime_error("Unknown shared dataset frame kind.");
 }
@@ -71,6 +75,7 @@ streamcenterplus::io::DataSetFrame ToIoFrame(const FrameInfo& frame) {
     out.coordinatePath = frame.coordinatePath;
     out.sourceIndex = frame.sourceIndex;
     out.coordinateSourceIndex = frame.coordinateSourceIndex;
+    out.multiZoneBackgroundIndex = frame.multiZoneBackgroundIndex;
     switch (frame.kind) {
     case DataSetFrameKind::File:
         out.kind = streamcenterplus::io::DataSetFrameKind::File;
@@ -83,6 +88,9 @@ streamcenterplus::io::DataSetFrame ToIoFrame(const FrameInfo& frame) {
         break;
     case DataSetFrameKind::OpenFoamTimeStep:
         out.kind = streamcenterplus::io::DataSetFrameKind::OpenFoamTimeStep;
+        break;
+    case DataSetFrameKind::MultiZoneManifestTimeStep:
+        out.kind = streamcenterplus::io::DataSetFrameKind::MultiZoneManifestTimeStep;
         break;
     }
     return out;
@@ -185,7 +193,8 @@ std::vector<FrameInfo> CollectFolderFiles(const std::filesystem::path& folder, d
     frames.reserve(tagged.size());
     for (std::size_t i = 0; i < tagged.size(); ++i) {
         FrameInfo frame = std::move(tagged[i].frame);
-        if (!frame.readerTime.has_value()) {
+        if (!frame.readerTime.has_value() &&
+            frame.kind != DataSetFrameKind::MultiZoneManifestTimeStep) {
             frame.time = static_cast<double>(i) * physicalDt;
         }
         frames.push_back(std::move(frame));
@@ -361,6 +370,7 @@ std::vector<FrameInfo> EnumerateDataSetFrames(const std::filesystem::path& sourc
         frame.coordinatePath = shared.coordinatePath;
         frame.sourceIndex = shared.sourceIndex;
         frame.coordinateSourceIndex = shared.coordinateSourceIndex;
+        frame.multiZoneBackgroundIndex = shared.multiZoneBackgroundIndex;
         frames.push_back(std::move(frame));
     }
     return frames;
@@ -444,7 +454,7 @@ std::array<double, 6> ReadDataSetBounds(const std::filesystem::path& filePath) {
     const std::string extension =
         ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (extension == ".nek5000" || extension == ".nek" ||
-        extension == ".case" || extension == ".foam") {
+        extension == ".case" || extension == ".foam" || extension == ".scpm") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSetBounds(frames.front());
     }
@@ -456,8 +466,9 @@ std::array<double, 6> ReadDataSetBounds(const FrameInfo& frame) {
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
         ext == ".nek" ||
-        ext == ".case" || ext == ".foam") {
-        if (!frame.readerTime.has_value()) {
+        ext == ".case" || ext == ".foam" || ext == ".scpm") {
+        if (!frame.readerTime.has_value() &&
+            frame.kind != DataSetFrameKind::MultiZoneManifestTimeStep) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSetBounds(frames.front());
         }
@@ -515,7 +526,7 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const std::filesystem::path& filePath) {
     const std::string extension =
         ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (extension == ".nek5000" || extension == ".nek" ||
-        extension == ".case" || extension == ".foam") {
+        extension == ".case" || extension == ".foam" || extension == ".scpm") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSet(frames.front());
     }
@@ -527,8 +538,9 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const FrameInfo& frame) {
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
         ext == ".nek" ||
-        ext == ".case" || ext == ".foam") {
-        if (!frame.readerTime.has_value()) {
+        ext == ".case" || ext == ".foam" || ext == ".scpm") {
+        if (!frame.readerTime.has_value() &&
+            frame.kind != DataSetFrameKind::MultiZoneManifestTimeStep) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSet(frames.front());
         }
@@ -576,6 +588,47 @@ vtkSmartPointer<vtkDataSet> PreparePointData(vtkDataSet* input) {
 
     vtkPointData* pointData = copy->GetPointData();
     vtkCellData* cellData = copy->GetCellData();
+    const bool multiZoneCanonical =
+        pointData != nullptr &&
+        pointData->GetArray(streamcenterplus::io::kMultiZoneOwnershipArray) != nullptr;
+    if (multiZoneCanonical && pointData != nullptr && cellData != nullptr) {
+        // The reader's cell cut is categorical.  Promote it conservatively
+        // before the generic cell-to-point filter can average/truncate it.
+        vtkDataArray* cellCut = cellData->GetArray(
+            streamcenterplus::io::kMultiZoneBackgroundCutArray);
+        if (cellCut != nullptr && cellCut->GetNumberOfComponents() == 1 &&
+            cellCut->GetNumberOfTuples() >= copy->GetNumberOfCells()) {
+            vtkNew<vtkUnsignedCharArray> pointCut;
+            pointCut->SetName(streamcenterplus::io::kMultiZoneBackgroundCutArray);
+            pointCut->SetNumberOfTuples(copy->GetNumberOfPoints());
+            pointCut->FillValue(0);
+            vtkNew<vtkIdList> pointIds;
+            for (vtkIdType cellId = 0; cellId < copy->GetNumberOfCells(); ++cellId) {
+                if (cellCut->GetComponent(cellId, 0) == 0.0) {
+                    continue;
+                }
+                copy->GetCellPoints(cellId, pointIds);
+                for (vtkIdType pointIndex = 0; pointIndex < pointIds->GetNumberOfIds();
+                     ++pointIndex) {
+                    pointCut->SetValue(pointIds->GetId(pointIndex), 1);
+                }
+            }
+            pointData->RemoveArray(streamcenterplus::io::kMultiZoneBackgroundCutArray);
+            pointData->AddArray(pointCut);
+            cellData->RemoveArray(streamcenterplus::io::kMultiZoneBackgroundCutArray);
+        }
+
+        // The mesh-set reader deliberately composes only point-associated
+        // physical fields.  Any remaining CellData is zone-local/background
+        // diagnostic data: promoting it here would manufacture a PointData
+        // field with stale background values in the foreground-covered
+        // region (including when the same-named PointData was correctly
+        // rejected by the reader as unavailable in the foreground).  The
+        // canonical point diagnostics above are the only cell diagnostics
+        // that Resample exposes for a two-zone input.
+        cellData->Initialize();
+        return copy;
+    }
     if (pointData != nullptr && cellData != nullptr) {
         std::vector<std::string> conflictingNames;
         for (int i = 0; i < cellData->GetNumberOfArrays(); ++i) {
@@ -587,7 +640,14 @@ vtkSmartPointer<vtkDataSet> PreparePointData(vtkDataSet* input) {
             }
         }
         for (const std::string& name : conflictingNames) {
-            pointData->RemoveArray(name.c_str());
+            if (multiZoneCanonical) {
+                // Reader-composed point data is already in the common world
+                // reference frame.  A background-only cell array with the
+                // same name must not replace it during point conversion.
+                cellData->RemoveArray(name.c_str());
+            } else {
+                pointData->RemoveArray(name.c_str());
+            }
         }
     }
 

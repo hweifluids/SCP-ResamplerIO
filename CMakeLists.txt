@@ -21,6 +21,7 @@ set(SCP_RESAMPLER_IO_VTK_COMPONENTS
   FiltersCore
   FiltersGeneral
   FiltersPoints
+  FiltersVerdict
   IOEnSight
   IOGeometry
   IOHDF
@@ -40,9 +41,9 @@ if(NOT TARGET SCP::SolverSDK)
 
   if(scp_solver_sdk_source)
     file(STRINGS "${scp_solver_sdk_source}/VERSION" scp_solver_sdk_version LIMIT_COUNT 1)
-    if(NOT scp_solver_sdk_version STREQUAL "0.1.0")
+    if(NOT scp_solver_sdk_version STREQUAL "0.2.0")
       message(FATAL_ERROR
-        "SCP-ResamplerIO requires SCP-SolverSDK 0.1.0; found '${scp_solver_sdk_version}' "
+        "SCP-ResamplerIO requires SCP-SolverSDK 0.2.0; found '${scp_solver_sdk_version}' "
         "at ${scp_solver_sdk_source}.")
     endif()
     add_subdirectory(
@@ -62,7 +63,7 @@ if(NOT TARGET SCP::SolverSDK)
     endif()
     list(GET scp_solver_sdk_installed_configs 0 scp_solver_sdk_config)
     get_filename_component(SCPSolverSDK_DIR "${scp_solver_sdk_config}" DIRECTORY)
-    find_package(SCPSolverSDK 0.1.0 EXACT CONFIG REQUIRED NO_DEFAULT_PATH)
+    find_package(SCPSolverSDK 0.2.0 EXACT CONFIG REQUIRED NO_DEFAULT_PATH)
   endif()
 endif()
 
@@ -202,6 +203,7 @@ if(SCP_RESAMPLER_IO_BUILD_TOOL)
   target_link_libraries(scp_nek5000_smoke PRIVATE SCP::ResamplerIO)
   streamcenterplus_configure_solver_info(
     streamcenterplus_resample_solver "Resample" ON OFF "tools"
+    "single_static,two_zone_static,two_zone_nested,two_zone_multigrid,two_zone_sliding"
   )
   vtk_module_autoinit(
     TARGETS streamcenterplus_resample_solver scp_nek5000_smoke
@@ -243,6 +245,25 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
     COMMAND scp_resampler_io_nek_resample
   )
   set_tests_properties(SCPResamplerIO.NativeReaders PROPERTIES TIMEOUT 120)
+
+  add_executable(scp_resampler_io_multizone
+    tests/multizone/main.cpp
+  )
+  target_link_libraries(scp_resampler_io_multizone PRIVATE
+    SCP::ResamplerIO
+    VTK::hdf5
+  )
+  target_compile_definitions(scp_resampler_io_multizone PRIVATE
+    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+  )
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_multizone
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.MultiZoneManifest
+    COMMAND scp_resampler_io_multizone
+  )
+  set_tests_properties(SCPResamplerIO.MultiZoneManifest PROPERTIES TIMEOUT 120)
 
   add_executable(scp_resampler_io_nek5000_integration
     tests/nek5000-integration/main.cpp

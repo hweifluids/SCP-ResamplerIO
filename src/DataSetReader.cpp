@@ -3,8 +3,12 @@
 #include <streamcenterplus/VtkHdfIO.h>
 
 #include <vtkAppendFilter.h>
+#include <vtkCell.h>
 #include <vtkCellData.h>
+#include <vtkCellSizeFilter.h>
 #include <vtkCellType.h>
+#include <vtkCallbackCommand.h>
+#include <vtkDataSetAttributes.h>
 #include <vtkCompositeDataIterator.h>
 #include <vtkCompositeDataSet.h>
 #include <vtkDataArray.h>
@@ -18,6 +22,7 @@
 #include <vtkGenericCell.h>
 #include <vtkGenericEnSightReader.h>
 #include <vtkInformation.h>
+#include <vtkIdList.h>
 #include <vtkIntArray.h>
 #include <vtkNew.h>
 #include <vtkOpenFOAMReader.h>
@@ -30,6 +35,8 @@
 #include <vtkStreamingDemandDrivenPipeline.h>
 #include <vtkStringArray.h>
 #include <vtkStaticCellLocator.h>
+#include <vtkStaticPointLocator.h>
+#include <vtkUnsignedCharArray.h>
 #include <vtkUnstructuredGrid.h>
 #include <vtkXMLGenericDataObjectReader.h>
 
@@ -45,6 +52,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -101,6 +109,585 @@ bool IsOrdinaryVtkExtension(const std::string& extension) {
            extension == ".vtm" || extension == ".vtkhdf";
 }
 
+constexpr const char* kCanonicalVelocityArray = kMultiZoneCanonicalVelocityArray;
+
+enum class MultiZoneOverlapPolicy {
+    CutBackground,
+    Blend50_50,
+};
+
+enum class MultiZoneMotion {
+    Static,
+    Rigid,
+};
+
+enum class MultiZoneVelocityFrame {
+    World,
+    Zone,
+    Relative,
+};
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+struct MultiZoneZone {
+    std::filesystem::path source;
+    MultiZoneMotion motion = MultiZoneMotion::Static;
+    Vec3 translation;
+    Vec3 rotationAxis{0.0, 0.0, 1.0};
+    Vec3 rotationOrigin;
+    Vec3 linearVelocity;
+    double angularVelocity = 0.0;
+    double phase = 0.0;
+    MultiZoneVelocityFrame velocityFrame = MultiZoneVelocityFrame::World;
+    std::string velocityArray;
+    std::array<std::string, 3> velocityComponents;
+};
+
+struct MultiZoneManifest {
+    std::filesystem::path path;
+    std::string meshKind;
+    MultiZoneOverlapPolicy overlapPolicy = MultiZoneOverlapPolicy::CutBackground;
+    int backgroundZone = -1;
+    std::array<MultiZoneZone, 2> zones;
+};
+
+bool IsZero(const Vec3& value) {
+    return value.x == 0.0 && value.y == 0.0 && value.z == 0.0;
+}
+
+double Dot(const Vec3& lhs, const Vec3& rhs) {
+    return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+}
+
+Vec3 Cross(const Vec3& lhs, const Vec3& rhs) {
+    return {lhs.y * rhs.z - lhs.z * rhs.y,
+            lhs.z * rhs.x - lhs.x * rhs.z,
+            lhs.x * rhs.y - lhs.y * rhs.x};
+}
+
+Vec3 Add(const Vec3& lhs, const Vec3& rhs) {
+    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
+}
+
+Vec3 Subtract(const Vec3& lhs, const Vec3& rhs) {
+    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
+}
+
+Vec3 Scale(const Vec3& value, double factor) {
+    return {value.x * factor, value.y * factor, value.z * factor};
+}
+
+double Norm(const Vec3& value) {
+    return std::sqrt(Dot(value, value));
+}
+
+Vec3 ParseVec3(const std::string& value, const std::string& key) {
+    std::string normalized = value;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::replace(normalized.begin(), normalized.end(), ';', ' ');
+    std::istringstream input(normalized);
+    std::array<double, 3> values{};
+    for (double& component : values) {
+        if (!(input >> component) || !std::isfinite(component)) {
+            throw std::runtime_error("Manifest key '" + key +
+                                     "' must contain three finite numbers.");
+        }
+    }
+    std::string trailing;
+    if (input >> trailing) {
+        throw std::runtime_error("Manifest key '" + key +
+                                 "' must contain exactly three numbers.");
+    }
+    return {values[0], values[1], values[2]};
+}
+
+std::array<std::string, 3> ParseNameTriplet(const std::string& value,
+                                             const std::string& key) {
+    std::string normalized = value;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::replace(normalized.begin(), normalized.end(), ';', ' ');
+    std::istringstream input(normalized);
+    std::array<std::string, 3> names{};
+    for (std::string& name : names) {
+        if (!(input >> name) || name.empty()) {
+            throw std::runtime_error("Manifest key '" + key +
+                                     "' must contain exactly three array names.");
+        }
+    }
+    std::string trailing;
+    if (input >> trailing) {
+        throw std::runtime_error("Manifest key '" + key +
+                                 "' must contain exactly three array names.");
+    }
+    return names;
+}
+
+double ParseFiniteDouble(const std::string& value, const std::string& key) {
+    std::size_t used = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &used);
+    } catch (const std::exception&) {
+        throw std::runtime_error("Manifest key '" + key +
+                                 "' must be a finite number.");
+    }
+    if (used != value.size() || !std::isfinite(parsed)) {
+        throw std::runtime_error("Manifest key '" + key +
+                                 "' must be a finite number.");
+    }
+    return parsed;
+}
+
+int ParsePositiveInt(const std::string& value, const std::string& key) {
+    std::size_t used = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value, &used);
+    } catch (const std::exception&) {
+        throw std::runtime_error("Manifest key '" + key + "' must be an integer.");
+    }
+    if (used != value.size() || parsed <= 0) {
+        throw std::runtime_error("Manifest key '" + key +
+                                 "' must be a positive integer.");
+    }
+    return parsed;
+}
+
+const std::string* FindManifestValue(
+    const std::map<std::string, std::string>& values,
+    const std::string& key) {
+    const auto found = values.find(key);
+    return found == values.end() ? nullptr : &found->second;
+}
+
+std::string RequiredManifestValue(const std::map<std::string, std::string>& values,
+                                  const std::string& key,
+                                  const std::filesystem::path& manifestPath) {
+    const std::string* value = FindManifestValue(values, key);
+    if (value == nullptr || value->empty()) {
+        throw std::runtime_error("Manifest '" + manifestPath.string() +
+                                 "' is missing required key '" + key + "'.");
+    }
+    return *value;
+}
+
+std::string OptionalManifestValue(const std::map<std::string, std::string>& values,
+                                  const std::string& key,
+                                  const std::string& fallback) {
+    const std::string* value = FindManifestValue(values, key);
+    return value == nullptr ? fallback : *value;
+}
+
+std::string ManifestMeshKind(const std::map<std::string, std::string>& values,
+                             const std::filesystem::path& manifestPath) {
+    for (const char* key : {"mesh_kind", "grid_kind", "layout"}) {
+        if (const std::string* value = FindManifestValue(values, key)) {
+            const std::string kind = ToLower(*value);
+            if (kind == "two_zone_static" || kind == "multizone") {
+                return "static";
+            }
+            if (kind == "two_zone_nested") {
+                return "nested";
+            }
+            if (kind == "two_zone_multigrid" || kind == "multi_grid") {
+                return "multigrid";
+            }
+            if (kind == "two_zone_sliding") {
+                return "sliding";
+            }
+            return kind;
+        }
+    }
+    throw std::runtime_error("Manifest '" + manifestPath.string() +
+                             "' is missing required key 'mesh_kind'.");
+}
+
+bool IsKnownMultiZoneManifestKey(const std::string& key) {
+    if (key == "streamcenterplus_meshset" || key == "zone_count" ||
+        key == "mesh_kind" || key == "grid_kind" || key == "layout" ||
+        key == "overlap_policy" || key == "background_zone") {
+        return true;
+    }
+    for (int index = 0; index < 2; ++index) {
+        const std::string prefix = "zone" + std::to_string(index) + "_";
+        for (const char* suffix : {"source", "motion", "translation", "rotation_axis",
+                                   "rotation_origin", "linear_velocity", "angular_velocity",
+                                   "phase", "velocity_frame", "velocity_array",
+                                   "velocity_components"}) {
+            if (key == prefix + suffix) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void ValidateMultiZoneManifestKeys(const std::map<std::string, std::string>& values,
+                                   const std::filesystem::path& manifestPath) {
+    int meshKindKeys = 0;
+    for (const auto& [key, value] : values) {
+        static_cast<void>(value);
+        if (!IsKnownMultiZoneManifestKey(key)) {
+            throw std::runtime_error("Unknown mesh-set manifest key '" + key +
+                                     "' in '" + manifestPath.string() + "'.");
+        }
+        if (key == "mesh_kind" || key == "grid_kind" || key == "layout") {
+            ++meshKindKeys;
+        }
+    }
+    if (meshKindKeys != 1) {
+        throw std::runtime_error("Manifest '" + manifestPath.string() +
+                                 "' must declare exactly one of mesh_kind, grid_kind or layout.");
+    }
+}
+
+MultiZoneManifest ParseMultiZoneManifest(const std::filesystem::path& sourcePath) {
+    const std::filesystem::path realPath =
+        streamcenterplus::vtkhdf::RealPath(sourcePath);
+    if (!std::filesystem::is_regular_file(realPath)) {
+        throw std::runtime_error("Mesh-set manifest does not exist: " +
+                                 sourcePath.string());
+    }
+    if (LowerExtension(sourcePath) != ".scpm") {
+        throw std::runtime_error("Expected a .scpm mesh-set manifest: " +
+                                 sourcePath.string());
+    }
+
+    std::ifstream input(realPath);
+    if (!input) {
+        throw std::runtime_error("Cannot open mesh-set manifest: " +
+                                 sourcePath.string());
+    }
+    std::map<std::string, std::string> values;
+    std::string line;
+    int lineNumber = 0;
+    while (std::getline(input, line)) {
+        ++lineNumber;
+        line = StripComment(line);
+        if (line.empty()) {
+            continue;
+        }
+        const std::size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            throw std::runtime_error("Malformed mesh-set manifest line " +
+                                     std::to_string(lineNumber) + " in '" +
+                                     sourcePath.string() + "': expected key=value.");
+        }
+        const std::string key = ToLower(TrimAscii(line.substr(0, separator)));
+        const std::string value = TrimAscii(line.substr(separator + 1));
+        if (key.empty() || value.empty()) {
+            throw std::runtime_error("Malformed mesh-set manifest line " +
+                                     std::to_string(lineNumber) + " in '" +
+                                     sourcePath.string() + ".");
+        }
+        if (!values.emplace(key, value).second) {
+            throw std::runtime_error("Duplicate mesh-set manifest key '" + key +
+                                     "' in '" + sourcePath.string() + "'.");
+        }
+    }
+
+    ValidateMultiZoneManifestKeys(values, sourcePath);
+
+    if (RequiredManifestValue(values, "streamcenterplus_meshset", sourcePath) != "1") {
+        throw std::runtime_error("Manifest '" + sourcePath.string() +
+                                 "' must declare streamcenterplus_meshset=1.");
+    }
+    if (ParsePositiveInt(RequiredManifestValue(values, "zone_count", sourcePath),
+                         "zone_count") != 2) {
+        throw std::runtime_error("Manifest '" + sourcePath.string() +
+                                 "' must declare exactly zone_count=2.");
+    }
+
+    MultiZoneManifest manifest;
+    manifest.path = std::filesystem::absolute(realPath).lexically_normal();
+    manifest.meshKind = ManifestMeshKind(values, sourcePath);
+    if (manifest.meshKind != "static" && manifest.meshKind != "nested" &&
+        manifest.meshKind != "multigrid" && manifest.meshKind != "sliding") {
+        throw std::runtime_error("Manifest '" + sourcePath.string() +
+                                 "' has unsupported mesh_kind '" + manifest.meshKind +
+                                 "'.");
+    }
+
+    const std::string overlap = ToLower(OptionalManifestValue(
+        values, "overlap_policy", "cut_background"));
+    if (overlap == "cut_background") {
+        manifest.overlapPolicy = MultiZoneOverlapPolicy::CutBackground;
+    } else if (overlap == "blend_50_50") {
+        manifest.overlapPolicy = MultiZoneOverlapPolicy::Blend50_50;
+    } else {
+        throw std::runtime_error("Manifest '" + sourcePath.string() +
+                                 "' has unsupported overlap_policy '" + overlap + "'.");
+    }
+
+    for (int index = 0; index < 2; ++index) {
+        const std::string prefix = "zone" + std::to_string(index) + "_";
+        MultiZoneZone& zone = manifest.zones[static_cast<std::size_t>(index)];
+        const std::filesystem::path configuredSource = RequiredManifestValue(
+            values, prefix + "source", sourcePath);
+        zone.source = configuredSource.is_absolute()
+                          ? configuredSource
+                          : (manifest.path.parent_path() / configuredSource);
+        zone.source = zone.source.lexically_normal();
+        if (LowerExtension(zone.source) == ".scpm") {
+            throw std::runtime_error("Nested .scpm sources are not supported by '" +
+                                     sourcePath.string() + "'.");
+        }
+
+        const std::string motion = ToLower(OptionalManifestValue(
+            values, prefix + "motion", "static"));
+        if (motion == "static") {
+            zone.motion = MultiZoneMotion::Static;
+        } else if (motion == "rigid") {
+            zone.motion = MultiZoneMotion::Rigid;
+        } else {
+            throw std::runtime_error("Manifest key '" + prefix +
+                                     "motion' must be static or rigid.");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "translation")) {
+            zone.translation = ParseVec3(*value, prefix + "translation");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "rotation_axis")) {
+            zone.rotationAxis = ParseVec3(*value, prefix + "rotation_axis");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "rotation_origin")) {
+            zone.rotationOrigin = ParseVec3(*value, prefix + "rotation_origin");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "linear_velocity")) {
+            zone.linearVelocity = ParseVec3(*value, prefix + "linear_velocity");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "angular_velocity")) {
+            zone.angularVelocity = ParseFiniteDouble(*value, prefix + "angular_velocity");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "phase")) {
+            zone.phase = ParseFiniteDouble(*value, prefix + "phase");
+        }
+        const double axisNorm = Norm(zone.rotationAxis);
+        if (axisNorm == 0.0) {
+            throw std::runtime_error("Manifest key '" + prefix +
+                                     "rotation_axis' must be non-zero.");
+        }
+        zone.rotationAxis = Scale(zone.rotationAxis, 1.0 / axisNorm);
+        if (zone.motion == MultiZoneMotion::Static &&
+            (zone.angularVelocity != 0.0 || !IsZero(zone.linearVelocity))) {
+            throw std::runtime_error("Static zone '" + std::to_string(index) +
+                                     "' cannot declare angular_velocity or linear_velocity.");
+        }
+
+        const std::string velocityFrame = ToLower(OptionalManifestValue(
+            values, prefix + "velocity_frame", "world"));
+        if (velocityFrame == "world") {
+            zone.velocityFrame = MultiZoneVelocityFrame::World;
+        } else if (velocityFrame == "zone") {
+            zone.velocityFrame = MultiZoneVelocityFrame::Zone;
+        } else if (velocityFrame == "relative") {
+            zone.velocityFrame = MultiZoneVelocityFrame::Relative;
+        } else {
+            throw std::runtime_error("Manifest key '" + prefix +
+                                     "velocity_frame' must be world, zone or relative.");
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "velocity_array")) {
+            zone.velocityArray = *value;
+        }
+        if (const std::string* value = FindManifestValue(values, prefix + "velocity_components")) {
+            if (!zone.velocityArray.empty()) {
+                throw std::runtime_error("Manifest zone " + std::to_string(index) +
+                                         " cannot declare both velocity_array and velocity_components.");
+            }
+            zone.velocityComponents = ParseNameTriplet(*value, prefix + "velocity_components");
+        }
+    }
+
+    if (const std::string* value = FindManifestValue(values, "background_zone")) {
+        std::size_t used = 0;
+        int parsed = -1;
+        try {
+            parsed = std::stoi(*value, &used);
+        } catch (const std::exception&) {
+            throw std::runtime_error("Manifest key 'background_zone' must be 0 or 1.");
+        }
+        if (used != value->size() || (parsed != 0 && parsed != 1)) {
+            throw std::runtime_error("Manifest key 'background_zone' must be 0 or 1.");
+        }
+        manifest.backgroundZone = parsed;
+    }
+    if (manifest.meshKind == "sliding" &&
+        manifest.zones[0].motion != MultiZoneMotion::Rigid &&
+        manifest.zones[1].motion != MultiZoneMotion::Rigid) {
+        throw std::runtime_error("A sliding mesh-set manifest must declare at least one rigid zone.");
+    }
+    const bool hasDynamicRigidZone = std::any_of(
+        manifest.zones.begin(), manifest.zones.end(), [](const MultiZoneZone& zone) {
+            return zone.motion == MultiZoneMotion::Rigid &&
+                   (zone.angularVelocity != 0.0 || !IsZero(zone.linearVelocity));
+        });
+    if (hasDynamicRigidZone && manifest.meshKind != "sliding") {
+        throw std::runtime_error("A manifest with moving rigid zones must use mesh_kind=sliding.");
+    }
+
+    return manifest;
+}
+
+bool NearlyEqualTime(double lhs, double rhs) {
+    return std::abs(lhs - rhs) <=
+           1.0e-10 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
+}
+
+const DataSetFrame& SelectZoneFrame(const std::vector<DataSetFrame>& frames,
+                                    int manifestFrameIndex,
+                                    const std::filesystem::path& manifestPath) {
+    if (frames.empty()) {
+        throw std::runtime_error("Mesh-set source has no frames in '" +
+                                 manifestPath.string() + "'.");
+    }
+    if (frames.size() == 1) {
+        return frames.front();
+    }
+    if (manifestFrameIndex < 0 ||
+        static_cast<std::size_t>(manifestFrameIndex) >= frames.size()) {
+        throw std::runtime_error("Mesh-set frame index is out of range in '" +
+                                 manifestPath.string() + "'.");
+    }
+    return frames[static_cast<std::size_t>(manifestFrameIndex)];
+}
+
+struct MeshReferenceMeasure {
+    int dimension = -1;
+    double value = 0.0;
+};
+
+std::optional<MeshReferenceMeasure> ComputeMeshReferenceMeasure(vtkDataSet* dataSet);
+
+int ResolveMultiZoneBackground(const MultiZoneManifest& manifest,
+                               const std::vector<DataSetFrame>& first,
+                               const std::vector<DataSetFrame>& second) {
+    int backgroundZone = manifest.backgroundZone;
+    if (backgroundZone < 0) {
+        // The choice is made from the two reference frames once, during
+        // manifest enumeration.  It must never be re-evaluated from a moving
+        // foreground frame because modal solvers require invariant DOF.
+        ReadOptions geometryOnly;
+        geometryOnly.readAllArrays = false;
+        geometryOnly.attachSourceBlockIds = false;
+        geometryOnly.attachNek5000SpectralMetadata = false;
+        // Nek5000 normally skips its linearized cells for this lightweight
+        // geometry read.  Automatic reference selection needs physical cell
+        // measures, however, so build them only when either source is Nek.
+        geometryOnly.buildNek5000LinearizedTopology =
+            first.front().kind == DataSetFrameKind::Nek5000TimeStep ||
+            second.front().kind == DataSetFrameKind::Nek5000TimeStep;
+        geometryOnly.attachNek5000QuadratureArrays = false;
+        geometryOnly.failOnVtkXmlReadErrors = true;
+        vtkSmartPointer<vtkDataSet> firstReference =
+            ReadDataSet(first.front(), geometryOnly);
+        vtkSmartPointer<vtkDataSet> secondReference =
+            ReadDataSet(second.front(), geometryOnly);
+        const std::optional<MeshReferenceMeasure> firstMeasure =
+            ComputeMeshReferenceMeasure(firstReference);
+        const std::optional<MeshReferenceMeasure> secondMeasure =
+            ComputeMeshReferenceMeasure(secondReference);
+        if (!firstMeasure.has_value() || !secondMeasure.has_value() ||
+            firstMeasure->dimension != secondMeasure->dimension) {
+            throw std::runtime_error(
+                "Cannot determine comparable physical reference measures for both "
+                "mesh-set zones in '" + manifest.path.string() +
+                "'. Automatic background selection requires non-degenerate cells of "
+                "the same physical dimension; declare background_zone explicitly "
+                "after verifying the fixed background geometry.");
+        }
+        backgroundZone = firstMeasure->value >= secondMeasure->value ? 0 : 1;
+    }
+    const MultiZoneZone& zone = manifest.zones[static_cast<std::size_t>(backgroundZone)];
+    if (zone.motion == MultiZoneMotion::Rigid &&
+        (zone.angularVelocity != 0.0 || !IsZero(zone.linearVelocity))) {
+        throw std::runtime_error("The selected background zone must be static so the "
+                                 "canonical world reference geometry remains fixed: " +
+                                 manifest.path.string());
+    }
+    return backgroundZone;
+}
+
+std::vector<DataSetFrame> EnumerateMultiZoneManifestFrames(
+    const std::filesystem::path& sourcePath,
+    double fallbackPhysicalDt) {
+    const MultiZoneManifest manifest = ParseMultiZoneManifest(sourcePath);
+    // A zone source may be a PVD collection.  It must still resolve to an
+    // ordinary dataset sequence, not another mesh-set manifest: recursively
+    // composing a two-zone result would exceed the public two-zone contract
+    // and apply a second reference-frame transform to already canonical data.
+    // Track the active manifests as well so a PVD-mediated self-reference
+    // fails deterministically instead of recursing through enumeration.
+    static thread_local std::vector<std::filesystem::path> activeManifests;
+    const auto active = std::find(activeManifests.begin(), activeManifests.end(), manifest.path);
+    if (active != activeManifests.end()) {
+        throw std::runtime_error("Recursive mesh-set manifest source is not supported: " +
+                                 manifest.path.string());
+    }
+    activeManifests.push_back(manifest.path);
+    struct ActiveManifestScope {
+        std::vector<std::filesystem::path>* paths = nullptr;
+        ~ActiveManifestScope() {
+            if (paths != nullptr) {
+                paths->pop_back();
+            }
+        }
+    } activeManifestScope{&activeManifests};
+
+    const std::vector<DataSetFrame> first =
+        EnumerateDataSetFrames(manifest.zones[0].source, fallbackPhysicalDt);
+    const std::vector<DataSetFrame> second =
+        EnumerateDataSetFrames(manifest.zones[1].source, fallbackPhysicalDt);
+    const auto rejectNestedManifestFrames =
+        [&](const std::vector<DataSetFrame>& zoneFrames, int zoneIndex) {
+            if (std::any_of(zoneFrames.begin(), zoneFrames.end(),
+                            [](const DataSetFrame& frame) {
+                                return frame.kind ==
+                                       DataSetFrameKind::MultiZoneManifestTimeStep;
+                            })) {
+                throw std::runtime_error(
+                    "Nested .scpm sources, including PVD-indirected mesh-set manifests, "
+                    "are not supported by '" + manifest.path.string() +
+                    "' (zone" + std::to_string(zoneIndex) + ").");
+            }
+        };
+    rejectNestedManifestFrames(first, 0);
+    rejectNestedManifestFrames(second, 1);
+    if (first.empty() || second.empty()) {
+        throw std::runtime_error("Every mesh-set zone must provide at least one frame: " +
+                                 sourcePath.string());
+    }
+    if (first.size() > 1 && second.size() > 1 && first.size() != second.size()) {
+        throw std::runtime_error("Two dynamic mesh-set sources must have equal frame counts: " +
+                                 sourcePath.string());
+    }
+    const int backgroundZone = ResolveMultiZoneBackground(manifest, first, second);
+    const std::size_t count = std::max(first.size(), second.size());
+    std::vector<DataSetFrame> result;
+    result.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const DataSetFrame& firstFrame = SelectZoneFrame(
+            first, static_cast<int>(index), sourcePath);
+        const DataSetFrame& secondFrame = SelectZoneFrame(
+            second, static_cast<int>(index), sourcePath);
+        if (first.size() > 1 && second.size() > 1 &&
+            !NearlyEqualTime(firstFrame.time, secondFrame.time)) {
+            throw std::runtime_error("Two dynamic mesh-set sources must have matching frame times: " +
+                                     sourcePath.string());
+        }
+        DataSetFrame frame;
+        frame.path = manifest.path;
+        frame.time = first.size() > 1 ? firstFrame.time : secondFrame.time;
+        frame.kind = DataSetFrameKind::MultiZoneManifestTimeStep;
+        frame.sourceIndex = static_cast<int>(index);
+        frame.multiZoneBackgroundIndex = backgroundZone;
+        result.push_back(std::move(frame));
+    }
+    return result;
+}
+
 vtkSmartPointer<vtkDataSet> CloneDataSet(vtkDataSet* input) {
     if (input == nullptr) {
         return nullptr;
@@ -145,11 +732,29 @@ void AttachSourceBlockId(vtkDataSet* dataSet, int blockId) {
     if (dataSet == nullptr) {
         return;
     }
+    vtkCellData* cellData = dataSet->GetCellData();
+    if (cellData == nullptr) {
+        return;
+    }
+    vtkDataArray* existing =
+        cellData->GetArray(kSourceBlockIdArray);
+    if (existing != nullptr &&
+        existing->GetNumberOfComponents() == 1 &&
+        existing->GetNumberOfTuples() ==
+            dataSet->GetNumberOfCells()) {
+        // A reader or upstream conversion may already carry stable,
+        // application-level block provenance. Preserve it instead of
+        // replacing it with the transient composite traversal index.
+        return;
+    }
+    if (existing != nullptr) {
+        cellData->RemoveArray(kSourceBlockIdArray);
+    }
     vtkNew<vtkIntArray> cells;
     cells->SetName(kSourceBlockIdArray);
     cells->SetNumberOfTuples(dataSet->GetNumberOfCells());
     cells->FillValue(blockId);
-    dataSet->GetCellData()->AddArray(cells);
+    cellData->AddArray(cells);
 }
 
 vtkSmartPointer<vtkDataSet> CollapseDataObject(vtkDataObject* object,
@@ -189,6 +794,1132 @@ vtkSmartPointer<vtkDataSet> CollapseDataObject(vtkDataObject* object,
     return output;
 }
 
+Vec3 RotateZoneVector(const MultiZoneZone& zone, const Vec3& value, double time) {
+    const double angle = zone.phase +
+                         (zone.motion == MultiZoneMotion::Rigid
+                              ? zone.angularVelocity * time
+                              : 0.0);
+    if (angle == 0.0) {
+        return value;
+    }
+    const double cosine = std::cos(angle);
+    const double sine = std::sin(angle);
+    return Add(Add(Scale(value, cosine), Scale(Cross(zone.rotationAxis, value), sine)),
+               Scale(zone.rotationAxis, Dot(zone.rotationAxis, value) * (1.0 - cosine)));
+}
+
+Vec3 ZoneTranslationAt(const MultiZoneZone& zone, double time) {
+    if (zone.motion != MultiZoneMotion::Rigid) {
+        return zone.translation;
+    }
+    return Add(zone.translation, Scale(zone.linearVelocity, time));
+}
+
+Vec3 TransformZonePointToWorld(const MultiZoneZone& zone,
+                               const Vec3& localPoint,
+                               double time) {
+    const Vec3 translation = ZoneTranslationAt(zone, time);
+    return Add(Add(translation, zone.rotationOrigin),
+               RotateZoneVector(zone, Subtract(localPoint, zone.rotationOrigin), time));
+}
+
+Vec3 MeshVelocityAtWorldPoint(const MultiZoneZone& zone,
+                              const Vec3& worldPoint,
+                              double time) {
+    if (zone.motion != MultiZoneMotion::Rigid) {
+        return {};
+    }
+    const Vec3 centre = Add(ZoneTranslationAt(zone, time), zone.rotationOrigin);
+    return Add(zone.linearVelocity,
+               Scale(Cross(zone.rotationAxis, Subtract(worldPoint, centre)),
+                     zone.angularVelocity));
+}
+
+vtkDataArray* FindDataArray(vtkDataSetAttributes* attributes, const std::string& name) {
+    if (attributes == nullptr || name.empty()) {
+        return nullptr;
+    }
+    if (vtkDataArray* exact = attributes->GetArray(name.c_str())) {
+        return exact;
+    }
+    const std::string expected = ToLower(name);
+    for (int index = 0; index < attributes->GetNumberOfArrays(); ++index) {
+        vtkDataArray* candidate = attributes->GetArray(index);
+        if (candidate != nullptr && candidate->GetName() != nullptr &&
+            ToLower(candidate->GetName()) == expected) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+vtkDataArray* FindExactDataArray(vtkDataSetAttributes* attributes, const char* name) {
+    return attributes == nullptr ? nullptr : attributes->GetArray(name);
+}
+
+struct VelocitySelection {
+    vtkDataArray* vector = nullptr;
+    std::array<vtkDataArray*, 3> components = {nullptr, nullptr, nullptr};
+    std::vector<std::string> explicitlyNamedArrays;
+};
+
+VelocitySelection ResolveVelocitySelection(vtkDataSetAttributes* attributes,
+                                           const MultiZoneZone& zone,
+                                           int zoneIndex) {
+    if (attributes == nullptr) {
+        throw std::runtime_error("Mesh-set zone " + std::to_string(zoneIndex) +
+                                 " has no point data for Velocity.");
+    }
+    VelocitySelection result;
+    if (!zone.velocityArray.empty()) {
+        result.vector = FindDataArray(attributes, zone.velocityArray);
+        if (result.vector == nullptr || result.vector->GetNumberOfComponents() != 3) {
+            throw std::runtime_error("Manifest velocity_array for zone " +
+                                     std::to_string(zoneIndex) +
+                                     " must name a three-component point array.");
+        }
+        result.explicitlyNamedArrays.push_back(result.vector->GetName());
+        return result;
+    }
+
+    if (!zone.velocityComponents[0].empty()) {
+        for (int component = 0; component < 3; ++component) {
+            result.components[static_cast<std::size_t>(component)] = FindDataArray(
+                attributes, zone.velocityComponents[static_cast<std::size_t>(component)]);
+            vtkDataArray* array = result.components[static_cast<std::size_t>(component)];
+            if (array == nullptr || array->GetNumberOfComponents() != 1) {
+                throw std::runtime_error("Manifest velocity_components for zone " +
+                                         std::to_string(zoneIndex) +
+                                         " must name three scalar point arrays.");
+            }
+            result.explicitlyNamedArrays.push_back(array->GetName());
+        }
+        return result;
+    }
+
+    for (const char* candidate : {"Velocity", "U", "V"}) {
+        vtkDataArray* array = FindDataArray(attributes, candidate);
+        if (array != nullptr && array->GetNumberOfComponents() == 3) {
+            result.vector = array;
+            result.explicitlyNamedArrays.push_back(array->GetName());
+            return result;
+        }
+    }
+
+    const auto selectComponents = [&](const std::array<const char*, 3>& names) {
+        std::array<vtkDataArray*, 3> arrays = {
+            FindExactDataArray(attributes, names[0]),
+            FindExactDataArray(attributes, names[1]),
+            FindExactDataArray(attributes, names[2]),
+        };
+        for (vtkDataArray* array : arrays) {
+            if (array == nullptr || array->GetNumberOfComponents() != 1) {
+                return false;
+            }
+        }
+        result.components = arrays;
+        for (vtkDataArray* array : arrays) {
+            result.explicitlyNamedArrays.push_back(array->GetName());
+        }
+        return true;
+    };
+    if (selectComponents({"u", "v", "w"}) ||
+        selectComponents({"U", "V", "W"})) {
+        return result;
+    }
+
+    throw std::runtime_error(
+        "Mesh-set zone " + std::to_string(zoneIndex) +
+        " must expose a three-component Velocity/U/V point array, or scalar u/v/w or U/V/W arrays.");
+}
+
+Vec3 ReadVelocityTuple(const VelocitySelection& selection, vtkIdType pointId) {
+    if (selection.vector != nullptr) {
+        return {selection.vector->GetComponent(pointId, 0),
+                selection.vector->GetComponent(pointId, 1),
+                selection.vector->GetComponent(pointId, 2)};
+    }
+    return {selection.components[0]->GetComponent(pointId, 0),
+            selection.components[1]->GetComponent(pointId, 0),
+            selection.components[2]->GetComponent(pointId, 0)};
+}
+
+void RequireCompleteVelocityTuples(const VelocitySelection& selection,
+                                   vtkIdType expectedTupleCount,
+                                   int zoneIndex,
+                                   const char* association) {
+    if (expectedTupleCount < 0) {
+        throw std::runtime_error("Invalid expected tuple count for mesh-set zone " +
+                                 std::to_string(zoneIndex) + ".");
+    }
+    const auto requireArray = [&](vtkDataArray* array) {
+        if (array == nullptr || array->GetName() == nullptr ||
+            array->GetNumberOfTuples() != expectedTupleCount) {
+            const std::string name = array != nullptr && array->GetName() != nullptr
+                                         ? array->GetName()
+                                         : std::string("<unnamed>");
+            throw std::runtime_error(
+                std::string(association) + " velocity array '" + name +
+                "' in mesh-set zone " + std::to_string(zoneIndex) +
+                " must provide exactly " + std::to_string(expectedTupleCount) +
+                " tuples.");
+        }
+    };
+    if (selection.vector != nullptr) {
+        requireArray(selection.vector);
+        return;
+    }
+    for (vtkDataArray* component : selection.components) {
+        requireArray(component);
+    }
+}
+
+bool HasExplicitVelocitySelection(const MultiZoneZone& zone) {
+    return !zone.velocityArray.empty() || !zone.velocityComponents[0].empty();
+}
+
+bool IsStandardVelocityAlias(const char* name) {
+    if (name == nullptr) {
+        return false;
+    }
+    const std::string normalized = ToLower(name);
+    return normalized == "velocity" || normalized == "u" || normalized == "v" ||
+           normalized == "w";
+}
+
+void RemoveRawVelocityArrays(vtkDataSetAttributes* attributes,
+                             const VelocitySelection& selection,
+                             bool removeStandardAliases = true) {
+    if (attributes == nullptr) {
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(static_cast<std::size_t>(attributes->GetNumberOfArrays()));
+    for (int index = 0; index < attributes->GetNumberOfArrays(); ++index) {
+        vtkDataArray* array = attributes->GetArray(index);
+        if (array == nullptr || array->GetName() == nullptr) {
+            continue;
+        }
+        bool remove = removeStandardAliases && IsStandardVelocityAlias(array->GetName());
+        for (const std::string& explicitName : selection.explicitlyNamedArrays) {
+            if (array->GetName() == explicitName) {
+                remove = true;
+                break;
+            }
+        }
+        if (remove) {
+            names.emplace_back(array->GetName());
+        }
+    }
+    for (const std::string& name : names) {
+        attributes->RemoveArray(name.c_str());
+    }
+}
+
+void PromoteCellVelocityToPointData(vtkUnstructuredGrid* dataSet,
+                                    const VelocitySelection& selection,
+                                    int zoneIndex) {
+    if (dataSet == nullptr || dataSet->GetCellData() == nullptr ||
+        dataSet->GetPointData() == nullptr) {
+        throw std::runtime_error("Cannot promote cell velocity for mesh-set zone " +
+                                 std::to_string(zoneIndex) + ".");
+    }
+    std::vector<vtkDataArray*> sourceArrays;
+    if (selection.vector != nullptr) {
+        sourceArrays.push_back(selection.vector);
+    } else {
+        sourceArrays.assign(selection.components.begin(), selection.components.end());
+    }
+    vtkNew<vtkIdList> pointIds;
+    const vtkIdType pointCount = dataSet->GetNumberOfPoints();
+    for (vtkDataArray* source : sourceArrays) {
+        if (source == nullptr || source->GetName() == nullptr ||
+            source->GetNumberOfTuples() != dataSet->GetNumberOfCells()) {
+            const std::string name = source != nullptr && source->GetName() != nullptr
+                                         ? source->GetName()
+                                         : std::string("<unnamed>");
+            throw std::runtime_error("Cell velocity array '" + name +
+                                     "' in mesh-set zone " +
+                                     std::to_string(zoneIndex) +
+                                     " must provide exactly " +
+                                     std::to_string(dataSet->GetNumberOfCells()) +
+                                     " tuples.");
+        }
+        const int componentCount = source->GetNumberOfComponents();
+        std::vector<double> sums(static_cast<std::size_t>(pointCount) *
+                                     static_cast<std::size_t>(componentCount),
+                                 0.0);
+        std::vector<vtkIdType> counts(static_cast<std::size_t>(pointCount), 0);
+        for (vtkIdType cellId = 0; cellId < dataSet->GetNumberOfCells(); ++cellId) {
+            dataSet->GetCellPoints(cellId, pointIds);
+            for (vtkIdType localId = 0; localId < pointIds->GetNumberOfIds(); ++localId) {
+                const vtkIdType pointId = pointIds->GetId(localId);
+                ++counts[static_cast<std::size_t>(pointId)];
+                for (int component = 0; component < componentCount; ++component) {
+                    sums[static_cast<std::size_t>(pointId) *
+                             static_cast<std::size_t>(componentCount) +
+                         static_cast<std::size_t>(component)] +=
+                        source->GetComponent(cellId, component);
+                }
+            }
+        }
+        vtkSmartPointer<vtkDoubleArray> promoted =
+            vtkSmartPointer<vtkDoubleArray>::New();
+        promoted->SetName(source->GetName());
+        promoted->SetNumberOfComponents(componentCount);
+        promoted->SetNumberOfTuples(pointCount);
+        for (vtkIdType pointId = 0; pointId < pointCount; ++pointId) {
+            const vtkIdType count = counts[static_cast<std::size_t>(pointId)];
+            if (count <= 0) {
+                throw std::runtime_error("Cell velocity cannot be projected to an orphan point "
+                                         "in mesh-set zone " + std::to_string(zoneIndex) + ".");
+            }
+            for (int component = 0; component < componentCount; ++component) {
+                promoted->SetComponent(
+                    pointId, component,
+                    sums[static_cast<std::size_t>(pointId) *
+                             static_cast<std::size_t>(componentCount) +
+                         static_cast<std::size_t>(component)] /
+                        static_cast<double>(count));
+            }
+        }
+        dataSet->GetPointData()->RemoveArray(source->GetName());
+        dataSet->GetPointData()->AddArray(promoted);
+    }
+    // Keep a single world-frame velocity representation. Leaving the source
+    // cell arrays would let Resample's cell-to-point preparation replace the
+    // canonical point Velocity with stale zone-frame values.
+    RemoveRawVelocityArrays(dataSet->GetCellData(), selection);
+}
+
+bool TryResolveVelocitySelection(vtkUnstructuredGrid* dataSet,
+                                 const MultiZoneZone& zone,
+                                 int zoneIndex,
+                                 VelocitySelection* selection) {
+    if (dataSet == nullptr || selection == nullptr) {
+        throw std::runtime_error("Cannot resolve mesh-set velocity from a null zone.");
+    }
+    const bool explicitSelection = HasExplicitVelocitySelection(zone);
+    try {
+        *selection = ResolveVelocitySelection(dataSet->GetPointData(), zone, zoneIndex);
+        return true;
+    } catch (const std::runtime_error&) {
+        vtkCellData* cellData = dataSet->GetCellData();
+        if (cellData == nullptr || cellData->GetNumberOfArrays() == 0) {
+            if (explicitSelection) {
+                throw;
+            }
+            return false;
+        }
+
+        VelocitySelection cellSelection;
+        try {
+            cellSelection = ResolveVelocitySelection(cellData, zone, zoneIndex);
+        } catch (const std::runtime_error&) {
+            if (explicitSelection) {
+                throw;
+            }
+            return false;
+        }
+        PromoteCellVelocityToPointData(dataSet, cellSelection, zoneIndex);
+        *selection = ResolveVelocitySelection(dataSet->GetPointData(), zone, zoneIndex);
+        return true;
+    }
+}
+
+void ValidateSourceVelocityTupleCounts(vtkDataSet* source,
+                                       const MultiZoneZone& zone,
+                                       int zoneIndex) {
+    if (source == nullptr) {
+        throw std::runtime_error("Cannot validate velocity arrays for a null mesh-set zone.");
+    }
+
+    // Validate on the source before vtkAppendFilter materializes an
+    // unstructured grid. The append operation may allocate a full point-array
+    // length for a truncated input array, masking corrupt tail tuples behind
+    // default-initialized values.
+    VelocitySelection pointSelection;
+    bool hasPointSelection = false;
+    try {
+        pointSelection = ResolveVelocitySelection(source->GetPointData(), zone, zoneIndex);
+        hasPointSelection = true;
+    } catch (const std::runtime_error&) {
+    }
+    if (hasPointSelection) {
+        RequireCompleteVelocityTuples(pointSelection, source->GetNumberOfPoints(), zoneIndex,
+                                      "Point");
+        return;
+    }
+
+    VelocitySelection cellSelection;
+    bool hasCellSelection = false;
+    try {
+        cellSelection = ResolveVelocitySelection(source->GetCellData(), zone, zoneIndex);
+        hasCellSelection = true;
+    } catch (const std::runtime_error&) {
+    }
+    if (hasCellSelection) {
+        RequireCompleteVelocityTuples(cellSelection, source->GetNumberOfCells(), zoneIndex,
+                                      "Cell");
+    }
+}
+
+vtkSmartPointer<vtkUnstructuredGrid> MakeWorldZone(vtkDataSet* source,
+                                                    const MultiZoneZone& zone,
+                                                    int zoneIndex,
+                                                    double time,
+                                                    bool includeVelocity,
+                                                    bool* hasWorldVelocity = nullptr) {
+    if (source == nullptr || source->GetNumberOfPoints() <= 0 ||
+        source->GetNumberOfCells() <= 0) {
+        throw std::runtime_error("Mesh-set zone " + std::to_string(zoneIndex) +
+                                 " has no volume cells or points.");
+    }
+    if (includeVelocity) {
+        ValidateSourceVelocityTupleCounts(source, zone, zoneIndex);
+    }
+    vtkNew<vtkAppendFilter> append;
+    append->MergePointsOff();
+    append->AddInputData(source);
+    append->Update();
+    vtkSmartPointer<vtkUnstructuredGrid> result =
+        vtkSmartPointer<vtkUnstructuredGrid>::New();
+    result->DeepCopy(append->GetOutput());
+    if (result->GetPoints() == nullptr || result->GetPointData() == nullptr) {
+        throw std::runtime_error("Cannot materialize mesh-set zone " +
+                                 std::to_string(zoneIndex) + " as an unstructured grid.");
+    }
+
+    vtkPointData* pointData = result->GetPointData();
+    VelocitySelection velocity;
+    vtkSmartPointer<vtkDoubleArray> worldVelocity;
+    bool resolvedVelocity = false;
+    if (includeVelocity) {
+        resolvedVelocity = TryResolveVelocitySelection(result, zone, zoneIndex, &velocity);
+        if (resolvedVelocity) {
+            RequireCompleteVelocityTuples(velocity, result->GetNumberOfPoints(), zoneIndex,
+                                          "Point");
+            worldVelocity = vtkSmartPointer<vtkDoubleArray>::New();
+            worldVelocity->SetName(kCanonicalVelocityArray);
+            worldVelocity->SetNumberOfComponents(3);
+            worldVelocity->SetNumberOfTuples(result->GetNumberOfPoints());
+        }
+    }
+
+    double point[3] = {};
+    for (vtkIdType pointId = 0; pointId < result->GetNumberOfPoints(); ++pointId) {
+        result->GetPoint(pointId, point);
+        const Vec3 localPoint{point[0], point[1], point[2]};
+        const Vec3 worldPoint = TransformZonePointToWorld(zone, localPoint, time);
+        if (resolvedVelocity) {
+            const Vec3 inputVelocity = ReadVelocityTuple(velocity, pointId);
+            Vec3 transformedVelocity = inputVelocity;
+            if (zone.velocityFrame != MultiZoneVelocityFrame::World) {
+                transformedVelocity = RotateZoneVector(zone, inputVelocity, time);
+            }
+            if (zone.velocityFrame == MultiZoneVelocityFrame::Relative) {
+                transformedVelocity = Add(transformedVelocity,
+                                          MeshVelocityAtWorldPoint(zone, worldPoint, time));
+            }
+            const double tuple[3] = {
+                transformedVelocity.x, transformedVelocity.y, transformedVelocity.z};
+            worldVelocity->SetTuple(pointId, tuple);
+        }
+        result->GetPoints()->SetPoint(pointId, worldPoint.x, worldPoint.y, worldPoint.z);
+    }
+    result->GetPoints()->Modified();
+    result->Modified();
+    if (resolvedVelocity) {
+        RemoveRawVelocityArrays(pointData, velocity);
+        RemoveRawVelocityArrays(result->GetCellData(), velocity);
+        pointData->RemoveArray(kCanonicalVelocityArray);
+        pointData->AddArray(worldVelocity);
+        pointData->SetActiveVectors(kCanonicalVelocityArray);
+    }
+    if (hasWorldVelocity != nullptr) {
+        *hasWorldVelocity = resolvedVelocity;
+    }
+    return result;
+}
+
+void RequireSameReferenceGeometry(vtkDataSet* reference,
+                                  vtkDataSet* current,
+                                  const std::filesystem::path& manifestPath,
+                                  const char* subject) {
+    if (reference == nullptr || current == nullptr ||
+        reference->GetNumberOfPoints() != current->GetNumberOfPoints() ||
+        reference->GetNumberOfCells() != current->GetNumberOfCells()) {
+        throw std::runtime_error(std::string(subject) + " geometry changes across frames in '" +
+                                 manifestPath.string() + "'.");
+    }
+    double referencePoint[3] = {};
+    double currentPoint[3] = {};
+    for (vtkIdType pointId = 0; pointId < reference->GetNumberOfPoints(); ++pointId) {
+        reference->GetPoint(pointId, referencePoint);
+        current->GetPoint(pointId, currentPoint);
+        for (int axis = 0; axis < 3; ++axis) {
+            const double tolerance = 1.0e-11 * std::max(
+                {1.0, std::abs(referencePoint[axis]), std::abs(currentPoint[axis])});
+            if (std::abs(referencePoint[axis] - currentPoint[axis]) > tolerance) {
+                throw std::runtime_error(
+                    std::string(subject) + " geometry changes across frames in '" +
+                    manifestPath.string() + "'.");
+            }
+        }
+    }
+    vtkNew<vtkIdList> referencePointIds;
+    vtkNew<vtkIdList> currentPointIds;
+    for (vtkIdType cellId = 0; cellId < reference->GetNumberOfCells(); ++cellId) {
+        if (reference->GetCellType(cellId) != current->GetCellType(cellId)) {
+            throw std::runtime_error(std::string(subject) + " topology changes across frames in '" +
+                                     manifestPath.string() + "'.");
+        }
+        reference->GetCellPoints(cellId, referencePointIds);
+        current->GetCellPoints(cellId, currentPointIds);
+        if (referencePointIds->GetNumberOfIds() != currentPointIds->GetNumberOfIds()) {
+            throw std::runtime_error(std::string(subject) + " topology changes across frames in '" +
+                                     manifestPath.string() + "'.");
+        }
+        for (vtkIdType pointIndex = 0;
+             pointIndex < referencePointIds->GetNumberOfIds(); ++pointIndex) {
+            if (referencePointIds->GetId(pointIndex) != currentPointIds->GetId(pointIndex)) {
+                throw std::runtime_error(
+                    std::string(subject) + " topology changes across frames in '" +
+                    manifestPath.string() + "'.");
+            }
+        }
+    }
+}
+
+std::optional<MeshReferenceMeasure> ComputeMeshReferenceMeasure(vtkDataSet* dataSet) {
+    if (dataSet == nullptr || dataSet->GetNumberOfCells() <= 0) {
+        return std::nullopt;
+    }
+
+    vtkDataArray* ghosts = dataSet->GetCellData() == nullptr
+                                ? nullptr
+                                : dataSet->GetCellData()->GetArray(
+                                      vtkDataSetAttributes::GhostArrayName());
+    const vtkIdType cellCount = dataSet->GetNumberOfCells();
+    if (ghosts != nullptr && ghosts->GetNumberOfTuples() != cellCount) {
+        return std::nullopt;
+    }
+
+    // A reference can legitimately be a surface or a line mesh.  Select the
+    // highest physical dimension shared by the zones (3-D volume, 2-D area,
+    // or 1-D length), rather than comparing AABBs or rejecting valid 2-D
+    // mesh sets.  Mixed-dimensional references are rejected by the caller.
+    int dimension = -1;
+    for (vtkIdType cellId = 0; cellId < cellCount; ++cellId) {
+        if (ghosts != nullptr && ghosts->GetComponent(cellId, 0) != 0.0) {
+            continue;
+        }
+        vtkCell* cell = dataSet->GetCell(cellId);
+        if (cell == nullptr) {
+            return std::nullopt;
+        }
+        const int cellDimension = cell->GetCellDimension();
+        if (cellDimension >= 1 && cellDimension <= 3) {
+            dimension = std::max(dimension, cellDimension);
+        }
+    }
+    if (dimension < 1) {
+        return std::nullopt;
+    }
+
+    constexpr const char* kReferenceLengthArray = "__SCP_MeshReferenceLength";
+    constexpr const char* kReferenceAreaArray = "__SCP_MeshReferenceArea";
+    constexpr const char* kReferenceVolumeArray = "__SCP_MeshReferenceVolume";
+    vtkNew<vtkCellSizeFilter> cellSizes;
+    cellSizes->SetInputData(dataSet);
+    cellSizes->SetComputeVertexCount(false);
+    cellSizes->SetComputeLength(dimension == 1);
+    cellSizes->SetComputeArea(dimension == 2);
+    cellSizes->SetComputeVolume(dimension == 3);
+    cellSizes->SetComputeSum(false);
+    cellSizes->SetLengthArrayName(kReferenceLengthArray);
+    cellSizes->SetAreaArrayName(kReferenceAreaArray);
+    cellSizes->SetVolumeArrayName(kReferenceVolumeArray);
+    cellSizes->Update();
+
+    vtkDataSet* measured = vtkDataSet::SafeDownCast(cellSizes->GetOutputDataObject(0));
+    const char* measureArrayName = dimension == 3
+                                       ? kReferenceVolumeArray
+                                       : (dimension == 2 ? kReferenceAreaArray
+                                                         : kReferenceLengthArray);
+    vtkDataArray* measures = measured == nullptr || measured->GetCellData() == nullptr
+                                 ? nullptr
+                                 : measured->GetCellData()->GetArray(measureArrayName);
+    if (measures == nullptr || measures->GetNumberOfTuples() != cellCount) {
+        return std::nullopt;
+    }
+
+    bool hasPhysicalCell = false;
+    double totalMeasure = 0.0;
+    for (vtkIdType cellId = 0; cellId < cellCount; ++cellId) {
+        if (ghosts != nullptr && ghosts->GetComponent(cellId, 0) != 0.0) {
+            continue;
+        }
+        vtkCell* cell = dataSet->GetCell(cellId);
+        if (cell == nullptr) {
+            return std::nullopt;
+        }
+        if (cell->GetCellDimension() != dimension) {
+            continue;
+        }
+        const double measure = measures->GetComponent(cellId, 0);
+        if (!std::isfinite(measure) || measure <= 0.0) {
+            return std::nullopt;
+        }
+        hasPhysicalCell = true;
+        totalMeasure += measure;
+        if (!std::isfinite(totalMeasure)) {
+            return std::nullopt;
+        }
+    }
+    if (!hasPhysicalCell || totalMeasure <= 0.0) {
+        return std::nullopt;
+    }
+    return MeshReferenceMeasure{dimension, totalMeasure};
+}
+
+bool FindContainingCell(vtkStaticCellLocator* locator,
+                        vtkGenericCell* cell,
+                        std::vector<double>* weights,
+                        const double point[3]);
+
+void RequireForegroundWithinBackground(vtkDataSet* background,
+                                       vtkDataSet* foreground,
+                                       const std::filesystem::path& manifestPath) {
+    if (background == nullptr || foreground == nullptr) {
+        throw std::runtime_error("Cannot validate mesh-set foreground containment in '" +
+                                 manifestPath.string() + "'.");
+    }
+    double backgroundBounds[6] = {};
+    double foregroundBounds[6] = {};
+    background->GetBounds(backgroundBounds);
+    foreground->GetBounds(foregroundBounds);
+    for (int axis = 0; axis < 3; ++axis) {
+        const double scale = std::max(
+            {1.0, std::abs(backgroundBounds[2 * axis]),
+             std::abs(backgroundBounds[2 * axis + 1])});
+        const double tolerance = 1.0e-9 * scale;
+        if (foregroundBounds[2 * axis] < backgroundBounds[2 * axis] - tolerance ||
+            foregroundBounds[2 * axis + 1] > backgroundBounds[2 * axis + 1] + tolerance) {
+            throw std::runtime_error(
+                "The foreground zone extends beyond the fixed background reference mesh in '" +
+                manifestPath.string() + "'. Use a larger background zone or a pre-resampled input.");
+        }
+    }
+
+    vtkNew<vtkStaticCellLocator> backgroundLocator;
+    backgroundLocator->SetDataSet(background);
+    backgroundLocator->BuildLocator();
+    vtkNew<vtkGenericCell> locatorCell;
+    std::vector<double> weights(static_cast<std::size_t>(
+        std::max<vtkIdType>(1, background->GetMaxCellSize())));
+    const auto requireCoveredPoint = [&](const double point[3], const char* description) {
+        if (!FindContainingCell(backgroundLocator, locatorCell, &weights, point)) {
+            throw std::runtime_error("The foreground " + std::string(description) +
+                                     " lies outside the physical background volume in '" +
+                                     manifestPath.string() +
+                                     "'. Bounds containment alone is insufficient; use a "
+                                     "covering background or pre-resample the input.");
+        }
+    };
+
+    double point[3] = {};
+    for (vtkIdType pointId = 0; pointId < foreground->GetNumberOfPoints(); ++pointId) {
+        foreground->GetPoint(pointId, point);
+        requireCoveredPoint(point, "point");
+    }
+    vtkNew<vtkIdList> pointIds;
+    for (vtkIdType cellId = 0; cellId < foreground->GetNumberOfCells(); ++cellId) {
+        foreground->GetCellPoints(cellId, pointIds);
+        if (pointIds->GetNumberOfIds() <= 0) {
+            continue;
+        }
+        Vec3 centre;
+        for (vtkIdType pointIndex = 0; pointIndex < pointIds->GetNumberOfIds(); ++pointIndex) {
+            foreground->GetPoint(pointIds->GetId(pointIndex), point);
+            centre = Add(centre, {point[0], point[1], point[2]});
+        }
+        centre = Scale(centre, 1.0 / static_cast<double>(pointIds->GetNumberOfIds()));
+        const double centrePoint[3] = {centre.x, centre.y, centre.z};
+        requireCoveredPoint(centrePoint, "cell centre");
+    }
+}
+
+bool FindContainingCell(vtkStaticCellLocator* locator,
+                        vtkGenericCell* cell,
+                        std::vector<double>* weights,
+                        const double point[3]) {
+    if (locator == nullptr || cell == nullptr || weights == nullptr || point == nullptr) {
+        return false;
+    }
+    double query[3] = {point[0], point[1], point[2]};
+    double parametricCoordinates[3] = {};
+    int subId = 0;
+    const vtkIdType cellId = locator->FindCell(
+        query, 0.0, cell, subId, parametricCoordinates, weights->data());
+    return cellId >= 0;
+}
+
+void RequireForegroundRepresentableOnBackground(
+    vtkDataSet* background,
+    vtkDataSet* foreground,
+    const std::filesystem::path& manifestPath) {
+    if (background == nullptr || foreground == nullptr) {
+        throw std::runtime_error("Cannot validate fixed-reference mesh-set representation in '" +
+                                 manifestPath.string() + "'.");
+    }
+    if (foreground->GetNumberOfCells() <= 0) {
+        throw std::runtime_error(
+            "The foreground zone has no cells and cannot be sampled on the fixed reference "
+            "mesh in '" +
+            manifestPath.string() + "'.");
+    }
+
+    // The canonical output owns only the background point degrees of freedom.
+    // Requiring one of those DOFs for *each* foreground cell prevents a fine
+    // foreground from being partly (or wholly) invisible inside a coarse
+    // background cell.  A point locator makes this conservative validation
+    // proportional to nearby background points rather than all point/cell
+    // pairs.
+    vtkNew<vtkStaticPointLocator> backgroundPointLocator;
+    backgroundPointLocator->SetDataSet(background);
+    backgroundPointLocator->BuildLocator();
+    vtkNew<vtkIdList> candidatePointIds;
+    double point[3] = {};
+    for (vtkIdType cellId = 0; cellId < foreground->GetNumberOfCells(); ++cellId) {
+        vtkCell* foregroundCell = foreground->GetCell(cellId);
+        if (foregroundCell == nullptr || foregroundCell->GetNumberOfPoints() <= 0) {
+            throw std::runtime_error(
+                "The foreground zone contains an empty cell that cannot be represented on "
+                "the fixed reference mesh in '" +
+                manifestPath.string() + "'.");
+        }
+
+        double bounds[6] = {};
+        foregroundCell->GetBounds(bounds);
+        const double centre[3] = {
+            0.5 * (bounds[0] + bounds[1]),
+            0.5 * (bounds[2] + bounds[3]),
+            0.5 * (bounds[4] + bounds[5]),
+        };
+        const double dx = bounds[1] - bounds[0];
+        const double dy = bounds[3] - bounds[2];
+        const double dz = bounds[5] - bounds[4];
+        const double scale = std::max({1.0, std::abs(centre[0]), std::abs(centre[1]),
+                                       std::abs(centre[2]), dx, dy, dz});
+        const double radius = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz) +
+                              1.0e-10 * scale;
+        candidatePointIds->Reset();
+        backgroundPointLocator->FindPointsWithinRadius(radius, centre, candidatePointIds);
+
+        std::vector<double> weights(static_cast<std::size_t>(
+            std::max<vtkIdType>(1, foregroundCell->GetNumberOfPoints())));
+        bool represented = false;
+        for (vtkIdType candidateIndex = 0;
+             candidateIndex < candidatePointIds->GetNumberOfIds(); ++candidateIndex) {
+            background->GetPoint(candidatePointIds->GetId(candidateIndex), point);
+            double closestPoint[3] = {};
+            double parametricCoordinates[3] = {};
+            double distanceSquared = 0.0;
+            int subId = 0;
+            if (foregroundCell->EvaluatePosition(point, closestPoint, subId,
+                                                 parametricCoordinates, distanceSquared,
+                                                 weights.data()) == 1) {
+                represented = true;
+                break;
+            }
+        }
+        if (!represented) {
+            throw std::runtime_error(
+                "Foreground cell " + std::to_string(cellId) +
+                " contains no fixed background degree of freedom in '" +
+                manifestPath.string() +
+                "'. A fine foreground cell fully embedded inside a coarse background cell "
+                "cannot be represented on the fixed reference mesh; refine/pre-resample the "
+                "background input.");
+        }
+    }
+}
+
+bool IsFloatingPointArray(const vtkDataArray* array) {
+    if (array == nullptr) {
+        return false;
+    }
+    return array->GetDataType() == VTK_FLOAT || array->GetDataType() == VTK_DOUBLE;
+}
+
+struct PointArrayPair {
+    vtkDataArray* target = nullptr;
+    vtkDataArray* source = nullptr;
+};
+
+bool IsFixedReferencePointArray(vtkDataArray* array) {
+    if (array == nullptr || array->GetName() == nullptr) {
+        return false;
+    }
+    const std::string lowerName = ToLower(array->GetName());
+    // Nek spectral integration metadata belongs to the fixed background
+    // geometry.  Copying foreground values into it would make physical
+    // quadrature weights inconsistent with the canonical reference mesh.
+    if (lowerName.rfind("scp_nek5000", 0) == 0) {
+        return true;
+    }
+
+    std::string normalizedName;
+    normalizedName.reserve(lowerName.size());
+    for (unsigned char character : lowerName) {
+        if (std::isalnum(character)) {
+            normalizedName.push_back(static_cast<char>(character));
+        }
+    }
+    // These names are commonly attached by CFD exporters for integration or
+    // spatial measures.  They are not solution fields and must retain their
+    // fixed-background values even when analysis fields are cut/blended.
+    return normalizedName == "weight" || normalizedName == "weights" ||
+           normalizedName == "quadratureweight" ||
+           normalizedName == "quadratureweights" ||
+           normalizedName == "referenceweight" ||
+           normalizedName == "referenceweights" ||
+           normalizedName == "integrationweight" ||
+           normalizedName == "integrationweights" ||
+           normalizedName == "jacobian" ||
+           normalizedName == "jacobiandeterminant" || normalizedName == "detj" ||
+           normalizedName == "volume" || normalizedName == "cellvolume" ||
+           normalizedName == "area" || normalizedName == "cellarea" ||
+           normalizedName == "measure" || normalizedName == "cellmeasure";
+}
+
+std::vector<PointArrayPair> SharedPointArrays(vtkPointData* target,
+                                              vtkIdType targetPointCount,
+                                              vtkPointData* source,
+                                              vtkIdType sourcePointCount,
+                                              bool requireFloatingPoint) {
+    std::vector<PointArrayPair> arrays;
+    if (target == nullptr || source == nullptr) {
+        return arrays;
+    }
+    std::vector<std::string> unavailableFieldNames;
+    for (int index = 0; index < target->GetNumberOfArrays(); ++index) {
+        vtkDataArray* targetArray = target->GetArray(index);
+        if (targetArray == nullptr || targetArray->GetName() == nullptr) {
+            continue;
+        }
+        if (IsFixedReferencePointArray(targetArray)) {
+            continue;
+        }
+        vtkDataArray* sourceArray = source->GetArray(targetArray->GetName());
+        if (targetArray->GetNumberOfTuples() != targetPointCount ||
+            sourceArray == nullptr ||
+            sourceArray->GetNumberOfComponents() != targetArray->GetNumberOfComponents() ||
+            sourceArray->GetNumberOfTuples() != sourcePointCount ||
+            (requireFloatingPoint &&
+             (!IsFloatingPointArray(targetArray) || !IsFloatingPointArray(sourceArray)))) {
+            // A background-only analysis field would otherwise remain present
+            // at covered points after the foreground replaces the flow. The
+            // same is true for a truncated VTK point array: sampling skips
+            // its absent foreground tuples. Do not expose either mixed-
+            // reference field to RAW solvers; retain only fields complete in
+            // both zones. A 50:50 blend also has no correct categorical or
+            // integer result, so it retains only floating-point solution
+            // fields. Fixed reference weights above are the deliberate
+            // exception.
+            unavailableFieldNames.emplace_back(targetArray->GetName());
+            continue;
+        }
+        arrays.push_back({targetArray, sourceArray});
+    }
+    for (const std::string& name : unavailableFieldNames) {
+        target->RemoveArray(name.c_str());
+    }
+    return arrays;
+}
+
+void AttachMultiZoneProvenance(vtkUnstructuredGrid* background,
+                               vtkStaticCellLocator* foregroundLocator,
+                               int backgroundZone,
+                               int foregroundZone,
+                               MultiZoneOverlapPolicy policy) {
+    if (background == nullptr || foregroundLocator == nullptr ||
+        background->GetPointData() == nullptr || background->GetCellData() == nullptr) {
+        throw std::runtime_error("Cannot attach mesh-set provenance to an incomplete dataset.");
+    }
+    vtkPointData* pointData = background->GetPointData();
+    vtkCellData* cellData = background->GetCellData();
+    for (const char* name : {kMultiZoneOwnershipArray, kMultiZoneBlendWeightArray,
+                             kMultiZoneBackgroundZoneArray,
+                             kMultiZoneForegroundZoneArray}) {
+        pointData->RemoveArray(name);
+    }
+    cellData->RemoveArray(kMultiZoneBackgroundCutArray);
+    pointData->RemoveArray(kMultiZoneInterfaceArray);
+    cellData->RemoveArray(kMultiZoneInterfaceArray);
+
+    vtkNew<vtkIntArray> ownership;
+    ownership->SetName(kMultiZoneOwnershipArray);
+    ownership->SetNumberOfTuples(background->GetNumberOfPoints());
+    ownership->FillValue(0);
+    vtkNew<vtkDoubleArray> blendWeight;
+    blendWeight->SetName(kMultiZoneBlendWeightArray);
+    blendWeight->SetNumberOfTuples(background->GetNumberOfPoints());
+    blendWeight->FillValue(0.0);
+    vtkNew<vtkIntArray> backgroundIds;
+    backgroundIds->SetName(kMultiZoneBackgroundZoneArray);
+    backgroundIds->SetNumberOfTuples(background->GetNumberOfPoints());
+    backgroundIds->FillValue(backgroundZone);
+    vtkNew<vtkIntArray> foregroundIds;
+    foregroundIds->SetName(kMultiZoneForegroundZoneArray);
+    foregroundIds->SetNumberOfTuples(background->GetNumberOfPoints());
+    foregroundIds->FillValue(foregroundZone);
+
+    vtkNew<vtkGenericCell> locatorCell;
+    std::vector<double> weights(static_cast<std::size_t>(
+        std::max<vtkIdType>(1, foregroundLocator->GetDataSet()->GetMaxCellSize())));
+    double point[3] = {};
+    for (vtkIdType pointId = 0; pointId < background->GetNumberOfPoints(); ++pointId) {
+        background->GetPoint(pointId, point);
+        if (!FindContainingCell(foregroundLocator, locatorCell, &weights, point)) {
+            continue;
+        }
+        ownership->SetValue(pointId, policy == MultiZoneOverlapPolicy::Blend50_50 ? 2 : 1);
+        blendWeight->SetValue(pointId,
+                              policy == MultiZoneOverlapPolicy::Blend50_50 ? 0.5 : 1.0);
+    }
+    pointData->AddArray(ownership);
+    pointData->AddArray(blendWeight);
+    pointData->AddArray(backgroundIds);
+    pointData->AddArray(foregroundIds);
+
+    vtkNew<vtkUnsignedCharArray> interfacePoints;
+    interfacePoints->SetName(kMultiZoneInterfaceArray);
+    interfacePoints->SetNumberOfTuples(background->GetNumberOfPoints());
+    interfacePoints->FillValue(0);
+    vtkNew<vtkUnsignedCharArray> interfaceCells;
+    interfaceCells->SetName(kMultiZoneInterfaceArray);
+    interfaceCells->SetNumberOfTuples(background->GetNumberOfCells());
+    interfaceCells->FillValue(0);
+    vtkNew<vtkIdList> pointIds;
+    for (vtkIdType cellId = 0; cellId < background->GetNumberOfCells(); ++cellId) {
+        background->GetCellPoints(cellId, pointIds);
+        if (pointIds->GetNumberOfIds() <= 1) {
+            continue;
+        }
+        const int firstOwnership = ownership->GetValue(pointIds->GetId(0));
+        bool crossesOwnership = false;
+        for (vtkIdType index = 1; index < pointIds->GetNumberOfIds(); ++index) {
+            if (ownership->GetValue(pointIds->GetId(index)) != firstOwnership) {
+                crossesOwnership = true;
+                break;
+            }
+        }
+        if (!crossesOwnership) {
+            continue;
+        }
+        interfaceCells->SetValue(cellId, 1);
+        for (vtkIdType index = 0; index < pointIds->GetNumberOfIds(); ++index) {
+            interfacePoints->SetValue(pointIds->GetId(index), 1);
+        }
+    }
+    pointData->AddArray(interfacePoints);
+    cellData->AddArray(interfaceCells);
+
+    vtkNew<vtkUnsignedCharArray> backgroundCut;
+    backgroundCut->SetName(kMultiZoneBackgroundCutArray);
+    backgroundCut->SetNumberOfTuples(background->GetNumberOfCells());
+    backgroundCut->FillValue(0);
+    if (policy == MultiZoneOverlapPolicy::CutBackground) {
+        for (vtkIdType cellId = 0; cellId < background->GetNumberOfCells(); ++cellId) {
+            background->GetCellPoints(cellId, pointIds);
+            if (pointIds->GetNumberOfIds() <= 0) {
+                continue;
+            }
+            Vec3 centre;
+            for (vtkIdType index = 0; index < pointIds->GetNumberOfIds(); ++index) {
+                background->GetPoint(pointIds->GetId(index), point);
+                centre = Add(centre, {point[0], point[1], point[2]});
+            }
+            centre = Scale(centre, 1.0 / static_cast<double>(pointIds->GetNumberOfIds()));
+            const double centreArray[3] = {centre.x, centre.y, centre.z};
+            if (FindContainingCell(foregroundLocator, locatorCell, &weights, centreArray)) {
+                backgroundCut->SetValue(cellId, 1);
+            }
+        }
+    }
+    cellData->AddArray(backgroundCut);
+}
+
+void SetMultiZoneLogicalTime(vtkDataSet* dataSet, double time) {
+    if (dataSet == nullptr || !IsFiniteTime(time)) {
+        throw std::runtime_error("Cannot attach a non-finite logical time to a mesh-set frame.");
+    }
+    vtkFieldData* fieldData = dataSet->GetFieldData();
+    if (fieldData == nullptr) {
+        vtkNew<vtkFieldData> createdFieldData;
+        dataSet->SetFieldData(createdFieldData);
+        fieldData = dataSet->GetFieldData();
+    }
+    if (fieldData == nullptr) {
+        throw std::runtime_error("Cannot attach logical time to a mesh-set frame.");
+    }
+    fieldData->RemoveArray(kTimeValueArray);
+    vtkNew<vtkDoubleArray> logicalTime;
+    logicalTime->SetName(kTimeValueArray);
+    logicalTime->SetNumberOfComponents(1);
+    logicalTime->SetNumberOfTuples(1);
+    logicalTime->SetValue(0, time);
+    fieldData->AddArray(logicalTime);
+}
+
+vtkSmartPointer<vtkDataSet> ReadMultiZoneManifestFrame(const DataSetFrame& frame,
+                                                        const ReadOptions& options) {
+    const MultiZoneManifest manifest = ParseMultiZoneManifest(frame.path);
+    const std::vector<DataSetFrame> firstFrames =
+        EnumerateDataSetFrames(manifest.zones[0].source);
+    const std::vector<DataSetFrame> secondFrames =
+        EnumerateDataSetFrames(manifest.zones[1].source);
+    const DataSetFrame& firstFrame =
+        SelectZoneFrame(firstFrames, frame.sourceIndex, manifest.path);
+    const DataSetFrame& secondFrame =
+        SelectZoneFrame(secondFrames, frame.sourceIndex, manifest.path);
+    ReadOptions sourceOptions = options;
+    sourceOptions.failOnVtkXmlReadErrors = true;
+    vtkSmartPointer<vtkDataSet> firstSource = ReadDataSet(firstFrame, sourceOptions);
+    vtkSmartPointer<vtkDataSet> secondSource = ReadDataSet(secondFrame, sourceOptions);
+    const int backgroundZone = frame.multiZoneBackgroundIndex == 0 ||
+                                       frame.multiZoneBackgroundIndex == 1
+                                   ? frame.multiZoneBackgroundIndex
+                                   : ResolveMultiZoneBackground(manifest, firstFrames, secondFrames);
+    const int foregroundZone = backgroundZone == 0 ? 1 : 0;
+    const MultiZoneZone& selectedBackground =
+        manifest.zones[static_cast<std::size_t>(backgroundZone)];
+    if (selectedBackground.motion == MultiZoneMotion::Rigid &&
+        (selectedBackground.angularVelocity != 0.0 ||
+         !IsZero(selectedBackground.linearVelocity))) {
+        throw std::runtime_error("The selected background zone must be static so the "
+                                 "canonical world reference geometry remains fixed: " +
+                                 manifest.path.string());
+    }
+
+    const auto requireStableForegroundLocalGeometry =
+        [&](vtkDataSet* currentSource,
+            const std::vector<DataSetFrame>& sourceFrames,
+            const MultiZoneZone& zone,
+            int zoneIndex) {
+            if (frame.sourceIndex <= 0 || sourceFrames.size() <= 1 ||
+                zone.velocityFrame == MultiZoneVelocityFrame::World) {
+                return;
+            }
+            ReadOptions geometryOnly = sourceOptions;
+            geometryOnly.readAllArrays = false;
+            geometryOnly.attachSourceBlockIds = false;
+            // Keep the source's topology-affecting options identical to the
+            // current frame.  In particular, Nek5000's optional linearized
+            // topology must not make an otherwise unchanged local geometry
+            // look different merely because this comparison reads no fields.
+            vtkSmartPointer<vtkDataSet> referenceSource = ReadDataSet(
+                sourceFrames.front(), geometryOnly);
+            vtkSmartPointer<vtkUnstructuredGrid> referenceLocal = MakeWorldZone(
+                referenceSource, zone, zoneIndex, 0.0, false);
+            vtkSmartPointer<vtkUnstructuredGrid> currentLocal = MakeWorldZone(
+                currentSource, zone, zoneIndex, 0.0, false);
+            RequireSameReferenceGeometry(
+                referenceLocal, currentLocal, manifest.path,
+                "The foreground local geometry required for zone/relative velocity");
+        };
+    if (foregroundZone == 0) {
+        requireStableForegroundLocalGeometry(firstSource, firstFrames, manifest.zones[0], 0);
+    } else {
+        requireStableForegroundLocalGeometry(secondSource, secondFrames, manifest.zones[1], 1);
+    }
+
+    bool firstHasWorldVelocity = false;
+    bool secondHasWorldVelocity = false;
+    vtkSmartPointer<vtkUnstructuredGrid> firstWorld = MakeWorldZone(
+        firstSource, manifest.zones[0], 0, frame.time, options.readAllArrays,
+        &firstHasWorldVelocity);
+    vtkSmartPointer<vtkUnstructuredGrid> secondWorld = MakeWorldZone(
+        secondSource, manifest.zones[1], 1, frame.time, options.readAllArrays,
+        &secondHasWorldVelocity);
+    if (options.readAllArrays && !(firstHasWorldVelocity && secondHasWorldVelocity)) {
+        // A canonical Velocity is valid only when both zones supplied a velocity
+        // that was transformed into the same world reference frame. Never leave
+        // a one-zone Velocity behind for a velocity solver to mistake as complete.
+        firstWorld->GetPointData()->RemoveArray(kCanonicalVelocityArray);
+        secondWorld->GetPointData()->RemoveArray(kCanonicalVelocityArray);
+    }
+    vtkSmartPointer<vtkUnstructuredGrid> background =
+        backgroundZone == 0 ? firstWorld : secondWorld;
+    vtkSmartPointer<vtkUnstructuredGrid> foreground =
+        foregroundZone == 0 ? firstWorld : secondWorld;
+    if (frame.sourceIndex > 0) {
+        const std::vector<DataSetFrame>& backgroundFrames =
+            backgroundZone == 0 ? firstFrames : secondFrames;
+        vtkSmartPointer<vtkDataSet> referenceSource = ReadDataSet(
+            backgroundFrames.front(), sourceOptions);
+        vtkSmartPointer<vtkUnstructuredGrid> referenceWorld = MakeWorldZone(
+            referenceSource, manifest.zones[static_cast<std::size_t>(backgroundZone)],
+            backgroundZone, frame.time, options.readAllArrays);
+        RequireSameReferenceGeometry(referenceWorld, background, manifest.path,
+                                     "The selected background");
+    }
+    RequireForegroundWithinBackground(background, foreground, manifest.path);
+
+    vtkNew<vtkStaticCellLocator> foregroundLocator;
+    foregroundLocator->SetDataSet(foreground);
+    foregroundLocator->BuildLocator();
+    RequireForegroundRepresentableOnBackground(background, foreground, manifest.path);
+    const std::vector<PointArrayPair> arrays = SharedPointArrays(
+        background->GetPointData(), background->GetNumberOfPoints(),
+        foreground->GetPointData(), foreground->GetNumberOfPoints(),
+        manifest.overlapPolicy == MultiZoneOverlapPolicy::Blend50_50);
+    vtkNew<vtkGenericCell> locatorCell;
+    std::vector<double> weights(static_cast<std::size_t>(
+        std::max<vtkIdType>(1, foreground->GetMaxCellSize())));
+    double point[3] = {};
+    for (vtkIdType targetPointId = 0; targetPointId < background->GetNumberOfPoints();
+         ++targetPointId) {
+        background->GetPoint(targetPointId, point);
+        if (!FindContainingCell(foregroundLocator, locatorCell, &weights, point)) {
+            continue;
+        }
+        vtkIdList* sourcePointIds = locatorCell->GetPointIds();
+        if (sourcePointIds == nullptr || sourcePointIds->GetNumberOfIds() <= 0) {
+            continue;
+        }
+        const double blend = manifest.overlapPolicy == MultiZoneOverlapPolicy::Blend50_50
+                                 ? 0.5
+                                 : 1.0;
+        for (const PointArrayPair& pair : arrays) {
+            if (pair.target == nullptr || pair.source == nullptr ||
+                pair.target->GetNumberOfTuples() != background->GetNumberOfPoints() ||
+                pair.source->GetNumberOfTuples() != foreground->GetNumberOfPoints() ||
+                (blend < 1.0 && !IsFloatingPointArray(pair.target))) {
+                continue;
+            }
+            for (int component = 0;
+                 component < pair.target->GetNumberOfComponents(); ++component) {
+                double sampled = 0.0;
+                for (vtkIdType localId = 0; localId < sourcePointIds->GetNumberOfIds();
+                     ++localId) {
+                    sampled += weights[static_cast<std::size_t>(localId)] *
+                               pair.source->GetComponent(sourcePointIds->GetId(localId), component);
+                }
+                const double original = pair.target->GetComponent(targetPointId, component);
+                pair.target->SetComponent(targetPointId, component,
+                                          (1.0 - blend) * original + blend * sampled);
+            }
+        }
+    }
+    AttachMultiZoneProvenance(background, foregroundLocator, backgroundZone,
+                              foregroundZone, manifest.overlapPolicy);
+    SetMultiZoneLogicalTime(background, frame.time);
+    return background;
+}
+
 vtkSmartPointer<vtkDataSet> ReadOrdinaryVtk(const std::filesystem::path& path,
                                             const ReadOptions& options) {
     const std::string extension = LowerExtension(path);
@@ -209,6 +1940,24 @@ vtkSmartPointer<vtkDataSet> ReadOrdinaryVtk(const std::filesystem::path& path,
         object = reader->GetOutputDataObject(0);
     } else {
         vtkNew<vtkXMLGenericDataObjectReader> reader;
+        bool reportedReadError = false;
+        vtkSmartPointer<vtkCallbackCommand> errorObserver;
+        if (options.failOnVtkXmlReadErrors) {
+            errorObserver = vtkSmartPointer<vtkCallbackCommand>::New();
+            errorObserver->SetClientData(&reportedReadError);
+            errorObserver->SetCallback(
+                [](vtkObject*, unsigned long, void* clientData, void*) {
+                    *static_cast<bool*>(clientData) = true;
+                });
+            // vtkXMLGenericDataObjectReader delegates actual array reads to a
+            // concrete child reader. Its output may otherwise look usable after
+            // that child rejects a short PointData array, silently turning an
+            // invalid Velocity into a missing one. Mesh-set composition opts
+            // into propagating either parser or child-reader error.
+            reader->AddObserver(vtkCommand::ErrorEvent, errorObserver);
+            reader->SetReaderErrorObserver(errorObserver);
+            reader->SetParserErrorObserver(errorObserver);
+        }
         reader->SetFileName(path.string().c_str());
         reader->UpdateInformation();
         if (!options.readAllArrays) {
@@ -223,6 +1972,10 @@ vtkSmartPointer<vtkDataSet> ReadOrdinaryVtk(const std::filesystem::path& path,
             }
         }
         reader->Update();
+        if (options.failOnVtkXmlReadErrors && reportedReadError) {
+            throw std::runtime_error("Cannot read VTK XML data from '" +
+                                     path.string() + "'.");
+        }
         object = reader->GetOutputDataObject(0);
     }
     return CollapseDataObject(object, options, path);
@@ -2847,8 +4600,22 @@ std::string ToString(DataSetFrameKind kind) {
         return "ensight_gold_time_step";
     case DataSetFrameKind::OpenFoamTimeStep:
         return "openfoam_time_step";
+    case DataSetFrameKind::MultiZoneManifestTimeStep:
+        return "two_zone_manifest_time_step";
     }
     throw std::runtime_error("Unknown dataset frame kind.");
+}
+
+bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath) {
+    if (LowerExtension(sourcePath) != ".scpm") {
+        return false;
+    }
+    try {
+        ParseMultiZoneManifest(sourcePath);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
@@ -2875,6 +4642,9 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
         return false;
     }
     const std::string extension = LowerExtension(sourcePath);
+    if (extension == ".scpm") {
+        return IsMultiZoneMeshManifest(sourcePath);
+    }
     return IsOrdinaryVtkExtension(extension) || extension == ".pvd" ||
            (extension == ".nek5000" || extension == ".nek") ||
            extension == ".case" ||
@@ -2919,6 +4689,9 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
                                  sourcePath.string());
     }
     const std::string extension = LowerExtension(sourcePath);
+    if (extension == ".scpm") {
+        return EnumerateMultiZoneManifestFrames(sourcePath, fallbackPhysicalDt);
+    }
     if (extension == ".pvd") {
         return ParsePvd(sourcePath, fallbackPhysicalDt);
     }
@@ -2992,13 +4765,31 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
     }
     const std::vector<std::filesystem::path> expanded =
         streamcenterplus::vtkhdf::ExpandTimeSteps(sourcePath);
+    const bool isVtkHdf = streamcenterplus::vtkhdf::IsVtkHdfPath(sourcePath);
+    std::vector<double> nativeTimes;
+    if (isVtkHdf) {
+        nativeTimes = streamcenterplus::vtkhdf::TimeValues(sourcePath);
+        if (nativeTimes.size() != expanded.size() ||
+            !std::all_of(nativeTimes.cbegin(), nativeTimes.cend(), IsFiniteTime)) {
+            throw std::runtime_error(
+                "VTKHDF transient time metadata is missing, non-finite, or inconsistent "
+                "with its frame count: " + sourcePath.string());
+        }
+    }
     std::vector<DataSetFrame> frames;
     frames.reserve(expanded.size());
     for (std::size_t i = 0; i < expanded.size(); ++i) {
         DataSetFrame frame;
         frame.path = expanded[i];
-        frame.time = static_cast<double>(i) * fallbackPhysicalDt;
+        frame.time = isVtkHdf ? nativeTimes[i] : static_cast<double>(i) * fallbackPhysicalDt;
         frame.kind = DataSetFrameKind::File;
+        // File frames normally have no reader-time value, and folder
+        // enumeration uses that fact to assign its fallback cadence. Preserve
+        // a VTKHDF file's native time explicitly so a directory source cannot
+        // overwrite non-uniform transient times.
+        if (isVtkHdf) {
+            frame.readerTime = nativeTimes[i];
+        }
         frame.sourceIndex = static_cast<int>(i);
         frames.push_back(std::move(frame));
     }
@@ -3026,6 +4817,8 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const DataSetFrame& frame,
         return ReadEnSightGold(frame, options);
     case DataSetFrameKind::OpenFoamTimeStep:
         return ReadOpenFoam(frame, options);
+    case DataSetFrameKind::MultiZoneManifestTimeStep:
+        return ReadMultiZoneManifestFrame(frame, options);
     }
     throw std::runtime_error("Unsupported dataset frame kind.");
 }

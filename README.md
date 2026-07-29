@@ -22,6 +22,114 @@ The command-line release is always installed below this repository at `release/t
 
 Nek5000 parsing and spectral-element numerics are implemented in this module. EnSight Gold and OpenFOAM parsing use the corresponding readers from the pinned VTK dependency. Composite parts are retained as separate point sets while being assembled, and `SCP_SourceBlockId` records their source block.
 
+### Two-zone `.scpm` manifests
+
+The reader and Resample tool also accept a lightweight `key=value` `.scpm`
+mesh-set source. It is deliberately limited to exactly two zones and projects
+them onto one fixed world-reference mesh: the larger reference zone is the
+background (or select it explicitly with `background_zone=0|1`), while the
+other zone supplies values at covered background points. This keeps the point
+count, connectivity and world coordinates invariant for modal solvers while a
+rigid foreground slides or rotates.
+
+```ini
+streamcenterplus_meshset=1
+zone_count=2
+mesh_kind=sliding                 # static | nested | multigrid | sliding
+zone0_source=background.pvd
+zone0_motion=static
+zone0_velocity_frame=world
+zone1_source=rotor.pvd
+zone1_motion=rigid
+zone1_translation=2,2,0
+zone1_rotation_axis=0,0,1
+zone1_rotation_origin=0,0,0        # optional, defaults to 0,0,0
+zone1_angular_velocity=62.831853   # rad/s
+zone1_phase=0                      # rad
+zone1_linear_velocity=0,0,0        # optional world translation rate
+zone1_velocity_frame=relative      # world | zone | relative
+zone1_velocity_components=u,v,w    # or zone1_velocity_array=Velocity
+overlap_policy=cut_background      # or blend_50_50
+```
+
+`zoneN_source` paths are relative to the manifest when not absolute. Dynamic
+sources must have the same frame count and times; a one-frame source is held
+static. `sliding` requires at least one `rigid` zone. The selected background
+must have no angular or linear motion; otherwise the reader fails rather than
+silently changing the modal reference geometry. The default background choice
+is made once from the two reference frames, never per moving frame. Conversely,
+a non-zero rigid angular or linear velocity requires `mesh_kind=sliding` so
+solver capability checks cannot mistake moving data for a static mesh set.
+Every later background frame is checked against that reference for point
+coordinates, cell types, point counts and ordered cell connectivity.
+For a dynamic foreground declared with `velocity_frame=zone` or `relative`,
+its source-local coordinates and ordered connectivity must likewise remain
+unchanged across frames; only the declared rigid transform may move it. This
+prevents a changing local mesh from being silently interpreted in the wrong
+velocity reference frame. The manifest schema is closed: only the documented
+top-level and `zone0_`/`zone1_` keys are accepted, so misspelled settings fail
+at load time instead of falling back to defaults.
+
+Input velocity is normalized to one point-associated `Velocity(double3)` in
+world components. `world` means the supplied velocity is already absolute in
+world axes; `zone` rotates its components with the rigid transform; `relative`
+also adds the rigid mesh velocity. Scalar `u/v/w` and `U/V/W` are recognized,
+and arbitrary scalar names require `velocity_components`; a three-component
+array can be named with `velocity_array`. Original velocity candidates are
+removed from canonical output so consumers cannot accidentally select a
+zone-frame array. `translation` and `linear_velocity` are world vectors;
+`rotation_axis` is a world-axis direction and `rotation_origin` is expressed
+in the zone's input coordinates before the world translation.
+
+Velocity is optional for scalar-only mesh sets: when neither zone resolves a
+velocity, geometry and shared scalar fields are still transformed/composed and
+no canonical `Velocity` is emitted. A velocity is emitted only when both zones
+resolve one; a one-zone velocity is removed rather than being presented as a
+complete world field. Explicit `velocity_array` or `velocity_components`
+declarations remain strict and fail when their arrays are unavailable or have
+the wrong component count.
+
+`cut_background` is a fixed-reference field ownership operation, not dynamic
+VTK cell deletion: foreground values replace covered background point values.
+`blend_50_50` averages covered floating-point point arrays exactly 50:50.
+The diagnostic point arrays `SCP_MeshOwnership` (`0` background, `1`
+foreground, `2` blend) and `SCP_MeshBlendWeight` (`0`, `1`, or `0.5`) must not
+be applied a second time as integration weights. `SCP_MeshBackgroundCut` marks
+covered background cell centres, and point/cell `SCP_MeshInterface` marks
+ownership-crossing stencils. Derivative consumers must exclude
+`SCP_MeshInterface` instead of differentiating across the interface;
+`SCP_MeshBackgroundCut` is a provenance diagnostic, not a derivative mask, so
+foreground-owned interior samples remain differentiable. The foreground must
+be physically inside the background volume
+(not merely inside its bounding box), and every foreground cell must contain a
+fixed background point degree of freedom. A fine cell wholly embedded in a
+coarse background cell therefore fails closed; refine or pre-resample the
+background rather than silently losing foreground data. The canonical
+reference mesh cannot represent a foreground that exits its bounds, so that
+case also fails closed. `SCP_Nek5000*` quadrature/reference/Jacobian arrays
+and recognized integration or spatial-weight arrays always retain the fixed
+background values; they are never cut or blended from the foreground.
+Ordinary analysis PointData must be present with the same component count and
+exactly one tuple per zone point in both zones. A background-only,
+component-mismatched, or truncated field is removed from the canonical result
+rather than silently retaining stale background values in the
+foreground-covered region.
+When Resample promotes CellData to PointData, reader-composed point arrays win
+over same-named CellData, `SCP_MeshInterface` remains its canonical point mask,
+and the categorical cell cut is conservatively promoted to a point mask.
+Cell-only data and
+unidentified non-velocity vector/tensor fields are not reference-frame
+transformed. A named/declared cell-associated velocity is first averaged onto
+its zone points before world-frame conversion and its selected raw CellData
+array plus standard velocity aliases are removed, so Resample cannot overwrite
+canonical point `Velocity`.
+Other cell-only analysis fields remain background diagnostics rather than
+canonical remapped fields. For a reader-composed two-zone input, Resample
+does not promote any remaining CellData to PointData: this prevents a
+background-only CellData field from reappearing in the foreground-covered
+region after the reader has correctly removed its unavailable PointData
+counterpart.
+
 The implementation follows the official [Nek5000 field-file description](https://nek5000.github.io/NekDoc/problem_setup/case_files.html) for the 132-byte `#std` header, endian tag, element map and field blocks. Its numerical treatment follows Nek5000's documented [GLL/GL placement and element-local derivative semantics](https://nek5000.github.io/NekDoc/faq.html). Linear quad/hex subcells are emitted only as a VTK-compatible visualization/topology view, matching the role described by VTK's [`vtkNek5000Reader`](https://vtk.org/doc/nightly/html/classvtkNek5000Reader.html); integration, gradients and resampling use the retained spectral metadata instead.
 
 Three Nek5000 interpretation boundaries are explicit:
@@ -59,7 +167,7 @@ Windows target and host dependency builds use the module overlay triplet with th
 
 Inside the Streamcenter+ superproject, the installer automatically uses the superproject checkout at `.deps/vcpkg`; detached use automatically uses this module's `.deps/vcpkg`. In both cases installed packages remain private at `SCP-ResamplerIO/.deps/vcpkg_installed`.
 
-`SCP-SolverSDK` is resolved from the fixed sibling `../SCP-SolverSDK` checkout/installed release when present. A detached `SCP-ResamplerIO` checkout instead bootstraps `https://github.com/hweifluids/SCP-SolverSDK.git` at the exact tag `v0.1.0` into `.deps/SCP-SolverSDK`; the `VERSION` contract and exact checked-out tag are validated before configure. If the repository or tag has not yet been published, installation stops with an explicit publication error. The installers expose no external component-path override.
+`SCP-SolverSDK` is resolved from the fixed sibling `../SCP-SolverSDK` checkout/installed release when present. A detached `SCP-ResamplerIO` checkout instead bootstraps `https://github.com/hweifluids/SCP-SolverSDK.git` at the exact tag `v0.2.0` into `.deps/SCP-SolverSDK`; the `VERSION` contract and exact checked-out tag are validated before configure. If the repository or tag has not yet been published, installation stops with an explicit publication error. The installers expose no external component-path override.
 
 ## CMake consumption
 

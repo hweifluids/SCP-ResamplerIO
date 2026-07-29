@@ -724,6 +724,8 @@ std::string ToString(DataSetFrameKind value) {
         return "ensight_gold_time_step";
     case DataSetFrameKind::OpenFoamTimeStep:
         return "openfoam_time_step";
+    case DataSetFrameKind::MultiZoneManifestTimeStep:
+        return "two_zone_manifest_time_step";
     }
     return "unknown";
 }

@@ -32,11 +32,39 @@ inline constexpr const char* kNek5000ElementIdsField =
 inline constexpr const char* kNek5000RepresentationField =
     "SCP_Nek5000Representation";
 
+// Point-data provenance emitted when a two-zone .scpm manifest is read.  The
+// returned data set always uses the larger zone as a fixed world-reference
+// mesh.  These arrays describe how each reference point was populated; they
+// are diagnostics and must not be multiplied into integration weights.
+inline constexpr const char* kMultiZoneCanonicalVelocityArray =
+    "Velocity";
+inline constexpr const char* kMultiZoneOwnershipArray =
+    "SCP_MeshOwnership";
+inline constexpr const char* kMultiZoneBlendWeightArray =
+    "SCP_MeshBlendWeight";
+inline constexpr const char* kMultiZoneBackgroundZoneArray =
+    "SCP_MeshBackgroundZone";
+inline constexpr const char* kMultiZoneForegroundZoneArray =
+    "SCP_MeshForegroundZone";
+// Cell-data diagnostic only.  A value of one says the cell centre is covered
+// by the foreground zone.  It is deliberately not vtkGhostType: the fixed
+// reference topology remains valid for modal analysis and resampling.
+inline constexpr const char* kMultiZoneBackgroundCutArray =
+    "SCP_MeshBackgroundCut";
+// Point and cell arrays with this same name mark a canonical reference
+// stencil that crosses ownership. Gradient-based consumers should exclude
+// these locations rather than differentiating through a cut/sliding interface.
+inline constexpr const char* kMultiZoneInterfaceArray =
+    "SCP_MeshInterface";
+
 enum class DataSetFrameKind {
     File,
     Nek5000TimeStep,
     EnSightGoldTimeStep,
     OpenFoamTimeStep,
+    // A logical time frame assembled from exactly two data sources described
+    // by a Streamcenter+ mesh-set manifest (.scpm).
+    MultiZoneManifestTimeStep,
 };
 
 struct DataSetFrame {
@@ -51,6 +79,10 @@ struct DataSetFrame {
     // means that the source kind does not use a separate coordinate frame or
     // that a caller constructed the frame without enumeration metadata.
     int coordinateSourceIndex = -1;
+    // Set only for MultiZoneManifestTimeStep frames.  It records the stable
+    // source-zone choice made while enumerating the manifest, so every frame
+    // in a modal sequence uses identical reference topology.
+    int multiZoneBackgroundIndex = -1;
 };
 
 struct ReadOptions {
@@ -72,6 +104,11 @@ struct ReadOptions {
     bool attachNek5000ReferenceWeightArray = true;
     bool attachNek5000JacobianDeterminantArray = true;
     bool attachNek5000QuadratureWeightArray = true;
+    // The generic XML reader normally logs child-reader array failures and
+    // still returns a partial data object. Mesh-set composition opts into a
+    // fail-closed policy; ordinary single-grid reads retain their established
+    // fast path and VTK error-handling behavior.
+    bool failOnVtkXmlReadErrors = false;
 };
 
 struct Nek5000SpectralMetadata {
@@ -147,6 +184,11 @@ private:
 
 std::string ToString(DataSetFrameKind kind);
 bool IsSupportedDataSource(const std::filesystem::path& sourcePath);
+// Returns true only for a syntactically valid Streamcenter+ two-zone manifest.
+// A manifest is intentionally a source, rather than a new solver input type:
+// callers continue to use EnumerateDataSetFrames/ReadDataSet and receive a
+// fixed-world-reference vtkDataSet.
+bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath);
 
 // Enumerates logical frames without converting the source to an intermediate
 // VTK file. A directory is treated as an OpenFOAM case when it contains a

@@ -64,6 +64,7 @@ enum class DataSetFrameKind {
     Nek5000TimeStep,
     EnSightGoldTimeStep,
     OpenFoamTimeStep,
+    MultiZoneManifestTimeStep,
 };
 
 struct LinearParameters {
@@ -135,6 +136,7 @@ struct FrameInfo {
     std::filesystem::path coordinatePath;
     int sourceIndex = 0;
     int coordinateSourceIndex = -1;
+    int multiZoneBackgroundIndex = -1;
 };
 
 struct SequenceInfo {

@@ -37,14 +37,15 @@ $moduleRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $vcpkgCommit = "42f37e46d37baf7b218966434b91116bddf73461"
 $vcpkgRepository = "https://github.com/microsoft/vcpkg.git"
 $sdkRepository = "https://github.com/hweifluids/SCP-SolverSDK.git"
-$sdkTag = "v0.1.0"
-$sdkVersion = "0.1.0"
+$sdkTag = "v0.2.0"
+$sdkVersion = "0.2.0"
 $BuildDir = Join-Path $moduleRoot ".build\windows-x64"
 $InstallDir = Join-Path $moduleRoot "release"
 $VcpkgInstalledDir = Join-Path $moduleRoot ".deps\vcpkg_installed"
 $VcpkgTriplet = "x64-windows-release"
 $Generator = "Visual Studio 17 2022"
 $Architecture = "x64"
+$Toolset = "v143"
 
 $superprojectRoot = Resolve-ComponentSuperprojectRoot -ModuleRoot $moduleRoot -ComponentName "SCP-ResamplerIO"
 $VcpkgRoot = if ($null -ne $superprojectRoot) {
@@ -89,6 +90,10 @@ if ($null -eq $cmake) {
 $git = Get-Command git -ErrorAction SilentlyContinue
 if ($null -eq $git) {
     throw "Git is required for the pinned vcpkg bootstrap and was not found on PATH."
+}
+$windowsPowerShell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+if ($null -eq $windowsPowerShell) {
+    throw "Windows PowerShell is required by vcpkg's MSBuild deployment step."
 }
 
 $vcpkgExe = Join-Path $VcpkgRoot "vcpkg.exe"
@@ -191,10 +196,11 @@ $configureArgs = @(
     "-DVCPKG_HOST_TRIPLET=$VcpkgTriplet",
     "-DVCPKG_OVERLAY_TRIPLETS=$(Join-Path $moduleRoot 'cmake\triplets')",
     "-DVCPKG_INSTALLED_DIR=$VcpkgInstalledDir",
+    "-DZ_VCPKG_POWERSHELL_PATH=$($windowsPowerShell.Source)",
     "-DSCP_RESAMPLER_IO_BUILD_TOOL=ON"
 )
 if ($Generator -like "Visual Studio*") {
-    $configureArgs += @("-A", $Architecture)
+    $configureArgs += @("-A", $Architecture, "-T", $Toolset)
 }
 Invoke-NativeCommand -Executable $cmake.Source `
     -Arguments $configureArgs `

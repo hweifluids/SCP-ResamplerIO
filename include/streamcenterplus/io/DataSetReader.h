@@ -191,9 +191,10 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath);
 bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath);
 
 // Enumerates logical frames without converting the source to an intermediate
-// VTK file. A directory is treated as an OpenFOAM case when it contains a
-// *.foam marker (or a recognizable system/constant/processor layout), and as a
-// normal VTK frame directory otherwise.
+// VTK file.  Direct sources include VTK data, Tecplot ASCII (.dat) and classic
+// binary PLT (.plt) finite-element data. A directory is treated as an OpenFOAM
+// case when it contains a *.foam marker (or a recognizable
+// system/constant/processor layout), and as a normal frame directory otherwise.
 std::vector<DataSetFrame> EnumerateDataSetFrames(
     const std::filesystem::path& sourcePath,
     double fallbackPhysicalDt = 1.0);

@@ -1,4 +1,5 @@
 #include "streamcenterplus/io/DataSetReader.h"
+#include "TecplotReader.h"
 
 #include <streamcenterplus/VtkHdfIO.h>
 
@@ -36,6 +37,7 @@
 #include <vtkStringArray.h>
 #include <vtkStaticCellLocator.h>
 #include <vtkStaticPointLocator.h>
+#include <vtkTecplotReader.h>
 #include <vtkUnsignedCharArray.h>
 #include <vtkUnstructuredGrid.h>
 #include <vtkXMLGenericDataObjectReader.h>
@@ -107,6 +109,14 @@ bool IsOrdinaryVtkExtension(const std::string& extension) {
     return extension == ".vtk" || extension == ".vti" || extension == ".vtr" ||
            extension == ".vts" || extension == ".vtu" || extension == ".vtp" ||
            extension == ".vtm" || extension == ".vtkhdf";
+}
+
+bool IsTecplotExtension(const std::string& extension) {
+    return extension == ".dat" || extension == ".plt";
+}
+
+bool IsDirectDataExtension(const std::string& extension) {
+    return IsOrdinaryVtkExtension(extension) || IsTecplotExtension(extension);
 }
 
 constexpr const char* kCanonicalVelocityArray = kMultiZoneCanonicalVelocityArray;
@@ -1938,6 +1948,18 @@ vtkSmartPointer<vtkDataSet> ReadOrdinaryVtk(const std::filesystem::path& path,
         }
         reader->Update();
         object = reader->GetOutputDataObject(0);
+    } else if (IsTecplotExtension(extension)) {
+        if (detail::IsClassicTecplotBinaryFile(path)) {
+            object = detail::ReadClassicTecplotBinary(path);
+        } else {
+            // Tecplot users occasionally retain a .plt extension for an
+            // ASCII data file.  VTK's reader handles both that convention and
+            // regular .dat files, while classic binary PLT is handled above.
+            vtkNew<vtkTecplotReader> reader;
+            reader->SetFileName(path.string().c_str());
+            reader->Update();
+            object = reader->GetOutputDataObject(0);
+        }
     } else {
         vtkNew<vtkXMLGenericDataObjectReader> reader;
         bool reportedReadError = false;
@@ -3622,7 +3644,7 @@ std::vector<DataSetFrame> EnumerateFolder(const std::filesystem::path& folder,
                 nek5000Stems.end()) {
             continue;
         }
-        if (!IsOrdinaryVtkExtension(extension) && extension != ".nek5000" &&
+        if (!IsDirectDataExtension(extension) && extension != ".nek5000" &&
             extension != ".nek" &&
             extension != ".case") {
             continue;
@@ -4629,7 +4651,7 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
                 continue;
             }
             const std::string extension = LowerExtension(entry.path());
-            if (IsOrdinaryVtkExtension(extension) || extension == ".pvd" ||
+            if (IsDirectDataExtension(extension) || extension == ".pvd" ||
                 extension == ".nek5000" || extension == ".nek" ||
                 extension == ".case") {
                 return true;
@@ -4645,7 +4667,7 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
     if (extension == ".scpm") {
         return IsMultiZoneMeshManifest(sourcePath);
     }
-    return IsOrdinaryVtkExtension(extension) || extension == ".pvd" ||
+    return IsDirectDataExtension(extension) || extension == ".pvd" ||
            (extension == ".nek5000" || extension == ".nek") ||
            extension == ".case" ||
            extension == ".foam";
@@ -4760,11 +4782,13 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
         }
         return frames;
     }
-    if (!IsOrdinaryVtkExtension(extension)) {
+    if (!IsDirectDataExtension(extension)) {
         throw std::runtime_error("Unsupported dataset source: " + sourcePath.string());
     }
     const std::vector<std::filesystem::path> expanded =
-        streamcenterplus::vtkhdf::ExpandTimeSteps(sourcePath);
+        IsTecplotExtension(extension)
+            ? std::vector<std::filesystem::path>{sourcePath}
+            : streamcenterplus::vtkhdf::ExpandTimeSteps(sourcePath);
     const bool isVtkHdf = streamcenterplus::vtkhdf::IsVtkHdfPath(sourcePath);
     std::vector<double> nativeTimes;
     if (isVtkHdf) {

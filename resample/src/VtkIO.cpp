@@ -48,7 +48,25 @@ bool IsSupportedDataFile(const std::filesystem::path& path) {
     return ext == ".vtk" || ext == ".vti" || ext == ".vtr" ||
            ext == ".vts" || ext == ".vtu" || ext == ".vtp" ||
            ext == ".vtkhdf" || ext == ".nek5000" || ext == ".nek" ||
-           ext == ".case" || ext == ".foam" || ext == ".scpm";
+           ext == ".case" || ext == ".foam" || ext == ".scpm" ||
+           ext == ".dat" || ext == ".plt";
+}
+
+bool RequiresSharedDataSetReader(const FrameInfo& frame,
+                                 const std::string& extension) {
+    return frame.kind != DataSetFrameKind::File ||
+           extension == ".nek5000" || extension == ".nek" ||
+           extension == ".case" || extension == ".foam" ||
+           extension == ".scpm" || extension == ".dat" ||
+           extension == ".plt";
+}
+
+bool RequiresEnumeratedFrame(const FrameInfo& frame,
+                             const std::string& extension) {
+    return frame.kind == DataSetFrameKind::File && !frame.readerTime.has_value() &&
+           (extension == ".nek5000" || extension == ".nek" ||
+            extension == ".case" || extension == ".foam" ||
+            extension == ".scpm");
 }
 
 DataSetFrameKind FromIoFrameKind(streamcenterplus::io::DataSetFrameKind kind) {
@@ -464,11 +482,8 @@ std::array<double, 6> ReadDataSetBounds(const std::filesystem::path& filePath) {
 std::array<double, 6> ReadDataSetBounds(const FrameInfo& frame) {
     const std::filesystem::path& filePath = frame.path;
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
-    if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
-        ext == ".nek" ||
-        ext == ".case" || ext == ".foam" || ext == ".scpm") {
-        if (!frame.readerTime.has_value() &&
-            frame.kind != DataSetFrameKind::MultiZoneManifestTimeStep) {
+    if (RequiresSharedDataSetReader(frame, ext)) {
+        if (RequiresEnumeratedFrame(frame, ext)) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSetBounds(frames.front());
         }
@@ -536,11 +551,8 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const std::filesystem::path& filePath) {
 vtkSmartPointer<vtkDataSet> ReadDataSet(const FrameInfo& frame) {
     const std::filesystem::path& filePath = frame.path;
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(filePath));
-    if (frame.kind != DataSetFrameKind::File || ext == ".nek5000" ||
-        ext == ".nek" ||
-        ext == ".case" || ext == ".foam" || ext == ".scpm") {
-        if (!frame.readerTime.has_value() &&
-            frame.kind != DataSetFrameKind::MultiZoneManifestTimeStep) {
+    if (RequiresSharedDataSetReader(frame, ext)) {
+        if (RequiresEnumeratedFrame(frame, ext)) {
             const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
             return ReadDataSet(frames.front());
         }

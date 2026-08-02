@@ -89,8 +89,15 @@ bool supportedVtkExtension(const QString& suffix, bool includeNek5000) {
         || ext == QStringLiteral("vtu")
         || ext == QStringLiteral("vtm")
         || ext == QStringLiteral("vtkhdf")
+        || ext == QStringLiteral("dat")
+        || ext == QStringLiteral("plt")
         || (includeNek5000 &&
             (ext == QStringLiteral("nek5000") || ext == QStringLiteral("nek")));
+}
+
+bool isTecplotExtension(const QString& suffix) {
+    const QString ext = suffix.toLower();
+    return ext == QStringLiteral("dat") || ext == QStringLiteral("plt");
 }
 
 QString normalizedOpenFoamCaseType(QString caseType) {
@@ -182,10 +189,16 @@ qlonglong lastNumericTag(const QString& fileName) {
     return tag;
 }
 
-QStringList collectVtkFiles(const QString& folder, bool includeNek5000) {
-    QDir dir(folder);
-    const QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
-                                                    QDir::Name | QDir::IgnoreCase);
+QStringList collectVtkFiles(const QString& sourcePath, bool includeNek5000) {
+    const QFileInfo sourceInfo(sourcePath);
+    QFileInfoList entries;
+    if (sourceInfo.exists() && sourceInfo.isFile() && sourceInfo.isReadable()) {
+        entries.append(sourceInfo);
+    } else {
+        QDir dir(sourcePath);
+        entries = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
+                                    QDir::Name | QDir::IgnoreCase);
+    }
     QList<QPair<QPair<qlonglong, QString>, QString>> tagged;
     for (const QFileInfo& info : entries) {
         if (!supportedVtkExtension(info.suffix(), includeNek5000)) {
@@ -715,6 +728,25 @@ QVector<double> nek5000TimeValues(const QString& filePath, QString* errorMessage
 vtkSmartPointer<vtkDataSet> readAnyVtk(const QString& filePath, QString* errorMessage) {
     const QString ext = vtkExtensionSuffix(filePath);
     vtkDataSet* dataSet = nullptr;
+
+    if (isTecplotExtension(ext)) {
+        try {
+            const std::vector<streamcenterplus::resample::FrameInfo> frames =
+                streamcenterplus::resample::EnumerateDataSetFrames(
+                    fsPathFromQString(filePath));
+            if (frames.empty()) {
+                throw std::runtime_error("The Tecplot source contains no frames.");
+            }
+            return streamcenterplus::resample::ReadDataSet(frames.front());
+        } catch (const std::exception& ex) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QString("Cannot read Tecplot dataset %1:\n%2")
+                                    .arg(filePath,
+                                         QString::fromLocal8Bit(ex.what()));
+            }
+            return nullptr;
+        }
+    }
 
     try {
         if (ext == QStringLiteral("vtkhdf")) {
@@ -2186,10 +2218,12 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                                                  const ProgressCallback& progress,
                                                  const CancellationCallback& shouldCancel) {
     FlowDataScanResult result;
-    result.sourceFolder = normalizedPath(folder);
+    const QFileInfo sourceInfo(folder);
+    const bool singleFile = sourceInfo.exists() && sourceInfo.isFile();
+    result.sourceFolder = normalizedPath(singleFile ? sourceInfo.absoluteFilePath() : folder);
     result.entry.dataKind = dataKind;
     result.entry.source = FlowDataSource::Link;
-    result.entry.dataName = QFileInfo(folder).fileName();
+    result.entry.dataName = singleFile ? sourceInfo.completeBaseName() : QFileInfo(folder).fileName();
     result.entry.dataVersion = QDate::currentDate().toString(Qt::ISODate);
     result.entry.fileType = QStringLiteral("vtk series");
 
@@ -2204,21 +2238,38 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
         return result;
     }
 
-    const QDir dir(folder);
-    if (!dir.exists()) {
-        result.errorMessage = QString("Flow data folder does not exist: %1").arg(folder);
+    if (!singleFile) {
+        const QDir dir(folder);
+        if (!dir.exists()) {
+            result.errorMessage = QString("Flow data folder does not exist: %1").arg(folder);
+            return result;
+        }
+    } else if (!sourceInfo.isReadable()) {
+        result.errorMessage = QString("Flow data file is not readable: %1").arg(folder);
         return result;
     }
 
     result.files = collectVtkFiles(folder, dataKind == FlowDataKind::Raw);
     if (result.files.isEmpty()) {
         const QString extensions = dataKind == FlowDataKind::Raw
-            ? QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.nek5000, *.nek")
-            : QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf");
-        result.errorMessage = QString("No VTK series files (%1) were found in %2.").arg(extensions, folder);
+            ? QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.dat, *.plt, *.nek5000, *.nek")
+            : QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.dat, *.plt");
+        result.errorMessage = QString("No supported data files (%1) were found in %2.").arg(extensions, folder);
         return result;
     }
     if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
+            return vtkExtensionSuffix(file).compare(QStringLiteral("dat"), Qt::CaseInsensitive) == 0;
+        })) {
+        result.entry.fileType = QStringLiteral("tecplot ASCII series");
+    } else if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
+                   return vtkExtensionSuffix(file).compare(QStringLiteral("plt"), Qt::CaseInsensitive) == 0;
+               })) {
+        result.entry.fileType = QStringLiteral("tecplot binary series");
+    } else if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
+                   return isTecplotExtension(vtkExtensionSuffix(file));
+               })) {
+        result.entry.fileType = QStringLiteral("tecplot series");
+    } else if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
             const QString suffix = vtkExtensionSuffix(file);
             return suffix.compare(QStringLiteral("nek5000"), Qt::CaseInsensitive) == 0 ||
                    suffix.compare(QStringLiteral("nek"), Qt::CaseInsensitive) == 0;
@@ -2276,7 +2327,7 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
     result.entry.termCandidates = result.termCandidates;
 
     if (result.termCandidates.isEmpty()) {
-        result.errorMessage = "The first VTK snapshot does not contain numeric point or cell arrays.";
+        result.errorMessage = "The first data snapshot does not contain numeric point or cell arrays.";
         return result;
     }
 
@@ -2296,7 +2347,7 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                 return result;
             }
             if (!boundsEquivalent(first, frame)) {
-                result.errorMessage = QString("VTK snapshot grid coordinates differ from the first frame: %1")
+                result.errorMessage = QString("Snapshot grid coordinates differ from the first frame: %1")
                                           .arg(result.files.at(index));
                 return result;
             }

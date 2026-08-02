@@ -22,6 +22,8 @@ public:
     using ProgressCallback = std::function<void(const QString& stage, int current, int total)>;
     using CancellationCallback = std::function<bool()>;
 
+    // Accepts either a supported data directory or one supported data file.
+    // This includes Tecplot ASCII (.dat) and binary (.plt) sources.
     static FlowDataScanResult scanFolder(const QString& folder,
                                          FlowDataKind dataKind,
                                          bool coordinateCheck,

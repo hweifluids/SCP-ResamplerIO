@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(SCPResamplerIO VERSION 0.1.0 LANGUAGES CXX)
+project(SCPResamplerIO VERSION 0.3.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -71,6 +71,7 @@ find_package(VTK CONFIG REQUIRED COMPONENTS ${SCP_RESAMPLER_IO_VTK_COMPONENTS})
 
 add_library(SCP_ResamplerReaders STATIC
   src/DataSetReader.cpp
+  src/TecplotReader.cpp
 )
 add_library(SCP::ResamplerReaders ALIAS SCP_ResamplerReaders)
 set_target_properties(SCP_ResamplerReaders PROPERTIES EXPORT_NAME ResamplerReaders)
@@ -244,6 +245,23 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
   add_test(NAME SCPResamplerIO.NekSpectralResample
     COMMAND scp_resampler_io_nek_resample
   )
+
+  add_executable(scp_resampler_io_tecplot_resample
+    tests/tecplot-resample/main.cpp
+  )
+  target_link_libraries(scp_resampler_io_tecplot_resample PRIVATE SCP::ResamplerIO)
+  target_compile_definitions(scp_resampler_io_tecplot_resample PRIVATE
+    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+  )
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_tecplot_resample
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.TecplotResample
+    COMMAND scp_resampler_io_tecplot_resample
+  )
+  set_tests_properties(SCPResamplerIO.TecplotResample PROPERTIES TIMEOUT 120)
+
   set_tests_properties(SCPResamplerIO.NativeReaders PROPERTIES TIMEOUT 120)
 
   add_executable(scp_resampler_io_multizone

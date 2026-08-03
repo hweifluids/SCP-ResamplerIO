@@ -14,6 +14,7 @@ struct FlowDataScanResult {
     QString sourceFolder;
     QStringList files;
     QStringList termCandidates;
+    QVector<FlowDataSourceFingerprint> sourceInventory;
     FlowDataEntry entry;
 };
 
@@ -29,6 +30,13 @@ public:
                                          bool coordinateCheck,
                                          const ProgressCallback& progress = {},
                                          const CancellationCallback& shouldCancel = {});
+    // Validates converter staging output and derives dt from its authoritative
+    // PVD time axis in addition to the ordinary VTK metadata scan.
+    static FlowDataScanResult scanConvertedPvdFolder(const QString& folder,
+                                                     FlowDataKind dataKind,
+                                                     bool coordinateCheck,
+                                                     const ProgressCallback& progress = {},
+                                                     const CancellationCallback& shouldCancel = {});
     static FlowDataScanResult scanNek5000File(const QString& filePath,
                                               FlowDataKind dataKind,
                                               bool coordinateCheck,
@@ -53,6 +61,24 @@ public:
                                                    bool commonFieldsOnly,
                                                    const ProgressCallback& progress = {},
                                                    const CancellationCallback& shouldCancel = {});
+    static bool buildEnSightGoldSourceInventory(
+        const QStringList& casePaths,
+        QVector<FlowDataSourceFingerprint>* inventory,
+        QString* errorMessage = nullptr,
+        const ProgressCallback& progress = {},
+        const CancellationCallback& shouldCancel = {});
+    // Copies the exact validated dependency inventory into a private caller-
+    // owned directory, then emits normalized case files that reference only
+    // immutable snapshot copies.  The converter must use the returned paths,
+    // never the original case paths.
+    static bool materializeEnSightGoldSourceSnapshot(
+        const QStringList& casePaths,
+        const QVector<FlowDataSourceFingerprint>& expectedInventory,
+        const QString& snapshotRoot,
+        QStringList* snapshotCasePaths,
+        QString* errorMessage = nullptr,
+        const ProgressCallback& progress = {},
+        const CancellationCallback& shouldCancel = {});
     static bool convertOpenFoamCaseToPvd(const QString& casePath,
                                          const QString& caseType,
                                          const QString& destinationFolder,

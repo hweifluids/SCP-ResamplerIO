@@ -1,4 +1,5 @@
 #include "FlowDataInspector.h"
+#include "FlowDataProtocolLimits.h"
 #include "streamcenterplus_resample/Core.h"
 
 #include <streamcenterplus/VtkHdfIO.h>
@@ -6,6 +7,7 @@
 #include <vtkAbstractArray.h>
 #include <vtkAppendFilter.h>
 #include <vtkCellData.h>
+#include <vtkCellTypes.h>
 #include <vtkCompositeDataIterator.h>
 #include <vtkCompositeDataSet.h>
 #include <vtkDataArray.h>
@@ -29,11 +31,16 @@
 #include <vtkXMLUnstructuredGridWriter.h>
 
 #include <QDate>
+#include <QCryptographicHash>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
+#include <QStorageInfo>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 
@@ -42,30 +49,120 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <numeric>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+bool isFileSystemReparsePoint(const QString& path) {
+#ifdef Q_OS_WIN
+    const std::wstring nativePath = QDir::toNativeSeparators(path).toStdWString();
+    const DWORD attributes = GetFileAttributesW(nativePath.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    return QFileInfo(path).isSymLink();
+#endif
+}
+
+bool directoryChainContainsReparsePoint(const QString& directoryPath) {
+    QString current = QFileInfo(directoryPath).absoluteFilePath();
+    while (!current.isEmpty()) {
+        const QFileInfo info(current);
+        if (!info.exists() || !info.isDir() || info.isSymLink()
+            || isFileSystemReparsePoint(current)) {
+            return true;
+        }
+        const QString parent = info.absoluteDir().absolutePath();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return false;
+}
+
+bool makeSnapshotFileOwnerReadOnly(const QString& path, QString* errorMessage) {
+#ifdef Q_OS_WIN
+    const std::wstring nativePath = QDir::toNativeSeparators(path).toStdWString();
+    const DWORD attributes = GetFileAttributesW(nativePath.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES
+        || (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+        || !SetFileAttributesW(nativePath.c_str(), attributes | FILE_ATTRIBUTE_READONLY)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot make EnSight snapshot file read-only: %1")
+                                .arg(path);
+        }
+        return false;
+    }
+    const DWORD verifiedAttributes = GetFileAttributesW(nativePath.c_str());
+    if (verifiedAttributes == INVALID_FILE_ATTRIBUTES
+        || (verifiedAttributes & FILE_ATTRIBUTE_READONLY) == 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight snapshot file did not remain read-only: %1")
+                                .arg(path);
+        }
+        return false;
+    }
+    return true;
+#else
+    if (!QFile::setPermissions(path, QFileDevice::ReadOwner)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot make EnSight snapshot file owner-read-only: %1")
+                                .arg(path);
+        }
+        return false;
+    }
+    return true;
+#endif
+}
 
 QString normalizedPath(const QString& path) {
     return QDir::fromNativeSeparators(path);
 }
 
 std::filesystem::path fsPathFromQString(const QString& path) {
+#ifdef Q_OS_WIN
     return std::filesystem::path(QDir::toNativeSeparators(path).toStdWString());
+#else
+    const QByteArray encoded = QFile::encodeName(QDir::toNativeSeparators(path));
+    return std::filesystem::path(encoded.constData());
+#endif
 }
 
 QString qStringFromFsPath(const std::filesystem::path& path) {
+#ifdef Q_OS_WIN
     return normalizedPath(QString::fromStdWString(path.wstring()));
+#else
+    return normalizedPath(QFile::decodeName(path.native().c_str()));
+#endif
 }
 
 QString realVtkPath(const QString& path) {
-    return qStringFromFsPath(streamcenterplus::vtkhdf::RealPath(fsPathFromQString(path)));
+    try {
+        return qStringFromFsPath(
+            streamcenterplus::vtkhdf::RealPath(fsPathFromQString(path)));
+    } catch (const std::filesystem::filesystem_error&) {
+        return {};
+    }
 }
 
 QString vtkExtensionSuffix(const QString& path) {
-    std::string ext = streamcenterplus::vtkhdf::Extension(fsPathFromQString(path));
+    std::string ext;
+    try {
+        ext = streamcenterplus::vtkhdf::Extension(fsPathFromQString(path));
+    } catch (const std::filesystem::filesystem_error&) {
+        return {};
+    }
     if (!ext.empty() && ext.front() == '.') {
         ext.erase(ext.begin());
     }
@@ -74,6 +171,10 @@ QString vtkExtensionSuffix(const QString& path) {
 
 QString formatDouble(double value) {
     return QString::number(value, 'g', 15);
+}
+
+QString formatMachineDouble(double value) {
+    return QString::number(value, 'g', std::numeric_limits<double>::max_digits10);
 }
 
 QString formatRange(double minValue, double maxValue) {
@@ -320,10 +421,7 @@ QVector<double> openFoamTimeValues(vtkOpenFOAMReader* reader) {
         }
     }
     std::sort(values.begin(), values.end());
-    values.erase(std::unique(values.begin(), values.end(), [](double lhs, double rhs) {
-                     return std::abs(lhs - rhs) <= 1e-12;
-                 }),
-                 values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
     return values;
 }
 
@@ -406,9 +504,10 @@ bool prepareEnSightGoldReader(vtkGenericEnSightReader* reader,
     }
 
     const QFileInfo caseInfo(casePath);
-    if (!caseInfo.exists() || !caseInfo.isFile()) {
+    if (!caseInfo.exists() || !caseInfo.isFile() || caseInfo.isSymLink()) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("EnSight Gold case file does not exist: %1").arg(casePath);
+            *errorMessage = QString("EnSight Gold case file does not exist or is not a regular non-link file: %1")
+                                .arg(casePath);
         }
         return false;
     }
@@ -489,10 +588,7 @@ QVector<double> enSightGoldTimeValues(vtkGenericEnSightReader* reader) {
         values.push_back(0.0);
     }
     std::sort(values.begin(), values.end());
-    values.erase(std::unique(values.begin(), values.end(), [](double lhs, double rhs) {
-                     return std::abs(lhs - rhs) <= 1e-12;
-                 }),
-                 values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
     return values;
 }
 
@@ -509,6 +605,46 @@ double inferredTimeInterval(const QVector<double>& timeValues) {
     }
     std::sort(positiveSteps.begin(), positiveSteps.end());
     return positiveSteps.at(positiveSteps.size() / 2);
+}
+
+bool uniformTimeInterval(const QVector<double>& timeValues,
+                         double* interval,
+                         QString* errorMessage) {
+    if (interval == nullptr) {
+        return false;
+    }
+    if (timeValues.size() <= 1) {
+        *interval = 1.0;
+        return true;
+    }
+    const double firstStep = timeValues.at(1) - timeValues.at(0);
+    if (!std::isfinite(firstStep) || firstStep <= 0.0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight timesteps must be finite and strictly increasing.");
+        }
+        return false;
+    }
+    for (qsizetype index = 2; index < timeValues.size(); ++index) {
+        const double current = timeValues.at(index);
+        const double previous = timeValues.at(index - 1);
+        const double expected = std::fma(static_cast<double>(index),
+                                         firstStep, timeValues.first());
+        const double magnitude = std::max(std::abs(current), std::abs(expected));
+        const double tolerance = std::abs(firstStep)
+                * static_cast<double>(index) * 1.0e-10
+            + std::numeric_limits<double>::epsilon() * magnitude * 8.0
+            + std::numeric_limits<double>::denorm_min() * 16.0;
+        if (!std::isfinite(current) || !(current > previous)
+            || !std::isfinite(expected)
+            || std::abs(current - expected) > tolerance) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight uses a non-uniform time axis that cannot be represented by one dt value.");
+            }
+            return false;
+        }
+    }
+    *interval = firstStep;
+    return true;
 }
 
 vtkSmartPointer<vtkDataSet> extractEnSightGoldVolume(vtkDataObject* output, QString* errorMessage) {
@@ -618,7 +754,8 @@ bool writePvdFile(const QString& pvdPath,
     xml.writeStartElement(QStringLiteral("Collection"));
     for (int index = 0; index < timeValues.size(); ++index) {
         xml.writeEmptyElement(QStringLiteral("DataSet"));
-        xml.writeAttribute(QStringLiteral("timestep"), formatDouble(timeValues.at(index)));
+        xml.writeAttribute(QStringLiteral("timestep"),
+                           formatMachineDouble(timeValues.at(index)));
         xml.writeAttribute(QStringLiteral("group"), QString());
         xml.writeAttribute(QStringLiteral("part"), QStringLiteral("0"));
         xml.writeAttribute(QStringLiteral("file"), relativeFramePaths.at(index));
@@ -830,54 +967,298 @@ bool dimensionsForDataSet(vtkDataSet* dataSet, int dims[3]) {
 }
 
 bool axisIsRegular(const QVector<double>& values) {
-    if (values.size() <= 2) {
+    if (values.size() <= 1) {
         return true;
     }
     const double spacing = values[1] - values[0];
-    const double tolerance = std::max(1.0, std::abs(spacing)) * 1e-7;
+    if (!std::isfinite(spacing) || spacing == 0.0) {
+        return false;
+    }
+    if (values.size() == 2) {
+        return true;
+    }
     for (int index = 2; index < values.size(); ++index) {
-        if (std::abs((values[index] - values[index - 1]) - spacing) > tolerance) {
+        const double expected = std::fma(static_cast<double>(index),
+                                         spacing, values.first());
+        const double magnitude = std::max(std::abs(values[index]),
+                                          std::abs(expected));
+        const double tolerance = std::abs(spacing)
+                * static_cast<double>(index) * 1e-7
+            + std::numeric_limits<double>::epsilon() * magnitude * 8.0
+            + std::numeric_limits<double>::denorm_min() * 16.0;
+        if (!std::isfinite(values[index]) || !std::isfinite(expected)
+            || std::abs(values[index] - expected) > tolerance) {
             return false;
         }
     }
     return true;
 }
 
-QVector<double> uniqueAxisValues(vtkDataSet* dataSet, int axis) {
+QVector<double> vtkCoordinateValues(vtkDataArray* coordinates) {
     QVector<double> values;
-    values.reserve(static_cast<int>(std::min<vtkIdType>(dataSet->GetNumberOfPoints(), std::numeric_limits<int>::max())));
-    double point[3] = {};
-    for (vtkIdType id = 0; id < dataSet->GetNumberOfPoints(); ++id) {
-        dataSet->GetPoint(id, point);
-        values.append(point[axis]);
+    if (coordinates == nullptr || coordinates->GetNumberOfComponents() != 1
+        || coordinates->GetNumberOfTuples() > std::numeric_limits<int>::max()) {
+        return values;
     }
-    std::sort(values.begin(), values.end());
-    values.erase(std::unique(values.begin(), values.end(), [](double lhs, double rhs) {
-                     return std::abs(lhs - rhs) <= 1e-10;
-                 }),
-                 values.end());
+    values.reserve(static_cast<int>(coordinates->GetNumberOfTuples()));
+    for (vtkIdType index = 0; index < coordinates->GetNumberOfTuples(); ++index) {
+        const double value = coordinates->GetComponent(index, 0);
+        if (!std::isfinite(value)) {
+            return {};
+        }
+        values.append(value);
+    }
     return values;
 }
 
-bool isUniformStructured(vtkDataSet* dataSet, int dims[3]) {
-    if (vtkImageData::SafeDownCast(dataSet) != nullptr) {
-        return dimensionsForDataSet(dataSet, dims);
+bool coordinatesEquivalent(double actual, double expected) {
+    const double magnitude = std::max(std::abs(actual), std::abs(expected));
+    const double tolerance = std::numeric_limits<double>::epsilon()
+            * magnitude * 8.0
+        + std::numeric_limits<double>::denorm_min() * 16.0;
+    return std::isfinite(actual) && std::isfinite(expected)
+        && std::abs(actual - expected) <= tolerance;
+}
+
+double ulpAtMagnitude(double magnitude) {
+    magnitude = std::abs(magnitude);
+    if (!std::isfinite(magnitude)) {
+        return std::numeric_limits<double>::infinity();
     }
-    if (!dimensionsForDataSet(dataSet, dims)) {
+    if (magnitude == 0.0) {
+        return std::numeric_limits<double>::denorm_min();
+    }
+    const double next = std::nextafter(
+        magnitude, std::numeric_limits<double>::infinity());
+    return std::isfinite(next)
+        ? std::max(std::numeric_limits<double>::denorm_min(), next - magnitude)
+        : std::numeric_limits<double>::epsilon() * magnitude;
+}
+
+double dataSetCoplanarityTolerance(vtkDataSet* dataSet) {
+    double bounds[6] = {};
+    dataSet->GetBounds(bounds);
+    double geometricScale = 0.0;
+    double coordinateMagnitude = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        geometricScale = std::max(
+            geometricScale, std::abs(bounds[axis * 2 + 1] - bounds[axis * 2]));
+        coordinateMagnitude = std::max(
+            {coordinateMagnitude, std::abs(bounds[axis * 2]),
+             std::abs(bounds[axis * 2 + 1])});
+    }
+    const double coordinateUlp = ulpAtMagnitude(coordinateMagnitude);
+    return geometricScale * 1.0e-12 + coordinateUlp * 8.0;
+}
+
+bool dataSetPointsAreCoplanar(vtkDataSet* dataSet) {
+    if (dataSet == nullptr || dataSet->GetNumberOfPoints() <= 3) {
+        return true;
+    }
+    double bounds[6] = {};
+    dataSet->GetBounds(bounds);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (bounds[axis * 2] == bounds[axis * 2 + 1]) {
+            return true;
+        }
+    }
+
+    const double tolerance = dataSetCoplanarityTolerance(dataSet);
+    double origin[3] = {};
+    dataSet->GetPoint(0, origin);
+    auto finitePoint = [](const double point[3]) {
+        return std::isfinite(point[0]) && std::isfinite(point[1])
+            && std::isfinite(point[2]);
+    };
+    if (!finitePoint(origin) || !std::isfinite(tolerance)) {
         return false;
     }
-    return axisIsRegular(uniqueAxisValues(dataSet, 0))
-        && axisIsRegular(uniqueAxisValues(dataSet, 1))
-        && axisIsRegular(uniqueAxisValues(dataSet, 2));
+
+    vtkIdType farthestId = 0;
+    double farthestDistance = 0.0;
+    double point[3] = {};
+    for (vtkIdType id = 1; id < dataSet->GetNumberOfPoints(); ++id) {
+        dataSet->GetPoint(id, point);
+        if (!finitePoint(point)) {
+            return false;
+        }
+        const double distance = std::hypot(
+            std::hypot(point[0] - origin[0], point[1] - origin[1]),
+            point[2] - origin[2]);
+        if (!std::isfinite(distance)) {
+            return false;
+        }
+        if (distance > farthestDistance) {
+            farthestDistance = distance;
+            farthestId = id;
+        }
+    }
+    if (farthestDistance <= tolerance) {
+        return true;
+    }
+
+    double farthest[3] = {};
+    dataSet->GetPoint(farthestId, farthest);
+    const double direction[3] = {
+        (farthest[0] - origin[0]) / farthestDistance,
+        (farthest[1] - origin[1]) / farthestDistance,
+        (farthest[2] - origin[2]) / farthestDistance,
+    };
+    double greatestLineDistance = 0.0;
+    double planeRejection[3] = {};
+    for (vtkIdType id = 1; id < dataSet->GetNumberOfPoints(); ++id) {
+        dataSet->GetPoint(id, point);
+        const double delta[3] = {point[0] - origin[0], point[1] - origin[1],
+                                 point[2] - origin[2]};
+        const double projection = delta[0] * direction[0]
+            + delta[1] * direction[1] + delta[2] * direction[2];
+        const double rejection[3] = {
+            delta[0] - projection * direction[0],
+            delta[1] - projection * direction[1],
+            delta[2] - projection * direction[2],
+        };
+        const double distance = std::hypot(
+            std::hypot(rejection[0], rejection[1]), rejection[2]);
+        if (!std::isfinite(distance)) {
+            return false;
+        }
+        if (distance > greatestLineDistance) {
+            greatestLineDistance = distance;
+            for (int axis = 0; axis < 3; ++axis) {
+                planeRejection[axis] = rejection[axis];
+            }
+        }
+    }
+    if (greatestLineDistance <= tolerance) {
+        return true;
+    }
+
+    const double secondDirection[3] = {
+        planeRejection[0] / greatestLineDistance,
+        planeRejection[1] / greatestLineDistance,
+        planeRejection[2] / greatestLineDistance,
+    };
+    const double normal[3] = {
+        direction[1] * secondDirection[2] - direction[2] * secondDirection[1],
+        direction[2] * secondDirection[0] - direction[0] * secondDirection[2],
+        direction[0] * secondDirection[1] - direction[1] * secondDirection[0],
+    };
+    for (vtkIdType id = 1; id < dataSet->GetNumberOfPoints(); ++id) {
+        dataSet->GetPoint(id, point);
+        const double distance = std::abs(
+            (point[0] - origin[0]) * normal[0]
+            + (point[1] - origin[1]) * normal[1]
+            + (point[2] - origin[2]) * normal[2]);
+        if (!std::isfinite(distance) || distance > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int spatialDimensionForDataSet(vtkDataSet* dataSet, const int dims[3]) {
+    if (dataSet == nullptr) {
+        return 0;
+    }
+    if (vtkImageData::SafeDownCast(dataSet) != nullptr
+        || vtkRectilinearGrid::SafeDownCast(dataSet) != nullptr
+        || vtkStructuredGrid::SafeDownCast(dataSet) != nullptr) {
+        return dims[2] > 1 ? 3 : 2;
+    }
+
+    auto cellTypes = vtkSmartPointer<vtkCellTypes>::New();
+    dataSet->GetCellTypes(cellTypes);
+    for (vtkIdType index = 0; index < cellTypes->GetNumberOfTypes(); ++index) {
+        if (vtkCellTypes::GetDimension(cellTypes->GetCellType(index)) >= 3) {
+            return 3;
+        }
+    }
+    return dataSetPointsAreCoplanar(dataSet) ? 2 : 3;
+}
+
+bool isUniformStructured(vtkDataSet* dataSet, int dims[3]) {
+    if (auto* image = vtkImageData::SafeDownCast(dataSet)) {
+        image->GetDimensions(dims);
+        const double* spacing = image->GetSpacing();
+        for (int axis = 0; axis < 3; ++axis) {
+            if (dims[axis] > 1
+                && (!std::isfinite(spacing[axis]) || spacing[axis] == 0.0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (auto* rectilinear = vtkRectilinearGrid::SafeDownCast(dataSet)) {
+        rectilinear->GetDimensions(dims);
+        const QVector<double> x = vtkCoordinateValues(rectilinear->GetXCoordinates());
+        const QVector<double> y = vtkCoordinateValues(rectilinear->GetYCoordinates());
+        const QVector<double> z = vtkCoordinateValues(rectilinear->GetZCoordinates());
+        return x.size() == dims[0] && y.size() == dims[1] && z.size() == dims[2]
+            && axisIsRegular(x) && axisIsRegular(y) && axisIsRegular(z);
+    }
+    auto* structured = vtkStructuredGrid::SafeDownCast(dataSet);
+    if (structured == nullptr) {
+        return false;
+    }
+    structured->GetDimensions(dims);
+    if (dims[0] <= 0 || dims[1] <= 0 || dims[2] <= 0) {
+        return false;
+    }
+    QVector<double> axes[3];
+    axes[0].reserve(dims[0]);
+    axes[1].reserve(dims[1]);
+    axes[2].reserve(dims[2]);
+    double point[3] = {};
+    for (int i = 0; i < dims[0]; ++i) {
+        structured->GetPoint(i, point);
+        axes[0].append(point[0]);
+    }
+    for (int j = 0; j < dims[1]; ++j) {
+        structured->GetPoint(static_cast<vtkIdType>(j) * dims[0], point);
+        axes[1].append(point[1]);
+    }
+    for (int k = 0; k < dims[2]; ++k) {
+        structured->GetPoint(static_cast<vtkIdType>(k) * dims[0] * dims[1], point);
+        axes[2].append(point[2]);
+    }
+    if (!axisIsRegular(axes[0]) || !axisIsRegular(axes[1])
+        || !axisIsRegular(axes[2])) {
+        return false;
+    }
+    for (int k = 0; k < dims[2]; ++k) {
+        for (int j = 0; j < dims[1]; ++j) {
+            for (int i = 0; i < dims[0]; ++i) {
+                const vtkIdType id = i + static_cast<vtkIdType>(dims[0])
+                    * (j + static_cast<vtkIdType>(dims[1]) * k);
+                structured->GetPoint(id, point);
+                if (!coordinatesEquivalent(point[0], axes[0].at(i))
+                    || !coordinatesEquivalent(point[1], axes[1].at(j))
+                    || !coordinatesEquivalent(point[2], axes[2].at(k))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 struct ArrayInfo {
+    enum class Association {
+        Unknown,
+        Point,
+        Cell,
+    };
+
     QString name;
     int components = 0;
     vtkIdType tuples = 0;
+    Association association = Association::Unknown;
 };
 
-void collectArrays(vtkFieldData* data, QList<ArrayInfo>* arrays, QStringList* candidates) {
+void collectArrays(vtkFieldData* data,
+                   ArrayInfo::Association association,
+                   QList<ArrayInfo>* arrays,
+                   QStringList* candidates) {
     if (data == nullptr || arrays == nullptr || candidates == nullptr) {
         return;
     }
@@ -891,6 +1272,7 @@ void collectArrays(vtkFieldData* data, QList<ArrayInfo>* arrays, QStringList* ca
         info.name = QString::fromUtf8(array->GetName()).trimmed();
         info.components = array->GetNumberOfComponents();
         info.tuples = array->GetNumberOfTuples();
+        info.association = association;
         if (info.name.isEmpty()) {
             continue;
         }
@@ -999,12 +1381,45 @@ QStringList candidateListForArrays(const QList<ArrayInfo>& arrays) {
     return candidates;
 }
 
+bool sameCandidateFieldSet(const QStringList& lhs, const QStringList& rhs) {
+    return lhs.size() == rhs.size()
+        && std::all_of(lhs.cbegin(), lhs.cend(), [&](const QString& candidate) {
+               return rhs.contains(candidate, Qt::CaseSensitive);
+           });
+}
+
+bool sameArraySchema(const QList<ArrayInfo>& lhs, const QList<ArrayInfo>& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    QVector<bool> matched(rhs.size(), false);
+    for (const ArrayInfo& left : lhs) {
+        bool found = false;
+        for (qsizetype index = 0; index < rhs.size(); ++index) {
+            const ArrayInfo& right = rhs.at(index);
+            if (!matched.at(index)
+                && left.name.compare(right.name, Qt::CaseSensitive) == 0
+                && left.components == right.components
+                && left.association == right.association) {
+                matched[index] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct VtkDataSummary {
     bool hasBounds = false;
     double bounds[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     int dims[3] = {0, 0, 0};
     bool hasDims = false;
     bool uniformStructured = false;
+    int spatialDimension = 0;
     QList<ArrayInfo> arrays;
     QStringList termCandidates;
 };
@@ -1047,11 +1462,15 @@ bool summarizeDataSet(vtkDataSet* dataSet, VtkDataSummary* summary) {
         }
         summary->hasDims = true;
     }
+    summary->spatialDimension = std::max(
+        summary->spatialDimension, spatialDimensionForDataSet(dataSet, dims));
     summary->uniformStructured = summary->uniformStructured || isUniformStructured(dataSet, dims);
 
     if (summary->arrays.isEmpty()) {
-        collectArrays(dataSet->GetPointData(), &summary->arrays, &summary->termCandidates);
-        collectArrays(dataSet->GetCellData(), &summary->arrays, &summary->termCandidates);
+        collectArrays(dataSet->GetPointData(), ArrayInfo::Association::Point,
+                      &summary->arrays, &summary->termCandidates);
+        collectArrays(dataSet->GetCellData(), ArrayInfo::Association::Cell,
+                      &summary->arrays, &summary->termCandidates);
         summary->termCandidates.sort(Qt::CaseInsensitive);
     }
     return true;
@@ -1095,15 +1514,37 @@ QStringList collectVtmBlockFiles(const QString& vtmPath, QString* errorMessage) 
     return files;
 }
 
+bool coordinateBoundsEquivalent(const double* lhs, const double* rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        const int lower = axis * 2;
+        const int upper = lower + 1;
+        const double extent = std::max(
+            std::abs(lhs[upper] - lhs[lower]),
+            std::abs(rhs[upper] - rhs[lower]));
+        const double coordinateMagnitude = std::max(
+            {std::abs(lhs[lower]), std::abs(lhs[upper]),
+             std::abs(rhs[lower]), std::abs(rhs[upper])});
+        const double tolerance = extent * 1.0e-8
+            + ulpAtMagnitude(coordinateMagnitude) * 8.0;
+        for (const int index : {lower, upper}) {
+            if (!std::isfinite(lhs[index]) || !std::isfinite(rhs[index])
+                || std::abs(lhs[index] - rhs[index]) > tolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool boundsEquivalent(const VtkDataSummary& lhs, const VtkDataSummary& rhs) {
     if (!lhs.hasBounds || !rhs.hasBounds) {
         return false;
     }
-    for (int index = 0; index < 6; ++index) {
-        const double scale = std::max({1.0, std::abs(lhs.bounds[index]), std::abs(rhs.bounds[index])});
-        if (std::abs(lhs.bounds[index] - rhs.bounds[index]) > scale * 1e-8) {
-            return false;
-        }
+    if (!coordinateBoundsEquivalent(lhs.bounds, rhs.bounds)) {
+        return false;
     }
     if (lhs.hasDims != rhs.hasDims) {
         return false;
@@ -1319,11 +1760,8 @@ bool boundsEquivalent(vtkDataSet* lhs, vtkDataSet* rhs) {
     double right[6] = {};
     lhs->GetBounds(left);
     rhs->GetBounds(right);
-    for (int index = 0; index < 6; ++index) {
-        const double scale = std::max({1.0, std::abs(left[index]), std::abs(right[index])});
-        if (std::abs(left[index] - right[index]) > scale * 1e-8) {
-            return false;
-        }
+    if (!coordinateBoundsEquivalent(left, right)) {
+        return false;
     }
     int leftDims[3] = {};
     int rightDims[3] = {};
@@ -1345,13 +1783,7 @@ bool boundsEquivalent(vtkDataSet* lhs, vtkDataSet* rhs) {
 bool boundsRangeEquivalent(const double* left, vtkDataSet* rhs) {
     double right[6] = {};
     rhs->GetBounds(right);
-    for (int index = 0; index < 6; ++index) {
-        const double scale = std::max({1.0, std::abs(left[index]), std::abs(right[index])});
-        if (std::abs(left[index] - right[index]) > scale * 1e-8) {
-            return false;
-        }
-    }
-    return true;
+    return coordinateBoundsEquivalent(left, right);
 }
 
 QString boundsSummary(const double* bounds) {
@@ -1367,39 +1799,97 @@ QString boundsSummary(vtkDataSet* dataSet) {
     return boundsSummary(bounds);
 }
 
-QStringList splitEnSightGoldSources(const QStringList& sources) {
-    QStringList expanded;
-    for (const QString& source : sources) {
-        const QString trimmed = source.trimmed();
-        if (trimmed.isEmpty()) {
-            continue;
-        }
-        if (QFileInfo(trimmed).exists()) {
-            expanded.append(trimmed);
-            continue;
-        }
-        const QStringList pieces = trimmed.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-        for (const QString& piece : pieces) {
-            const QString path = piece.trimmed();
-            if (!path.isEmpty()) {
-                expanded.append(path);
-            }
-        }
+Qt::CaseSensitivity fileSystemPathCaseSensitivity() {
+#ifdef Q_OS_WIN
+    return Qt::CaseInsensitive;
+#else
+    return Qt::CaseSensitive;
+#endif
+}
+
+QString sourcePathIdentity(const QString& path) {
+    const QFileInfo info(path);
+    const QString canonical = info.canonicalFilePath();
+    return normalizedPath(QDir::cleanPath(
+        canonical.isEmpty() ? info.absoluteFilePath() : canonical));
+}
+
+bool sameSourcePath(const QString& lhs, const QString& rhs) {
+    return sourcePathIdentity(lhs).compare(sourcePathIdentity(rhs),
+                                            fileSystemPathCaseSensitivity()) == 0;
+}
+
+bool containsSourcePath(const QStringList& paths, const QString& candidate) {
+    return std::any_of(paths.cbegin(), paths.cend(), [&](const QString& path) {
+        return sameSourcePath(path, candidate);
+    });
+}
+
+QString sourcePathIdentityKey(const QString& path) {
+    const QString identity = sourcePathIdentity(path);
+    return fileSystemPathCaseSensitivity() == Qt::CaseInsensitive
+        ? identity.toCaseFolded()
+        : identity;
+}
+
+bool appendBoundedCasePath(const QString& path,
+                           QStringList* caseFiles,
+                           QSet<QString>* identities,
+                           qint64* aggregateBytes,
+                           QString* errorMessage) {
+    const QString identity = sourcePathIdentityKey(path);
+    if (identities->contains(identity)) {
+        return true;
     }
-    return expanded;
+    const qsizetype pathBytes = path.toUtf8().size();
+    if (pathBytes > Streamcenter::FlowDataProtocolLimits::MaximumStringBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("An EnSight Gold case path exceeds the %1-byte path limit: %2")
+                                .arg(Streamcenter::FlowDataProtocolLimits::MaximumStringBytes)
+                                .arg(path);
+        }
+        return false;
+    }
+    if (caseFiles->size() >= Streamcenter::FlowDataProtocolLimits::MaximumCaseCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold selection exceeds the %1-case limit.")
+                                .arg(Streamcenter::FlowDataProtocolLimits::MaximumCaseCount);
+        }
+        return false;
+    }
+    if (*aggregateBytes + pathBytes
+        > Streamcenter::FlowDataProtocolLimits::MaximumAggregateStringBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case paths exceed the %1-byte aggregate limit.")
+                                .arg(Streamcenter::FlowDataProtocolLimits::MaximumAggregateStringBytes);
+        }
+        return false;
+    }
+    caseFiles->append(path);
+    identities->insert(identity);
+    *aggregateBytes += pathBytes;
+    return true;
 }
 
 QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* errorMessage) {
     QStringList caseFiles;
-    const QStringList expandedSources = splitEnSightGoldSources(sources);
-    if (expandedSources.isEmpty()) {
+    QSet<QString> caseFileIdentities;
+    qint64 aggregatePathBytes = 0;
+    if (sources.isEmpty()) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("Select at least one EnSight Gold *.case file or a folder containing *.case files.");
         }
         return caseFiles;
     }
 
-    for (const QString& source : expandedSources) {
+    for (const QString& source : sources) {
+        if (source.isEmpty()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("An EnSight Gold source path is empty.");
+            }
+            caseFiles.clear();
+            return caseFiles;
+        }
         const QFileInfo info(source);
         if (!info.exists()) {
             if (errorMessage != nullptr) {
@@ -1410,10 +1900,45 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
         }
 
         if (info.isDir()) {
-            const QFileInfoList entries = QDir(info.absoluteFilePath()).entryInfoList({QStringLiteral("*.case")},
-                                                                                     QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
-                                                                                     QDir::Name | QDir::IgnoreCase);
-            if (entries.isEmpty()) {
+            QStringList directoryCaseFiles;
+            QSet<QString> directoryIdentities;
+            bool foundCaseEntry = false;
+            QDirIterator iterator(info.absoluteFilePath(),
+                                  {QStringLiteral("*.case")},
+                                  QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
+                                  QDirIterator::NoIteratorFlags);
+            while (iterator.hasNext()) {
+                const QString path = normalizedPath(QFileInfo(iterator.next()).absoluteFilePath());
+                foundCaseEntry = true;
+                const QString identity = sourcePathIdentityKey(path);
+                if (caseFileIdentities.contains(identity)
+                    || directoryIdentities.contains(identity)) {
+                    continue;
+                }
+                if (caseFiles.size() + directoryCaseFiles.size()
+                        >= Streamcenter::FlowDataProtocolLimits::MaximumCaseCount) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight Gold selection exceeds the %1-case limit.")
+                                            .arg(Streamcenter::FlowDataProtocolLimits::MaximumCaseCount);
+                    }
+                    caseFiles.clear();
+                    return caseFiles;
+                }
+                const qsizetype pathBytes = path.toUtf8().size();
+                if (pathBytes > Streamcenter::FlowDataProtocolLimits::MaximumStringBytes
+                    || aggregatePathBytes + pathBytes
+                        > Streamcenter::FlowDataProtocolLimits::MaximumAggregateStringBytes) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight Gold case paths exceed the bounded protocol size.");
+                    }
+                    caseFiles.clear();
+                    return caseFiles;
+                }
+                directoryCaseFiles.append(path);
+                directoryIdentities.insert(identity);
+                aggregatePathBytes += pathBytes;
+            }
+            if (!foundCaseEntry) {
                 if (errorMessage != nullptr) {
                     *errorMessage = QString("No EnSight Gold case files (*.case) were found in folder: %1")
                                         .arg(info.absoluteFilePath());
@@ -1421,12 +1946,9 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
                 caseFiles.clear();
                 return caseFiles;
             }
-            for (const QFileInfo& entry : entries) {
-                const QString path = normalizedPath(entry.absoluteFilePath());
-                if (!caseFiles.contains(path, Qt::CaseInsensitive)) {
-                    caseFiles.append(path);
-                }
-            }
+            directoryCaseFiles.sort(fileSystemPathCaseSensitivity());
+            caseFiles.append(directoryCaseFiles);
+            caseFileIdentities.unite(directoryIdentities);
             continue;
         }
 
@@ -1440,22 +1962,97 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
         }
 
         const QString path = normalizedPath(info.absoluteFilePath());
-        if (!caseFiles.contains(path, Qt::CaseInsensitive)) {
-            caseFiles.append(path);
+        if (!appendBoundedCasePath(path,
+                                   &caseFiles,
+                                   &caseFileIdentities,
+                                   &aggregatePathBytes,
+                                   errorMessage)) {
+            caseFiles.clear();
+            return caseFiles;
         }
     }
 
     return caseFiles;
 }
 
+struct EnSightGoldTimeSet {
+    int id = 0;
+    int declarationLine = 0;
+    int declaredSteps = 0;
+    bool hasDeclaredSteps = false;
+    bool hasExplicitFilenameNumbers = false;
+    bool hasFilenameStart = false;
+    bool hasFilenameIncrement = false;
+    qint64 filenameStart = 0;
+    qint64 filenameIncrement = 0;
+    QVector<qint64> filenameNumbers;
+    QVector<double> timeValues;
+};
+
+struct EnSightGoldFileChunk {
+    bool hasFilenameIndex = false;
+    qint64 filenameIndex = 0;
+    int stepCount = 0;
+};
+
+struct EnSightGoldFileSet {
+    int id = 0;
+    int declarationLine = 0;
+    bool usesFilenameIndices = false;
+    QVector<EnSightGoldFileChunk> chunks;
+};
+
+struct EnSightGoldReference {
+    enum class Role {
+        ModelGeometry,
+        MeasuredGeometry,
+        VolumeVariable,
+        MeasuredVariable,
+        ConstantVariable,
+        Auxiliary,
+    };
+
+    Role role = Role::Auxiliary;
+    QString declaration;
+    int declarationLine = 0;
+    int timeSetId = 0;
+    int fileSetId = 0;
+    QString variableName;
+    bool hasFrequency = false;
+    bool frequencyUndefined = false;
+    double frequency = 0.0;
+    QStringList patterns;
+    QStringList resolvedPaths;
+    QVector<QStringList> resolvedPatternPaths;
+    QVector<QStringList> expandedPatternNames;
+};
+
+struct EnSightGoldConstantPerCase {
+    int declarationLine = 0;
+    int timeSetId = 0;
+    QString variableName;
+    QVector<double> values;
+};
+
 struct EnSightGoldCaseSource {
     QString path;
     QVector<double> timeValues;
     QList<ArrayInfo> arrays;
-    QStringList geometryPatterns;
-    QStringList variablePatterns;
-    int filenameStartNumber = 0;
-    int filenameIncrement = 1;
+    QHash<int, EnSightGoldTimeSet> timeSets;
+    QHash<int, EnSightGoldFileSet> fileSets;
+    QVector<EnSightGoldReference> references;
+    QVector<EnSightGoldConstantPerCase> constantsPerCase;
+    QStringList constantPerCaseDeclarations;
+    QStringList referencedPaths;
+    QStringList modelGeometryPaths;
+    int maximumTimeSteps = 0;
+    bool hasMaximumTimeSteps = false;
+    int blockContinuationCount = 0;
+    qint64 blockContinuationStart = 0;
+    qint64 blockContinuationIncrement = 0;
+    bool hasBlockContinuationCount = false;
+    bool hasBlockContinuationStart = false;
+    bool hasBlockContinuationIncrement = false;
 };
 
 struct EnSightGoldFrameSource {
@@ -1476,6 +2073,30 @@ QString cleanEnSightGoldName(QString name) {
     return name;
 }
 
+bool normalizeEnSightGoldVariableName(const QString& rawName,
+                                      QString* normalizedName,
+                                      QString* errorMessage,
+                                      int lineNumber) {
+    if (normalizedName == nullptr) {
+        return false;
+    }
+    QString name = cleanEnSightGoldName(rawName);
+    name.replace(QRegularExpression(QStringLiteral(R"(\s+)")), QStringLiteral("_"));
+    static const QRegularExpression safeName(
+        QStringLiteral(R"(^[\p{L}_][\p{L}\p{N}_]*$)"),
+        QRegularExpression::UseUnicodePropertiesOption);
+    if (name.size() > 79 || !safeName.match(name).hasMatch()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold variable name on line %1 must be at most 79 characters, must not start with a digit, and must not contain whitespace/reserved characters; quoted spaces are normalized to underscores.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    *normalizedName = name;
+    return true;
+}
+
 bool parseIntToken(QString text, int* value) {
     if (value == nullptr) {
         return false;
@@ -1489,24 +2110,177 @@ bool parseIntToken(QString text, int* value) {
     return ok;
 }
 
-bool tokenIsInteger(const QString& text) {
-    int ignored = 0;
-    return parseIntToken(text, &ignored);
+bool parsePositiveIntToken(const QString& text, int* value) {
+    int parsed = 0;
+    if (!parseIntToken(text, &parsed) || parsed <= 0) {
+        return false;
+    }
+    if (value != nullptr) {
+        *value = parsed;
+    }
+    return true;
 }
 
-QVector<double> parseDoubleTokens(QString text) {
-    QVector<double> values;
-    text.replace(QLatin1Char(','), QLatin1Char(' '));
-    const QStringList tokens = text.split(QRegularExpression(QStringLiteral(R"(\s+)")), Qt::SkipEmptyParts);
-    values.reserve(tokens.size());
-    for (const QString& token : tokens) {
-        bool ok = false;
-        const double value = token.toDouble(&ok);
-        if (ok && std::isfinite(value)) {
-            values.push_back(value);
+bool parseEnSightGoldIntegerToken(const QString& text, qint64* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    const qint64 parsed = text.trimmed().toLongLong(&ok);
+    if (!ok || parsed < std::numeric_limits<int>::min()
+        || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+struct EnSightGoldCaseLine {
+    int number = 0;
+    QString text;
+};
+
+QString stripEnSightGoldInlineComment(const QString& rawLine) {
+    QChar quote;
+    for (qsizetype index = 0; index < rawLine.size(); ++index) {
+        const QChar character = rawLine.at(index);
+        if (!quote.isNull()) {
+            if (character == quote) {
+                quote = QChar{};
+            }
+            continue;
+        }
+        if (character == QLatin1Char('"') || character == QLatin1Char('\'')) {
+            quote = character;
+        } else if (character == QLatin1Char('#')) {
+            return rawLine.left(index);
         }
     }
-    return values;
+    return rawLine;
+}
+
+bool readBoundedEnSightGoldCaseLines(const QByteArray& payload,
+                                     QVector<EnSightGoldCaseLine>* lines,
+                                     QString* errorMessage) {
+    if (lines == nullptr) {
+        return false;
+    }
+    lines->clear();
+    constexpr qsizetype kMaximumCaseLineBytes = 1024;
+    qsizetype offset = 0;
+    int lineNumber = 1;
+    while (offset <= payload.size()) {
+        qsizetype end = payload.indexOf('\n', offset);
+        if (end < 0) {
+            end = payload.size();
+        }
+        qsizetype length = end - offset;
+        if (length > 0 && payload.at(offset + length - 1) == '\r') {
+            --length;
+        }
+        if (length > kMaximumCaseLineBytes) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold case line %1 exceeds the 1024-byte format limit.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        const QByteArray rawBytes = payload.mid(offset, length);
+        if (rawBytes.contains('\0')) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold case line %1 contains a NUL byte.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        QString text = stripEnSightGoldInlineComment(QString::fromUtf8(rawBytes)).trimmed();
+        if (!text.isEmpty()) {
+            lines->append(EnSightGoldCaseLine{lineNumber, text});
+        }
+        if (end == payload.size()) {
+            break;
+        }
+        offset = end + 1;
+        ++lineNumber;
+    }
+    return true;
+}
+
+bool tokenizeEnSightGoldPayload(const QString& payload,
+                                QStringList* tokens,
+                                QString* errorMessage,
+                                int lineNumber) {
+    if (tokens == nullptr) {
+        return false;
+    }
+    tokens->clear();
+    QString token;
+    QChar quote;
+    bool tokenStarted = false;
+    for (qsizetype index = 0; index < payload.size(); ++index) {
+        const QChar character = payload.at(index);
+        if (!quote.isNull()) {
+            if (character == quote) {
+                quote = QChar{};
+            } else {
+                token.append(character);
+            }
+            tokenStarted = true;
+            continue;
+        }
+        if (character == QLatin1Char('"') || character == QLatin1Char('\'')) {
+            if (tokenStarted) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "EnSight Gold case line %1 contains a quote in the middle of a token.")
+                                        .arg(lineNumber);
+                }
+                return false;
+            }
+            quote = character;
+            tokenStarted = true;
+        } else if (character.isSpace() || character == QLatin1Char(',')) {
+            if (tokenStarted) {
+                tokens->append(token);
+                token.clear();
+                tokenStarted = false;
+            }
+        } else {
+            token.append(character);
+            tokenStarted = true;
+        }
+    }
+    if (!quote.isNull()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case line %1 contains an unterminated quoted token.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    if (tokenStarted) {
+        tokens->append(token);
+    }
+    return true;
+}
+
+int enSightGoldUnquotedColon(const QString& line) {
+    QChar quote;
+    for (qsizetype index = 0; index < line.size(); ++index) {
+        const QChar character = line.at(index);
+        if (!quote.isNull()) {
+            if (character == quote) {
+                quote = QChar{};
+            }
+            continue;
+        }
+        if (character == QLatin1Char('"') || character == QLatin1Char('\'')) {
+            quote = character;
+        } else if (character == QLatin1Char(':')) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
 }
 
 int enSightGoldComponentCount(const QString& declaration) {
@@ -1526,75 +2300,1038 @@ int enSightGoldComponentCount(const QString& declaration) {
     return 1;
 }
 
-QStringList enSightGoldPayloadTokens(const QString& payload) {
-    return payload.trimmed().split(QRegularExpression(QStringLiteral(R"(\s+)")), Qt::SkipEmptyParts);
-}
-
-bool appendEnSightGoldGeometryPattern(const QString& payload, EnSightGoldCaseSource* source) {
-    QStringList tokens = enSightGoldPayloadTokens(payload);
-    if (tokens.isEmpty() || source == nullptr) {
-        return false;
-    }
-    if (tokens.size() >= 2 && tokenIsInteger(tokens.first())) {
-        tokens.removeFirst();
-    }
-    const QString pattern = cleanEnSightGoldName(tokens.join(QLatin1Char(' ')));
-    if (!pattern.isEmpty() && !source->geometryPatterns.contains(pattern, Qt::CaseInsensitive)) {
-        source->geometryPatterns.append(pattern);
-    }
-    return !pattern.isEmpty();
-}
-
-bool appendEnSightGoldVariable(const QString& declaration,
-                               const QString& payload,
-                               EnSightGoldCaseSource* source) {
-    QStringList tokens = enSightGoldPayloadTokens(payload);
-    if (tokens.size() < 2 || source == nullptr) {
-        return false;
-    }
-    if (tokens.size() >= 3 && tokenIsInteger(tokens.first())) {
-        tokens.removeFirst();
-    }
-
-    const QString pattern = cleanEnSightGoldName(tokens.takeLast());
-    const QString name = cleanEnSightGoldName(tokens.join(QLatin1Char(' ')));
-    if (name.isEmpty() || pattern.isEmpty()) {
-        return false;
-    }
-
-    bool alreadyPresent = false;
-    for (const ArrayInfo& array : std::as_const(source->arrays)) {
-        if (array.name.compare(name, Qt::CaseInsensitive) == 0) {
-            alreadyPresent = true;
-            break;
-        }
-    }
-    if (!alreadyPresent) {
-        ArrayInfo info;
-        info.name = name;
-        info.components = enSightGoldComponentCount(declaration);
-        source->arrays.append(info);
-    }
-    if (!source->variablePatterns.contains(pattern, Qt::CaseInsensitive)) {
-        source->variablePatterns.append(pattern);
-    }
-    return true;
-}
-
 QString enSightGoldSectionName(const QString& line) {
-    const QString upper = line.trimmed().toUpper();
-    if (upper == QStringLiteral("FORMAT")
-        || upper == QStringLiteral("GEOMETRY")
-        || upper == QStringLiteral("VARIABLE")
-        || upper == QStringLiteral("TIME")) {
-        return upper;
+    if (line == QStringLiteral("FORMAT")
+        || line == QStringLiteral("GEOMETRY")
+        || line == QStringLiteral("VARIABLE")
+        || line == QStringLiteral("TIME")
+        || line == QStringLiteral("FILE")
+        || line == QStringLiteral("SCRIPTS")
+        || line == QStringLiteral("BLOCK_CONTINUATION")
+        || line == QStringLiteral("QUERY")
+        || line == QStringLiteral("MATERIAL")) {
+        return line;
     }
     return {};
 }
 
-bool parseEnSightGoldCaseSource(const QString& casePath,
+bool isEnSightGoldSectionSpelling(const QString& line) {
+    const QString upper = line.toUpper();
+    return upper == QStringLiteral("FORMAT")
+        || upper == QStringLiteral("GEOMETRY")
+        || upper == QStringLiteral("VARIABLE")
+        || upper == QStringLiteral("TIME")
+        || upper == QStringLiteral("FILE")
+        || upper == QStringLiteral("SCRIPTS")
+        || upper == QStringLiteral("BLOCK_CONTINUATION")
+        || upper == QStringLiteral("QUERY")
+        || upper == QStringLiteral("MATERIAL");
+}
+
+bool takeEnSightGoldBinding(QStringList* tokens,
+                            qsizetype minimumTailTokens,
+                            bool allowFileSet,
+                            int* timeSetId,
+                            int* fileSetId) {
+    if (tokens == nullptr || timeSetId == nullptr || fileSetId == nullptr) {
+        return false;
+    }
+    *timeSetId = 0;
+    *fileSetId = 0;
+    int parsed = 0;
+    if (tokens->size() > minimumTailTokens
+        && parsePositiveIntToken(tokens->first(), &parsed)) {
+        *timeSetId = parsed;
+        tokens->removeFirst();
+        if (allowFileSet && tokens->size() > minimumTailTokens
+            && parsePositiveIntToken(tokens->first(), &parsed)) {
+            *fileSetId = parsed;
+            tokens->removeFirst();
+        }
+    }
+    return true;
+}
+
+bool validateEnSightGoldPattern(const QString& pattern,
+                                QString* errorMessage,
+                                int lineNumber) {
+    if (pattern.isEmpty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case line %1 contains an empty file name.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    const QRegularExpression wildcard(QStringLiteral(R"(\*+)"));
+    QRegularExpressionMatchIterator matches = wildcard.globalMatch(pattern);
+    int groups = 0;
+    while (matches.hasNext()) {
+        const QRegularExpressionMatch match = matches.next();
+        ++groups;
+        if (match.capturedLength() > 10) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold case line %1 uses more than ten filename wildcards.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+    }
+    if (groups > 1) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold case line %1 uses multiple disjoint wildcard groups, which the importer cannot expand unambiguously.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    const QRegularExpression blockWildcard(QStringLiteral(R"(%+)"));
+    QRegularExpressionMatchIterator blockMatches = blockWildcard.globalMatch(pattern);
+    int blockGroups = 0;
+    while (blockMatches.hasNext()) {
+        const QRegularExpressionMatch match = blockMatches.next();
+        ++blockGroups;
+        if (match.capturedLength() > 10) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold case line %1 uses more than ten block-continuation wildcards.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+    }
+    if (blockGroups > 1) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold case line %1 uses multiple disjoint block-continuation wildcard groups.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool appendEnSightGoldReference(EnSightGoldReference reference,
                                 EnSightGoldCaseSource* source,
                                 QString* errorMessage) {
+    if (source == nullptr || reference.patterns.isEmpty()) {
+        return false;
+    }
+    if (source->references.size()
+        >= Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "EnSight Gold case exceeds the bounded reference-declaration count.");
+        }
+        return false;
+    }
+    for (QString& pattern : reference.patterns) {
+        pattern = cleanEnSightGoldName(pattern);
+        if (!validateEnSightGoldPattern(pattern, errorMessage, reference.declarationLine)) {
+            return false;
+        }
+    }
+    source->references.append(std::move(reference));
+    return true;
+}
+
+bool addEnSightGoldArray(const QString& name,
+                         const QString& declaration,
+                         ArrayInfo::Association association,
+                          EnSightGoldCaseSource* source,
+                          QString* errorMessage,
+                          int lineNumber,
+                          int componentOverride = 0) {
+    if (source == nullptr || name.isEmpty()) {
+        return false;
+    }
+    for (const ArrayInfo& array : std::as_const(source->arrays)) {
+        if (array.name.compare(name, Qt::CaseInsensitive) == 0) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold case line %1 redeclares variable name \"%2\" with ambiguous casing or schema.")
+                                    .arg(lineNumber)
+                                    .arg(name);
+            }
+            return false;
+        }
+    }
+    ArrayInfo info;
+    info.name = name;
+    info.components = componentOverride > 0
+        ? componentOverride
+        : enSightGoldComponentCount(declaration);
+    info.association = association;
+    source->arrays.append(info);
+    return true;
+}
+
+bool parseEnSightGoldGeometryDeclaration(const QString& key,
+                                         const QString& payload,
+                                         int lineNumber,
+                                         EnSightGoldCaseSource* source,
+                                         QString* errorMessage) {
+    QStringList tokens;
+    if (!tokenizeEnSightGoldPayload(payload, &tokens, errorMessage, lineNumber)
+        || tokens.isEmpty()) {
+        if (tokens.isEmpty() && errorMessage != nullptr && errorMessage->isEmpty()) {
+            *errorMessage = QStringLiteral("EnSight Gold geometry declaration on line %1 is empty.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    const QString declaration = key.simplified().toLower();
+    if (tokens.contains(QStringLiteral("change_coords_only"), Qt::CaseInsensitive)
+        || tokens.contains(QStringLiteral("changing_geometry_per_part"), Qt::CaseInsensitive)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold geometry declaration on line %1 uses a legal changing-geometry variant that this importer does not support safely.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+
+    EnSightGoldReference reference;
+    reference.declaration = declaration;
+    reference.declarationLine = lineNumber;
+    if (declaration == QStringLiteral("model") || declaration == QStringLiteral("measured")) {
+        const bool duplicate = std::any_of(
+            source->references.cbegin(), source->references.cend(), [&](const EnSightGoldReference& existing) {
+                return existing.role == (declaration == QStringLiteral("model")
+                                             ? EnSightGoldReference::Role::ModelGeometry
+                                             : EnSightGoldReference::Role::MeasuredGeometry);
+            });
+        if (duplicate) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold case line %1 duplicates the %2 geometry declaration.")
+                                    .arg(lineNumber)
+                                    .arg(declaration);
+            }
+            return false;
+        }
+        takeEnSightGoldBinding(&tokens, 1, true, &reference.timeSetId, &reference.fileSetId);
+        if (tokens.size() != 1) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold %1 geometry on line %2 must contain [time set] [file set] and one quoted-or-unquoted filename.")
+                                    .arg(declaration)
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        reference.role = declaration == QStringLiteral("model")
+            ? EnSightGoldReference::Role::ModelGeometry
+            : EnSightGoldReference::Role::MeasuredGeometry;
+        reference.patterns = {tokens.first()};
+        return appendEnSightGoldReference(std::move(reference), source, errorMessage);
+    }
+
+    static const QSet<QString> auxiliaryDeclarations = {
+        QStringLiteral("match"),
+        QStringLiteral("boundary"),
+        QStringLiteral("rigid_body"),
+        QStringLiteral("rigid body"),
+        QStringLiteral("vector_glyphs"),
+        QStringLiteral("vector glyphs"),
+    };
+    if (!auxiliaryDeclarations.contains(declaration)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Unsupported EnSight Gold GEOMETRY declaration \"%1\" on line %2.")
+                                .arg(key)
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    if (tokens.size() != 1) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold auxiliary geometry declaration on line %1 must contain exactly one filename; filenames with spaces must be quoted.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    reference.role = EnSightGoldReference::Role::Auxiliary;
+    reference.patterns = {tokens.first()};
+    return appendEnSightGoldReference(std::move(reference), source, errorMessage);
+}
+
+bool parseEnSightGoldVariableDeclaration(const QString& key,
+                                         const QString& payload,
+                                         int lineNumber,
+                                         EnSightGoldCaseSource* source,
+                                         QString* errorMessage) {
+    const QString declaration = key.simplified().toLower();
+    QStringList tokens;
+    if (!tokenizeEnSightGoldPayload(payload, &tokens, errorMessage, lineNumber)) {
+        return false;
+    }
+
+    if (declaration == QStringLiteral("constant per case")) {
+        int timeSetId = 0;
+        if (tokens.size() >= 3) {
+            int parsedTimeSet = 0;
+            if (parsePositiveIntToken(tokens.first(), &parsedTimeSet)) {
+                timeSetId = parsedTimeSet;
+                tokens.removeFirst();
+            }
+        }
+        if (tokens.size() < 2) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold constant-per-case declaration on line %1 must contain [time set], a name, and one or more finite numeric values.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        QString variableName;
+        if (!normalizeEnSightGoldVariableName(tokens.takeFirst(), &variableName,
+                                              errorMessage, lineNumber)) {
+            return false;
+        }
+        QVector<double> values;
+        QStringList normalizedValues;
+        values.reserve(tokens.size());
+        normalizedValues.reserve(tokens.size());
+        for (const QString& token : std::as_const(tokens)) {
+            bool ok = false;
+            const double value = token.toDouble(&ok);
+            if (!ok || !std::isfinite(value)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Invalid EnSight Gold constant-per-case value on line %1.")
+                                        .arg(lineNumber);
+                }
+                return false;
+            }
+            values.append(value);
+            normalizedValues.append(formatMachineDouble(value));
+        }
+        if (source->constantsPerCase.size()
+            >= Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                    "EnSight Gold case exceeds the bounded constant-per-case declaration count.");
+            }
+            return false;
+        }
+        source->constantsPerCase.append(
+            EnSightGoldConstantPerCase{lineNumber, timeSetId, variableName, values});
+        QStringList normalizedTokens;
+        if (timeSetId > 0) {
+            normalizedTokens.append(QString::number(timeSetId));
+        }
+        normalizedTokens.append(variableName);
+        normalizedTokens += normalizedValues;
+        source->constantPerCaseDeclarations.append(
+            QStringLiteral("constant per case: %1")
+                .arg(normalizedTokens.join(QLatin1Char(' '))));
+        return true;
+    }
+
+    EnSightGoldReference reference;
+    reference.declaration = declaration;
+    reference.declarationLine = lineNumber;
+    if (declaration == QStringLiteral("constant per case file")) {
+        takeEnSightGoldBinding(&tokens, 2, false, &reference.timeSetId, &reference.fileSetId);
+        if (tokens.size() != 2 || tokens.first().isEmpty()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold constant-per-case-file declaration on line %1 must contain [time set], a name, and one filename.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        reference.role = EnSightGoldReference::Role::ConstantVariable;
+        if (!normalizeEnSightGoldVariableName(tokens.first(), &reference.variableName,
+                                              errorMessage, lineNumber)) {
+            return false;
+        }
+        reference.patterns = {tokens.at(1)};
+        return appendEnSightGoldReference(std::move(reference), source, errorMessage);
+    }
+    if (declaration == QStringLiteral("constant per part")) {
+        takeEnSightGoldBinding(&tokens, 2, false, &reference.timeSetId, &reference.fileSetId);
+        if ((tokens.size() != 2 && tokens.size() != 3) || tokens.first().isEmpty()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold constant-per-part declaration on line %1 must contain [time set], a name, a value filename, and an optional index filename.")
+                                    .arg(lineNumber);
+            }
+            return false;
+        }
+        reference.role = EnSightGoldReference::Role::ConstantVariable;
+        if (!normalizeEnSightGoldVariableName(tokens.first(), &reference.variableName,
+                                              errorMessage, lineNumber)) {
+            return false;
+        }
+        reference.patterns = tokens.mid(1);
+        return appendEnSightGoldReference(std::move(reference), source, errorMessage);
+    }
+
+    static const QSet<QString> standardDeclarations = {
+        QStringLiteral("scalar per node"),
+        QStringLiteral("scalar per element"),
+        QStringLiteral("scalar per measured node"),
+        QStringLiteral("vector per node"),
+        QStringLiteral("vector per element"),
+        QStringLiteral("vector per measured node"),
+        QStringLiteral("tensor per node"),
+        QStringLiteral("tensor per element"),
+        QStringLiteral("tensor symm per node"),
+        QStringLiteral("tensor symm per element"),
+        QStringLiteral("tensor asym per node"),
+        QStringLiteral("tensor asym per element"),
+    };
+    static const QSet<QString> complexDeclarations = {
+        QStringLiteral("complex scalar per node"),
+        QStringLiteral("complex scalar per element"),
+        QStringLiteral("complex vector per node"),
+        QStringLiteral("complex vector per element"),
+    };
+    const bool isStandard = standardDeclarations.contains(declaration);
+    const bool isComplex = complexDeclarations.contains(declaration);
+    if (!isStandard && !isComplex) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Unsupported EnSight Gold VARIABLE declaration \"%1\" on line %2.")
+                                .arg(key)
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+
+    takeEnSightGoldBinding(&tokens,
+                           isComplex ? 3 : 2,
+                           true,
+                           &reference.timeSetId,
+                           &reference.fileSetId);
+    if (isStandard && tokens.size() != 2) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold variable on line %1 must contain [time set] [file set], one name, and one filename; names and paths with spaces must be quoted.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    if (isComplex && tokens.size() != 4) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold complex variable on line %1 must contain [time set] [file set], one name, real/imaginary filenames, and a finite frequency or UNDEFINED.")
+                                .arg(lineNumber);
+        }
+        return false;
+    }
+    if (tokens.first().isEmpty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold variable name on line %1 is empty.").arg(lineNumber);
+        }
+        return false;
+    }
+    if (isComplex && tokens.size() == 4) {
+        if (tokens.last().compare(QStringLiteral("UNDEFINED"),
+                                  Qt::CaseInsensitive) == 0) {
+            reference.frequencyUndefined = true;
+            tokens.removeLast();
+        } else {
+            bool ok = false;
+            const double frequency = tokens.last().toDouble(&ok);
+            if (!ok || !std::isfinite(frequency)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "EnSight Gold complex frequency on line %1 must be finite numeric data or UNDEFINED.")
+                                        .arg(lineNumber);
+                }
+                return false;
+            }
+            reference.hasFrequency = true;
+            reference.frequency = frequency;
+            tokens.removeLast();
+        }
+    }
+
+    const bool measured = declaration.contains(QStringLiteral("measured"));
+    const ArrayInfo::Association association = declaration.contains(QStringLiteral("element"))
+        ? ArrayInfo::Association::Cell
+        : ArrayInfo::Association::Point;
+    QString variableName;
+    if (!normalizeEnSightGoldVariableName(tokens.first(), &variableName,
+                                          errorMessage, lineNumber)) {
+        return false;
+    }
+    if (!measured) {
+        if (isComplex && declaration.contains(QStringLiteral("vector"))) {
+            if (!addEnSightGoldArray(variableName + QStringLiteral("_r"), declaration,
+                                     association, source, errorMessage,
+                                     lineNumber, 3)
+                || !addEnSightGoldArray(variableName + QStringLiteral("_i"), declaration,
+                                        association, source, errorMessage,
+                                        lineNumber, 3)) {
+                return false;
+            }
+        } else if (!addEnSightGoldArray(variableName, declaration, association,
+                                        source, errorMessage, lineNumber)) {
+            return false;
+        }
+    }
+    reference.role = measured ? EnSightGoldReference::Role::MeasuredVariable
+                              : EnSightGoldReference::Role::VolumeVariable;
+    reference.variableName = variableName;
+    reference.patterns = tokens.mid(1);
+    return appendEnSightGoldReference(std::move(reference), source, errorMessage);
+}
+
+bool parseEnSightGoldIntegerList(const QString& inlineValues,
+                                 int expectedCount,
+                                 const QVector<EnSightGoldCaseLine>& lines,
+                                 int* lineIndex,
+                                 QVector<qint64>* values,
+                                 QString* errorMessage,
+                                 const QString& label) {
+    if (lineIndex == nullptr || values == nullptr || expectedCount <= 0
+        || expectedCount > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+        return false;
+    }
+    values->clear();
+    QString current = inlineValues;
+    while (true) {
+        QStringList tokens;
+        if (!tokenizeEnSightGoldPayload(current, &tokens, errorMessage,
+                                        lines.at(*lineIndex).number)) {
+            return false;
+        }
+        if (values->size() + tokens.size() > expectedCount) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold %1 contains more than the declared %2 values near line %3.")
+                                    .arg(label)
+                                    .arg(expectedCount)
+                                    .arg(lines.at(*lineIndex).number);
+            }
+            return false;
+        }
+        for (const QString& token : tokens) {
+            qint64 value = 0;
+            if (!parseEnSightGoldIntegerToken(token, &value)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold %1 contains an invalid 32-bit integer on line %2: %3")
+                                        .arg(label)
+                                        .arg(lines.at(*lineIndex).number)
+                                        .arg(token);
+                }
+                return false;
+            }
+            values->append(value);
+        }
+        if (values->size() == expectedCount) {
+            return true;
+        }
+        if (*lineIndex + 1 >= lines.size()) {
+            break;
+        }
+        const EnSightGoldCaseLine& next = lines.at(*lineIndex + 1);
+        if (!enSightGoldSectionName(next.text).isEmpty()
+            || isEnSightGoldSectionSpelling(next.text)
+            || enSightGoldUnquotedColon(next.text) >= 0) {
+            break;
+        }
+        ++(*lineIndex);
+        current = next.text;
+    }
+    if (errorMessage != nullptr) {
+        *errorMessage = QStringLiteral("EnSight Gold %1 contains %2 values, but %3 were declared.")
+                            .arg(label)
+                            .arg(values->size())
+                            .arg(expectedCount);
+    }
+    return false;
+}
+
+bool parseEnSightGoldDoubleList(const QString& inlineValues,
+                                int expectedCount,
+                                const QVector<EnSightGoldCaseLine>& lines,
+                                int* lineIndex,
+                                QVector<double>* values,
+                                QString* errorMessage,
+                                const QString& label) {
+    if (lineIndex == nullptr || values == nullptr || expectedCount <= 0
+        || expectedCount > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+        return false;
+    }
+    values->clear();
+    QString current = inlineValues;
+    while (true) {
+        QStringList tokens;
+        if (!tokenizeEnSightGoldPayload(current, &tokens, errorMessage,
+                                        lines.at(*lineIndex).number)) {
+            return false;
+        }
+        if (values->size() + tokens.size() > expectedCount) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold %1 contains more than the declared %2 values near line %3.")
+                                    .arg(label)
+                                    .arg(expectedCount)
+                                    .arg(lines.at(*lineIndex).number);
+            }
+            return false;
+        }
+        for (const QString& token : tokens) {
+            bool ok = false;
+            const double value = token.toDouble(&ok);
+            if (!ok || !std::isfinite(value)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold %1 contains a non-finite numeric value on line %2: %3")
+                                        .arg(label)
+                                        .arg(lines.at(*lineIndex).number)
+                                        .arg(token);
+                }
+                return false;
+            }
+            values->append(value);
+        }
+        if (values->size() == expectedCount) {
+            return true;
+        }
+        if (*lineIndex + 1 >= lines.size()) {
+            break;
+        }
+        const EnSightGoldCaseLine& next = lines.at(*lineIndex + 1);
+        if (!enSightGoldSectionName(next.text).isEmpty()
+            || isEnSightGoldSectionSpelling(next.text)
+            || enSightGoldUnquotedColon(next.text) >= 0) {
+            break;
+        }
+        ++(*lineIndex);
+        current = next.text;
+    }
+    if (errorMessage != nullptr) {
+        *errorMessage = QStringLiteral("EnSight Gold %1 contains %2 values, but %3 were declared.")
+                            .arg(label)
+                            .arg(values->size())
+                            .arg(expectedCount);
+    }
+    return false;
+}
+
+QString expandEnSightGoldPattern(QString pattern, qint64 filenameNumber) {
+    const QRegularExpression stars(QStringLiteral(R"(\*+)"));
+    const QRegularExpressionMatch match = stars.match(pattern);
+    if (!match.hasMatch()) {
+        return pattern;
+    }
+    const int width = match.capturedLength();
+    const QString number = QStringLiteral("%1").arg(filenameNumber, width, 10, QLatin1Char('0'));
+    pattern.replace(match.capturedStart(), width, number);
+    return pattern;
+}
+
+QString expandEnSightGoldBlockPattern(QString pattern, qint64 blockNumber) {
+    const QRegularExpression percents(QStringLiteral(R"(%+)"));
+    const QRegularExpressionMatch match = percents.match(pattern);
+    if (!match.hasMatch()) {
+        return pattern;
+    }
+    const int width = match.capturedLength();
+    const QString number = QStringLiteral("%1").arg(blockNumber, width, 10,
+                                                    QLatin1Char('0'));
+    pattern.replace(match.capturedStart(), width, number);
+    return pattern;
+}
+
+QString resolveEnSightGoldReferencedPath(const EnSightGoldCaseSource& source,
+                                         const QString& expandedPattern) {
+    if (QDir::isAbsolutePath(expandedPattern)) {
+        return normalizedPath(QFileInfo(expandedPattern).absoluteFilePath());
+    }
+    return normalizedPath(QFileInfo(QDir(QFileInfo(source.path).absolutePath())
+                                        .absoluteFilePath(expandedPattern))
+                              .absoluteFilePath());
+}
+
+bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* errorMessage) {
+    if (source == nullptr) {
+        return false;
+    }
+    const bool hasAnyBlockContinuation = source->hasBlockContinuationCount
+        || source->hasBlockContinuationStart
+        || source->hasBlockContinuationIncrement;
+    if (hasAnyBlockContinuation
+        && (!source->hasBlockContinuationCount
+            || !source->hasBlockContinuationStart
+            || !source->hasBlockContinuationIncrement
+            || source->blockContinuationCount <= 0
+            || source->blockContinuationCount
+                > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount
+            || source->blockContinuationIncrement == 0)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "EnSight Gold BLOCK_CONTINUATION must declare bounded number of sets, filename start number, and non-zero increment exactly once.");
+        }
+        return false;
+    }
+    if (hasAnyBlockContinuation) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "EnSight Gold BLOCK_CONTINUATION is legal, but the bundled VTK EnSight reader cannot preserve its structured-block continuation semantics safely; re-export as one merged case, VTU/VTS, or another supported format.");
+        }
+        return false;
+    }
+
+    for (auto timeSetIt = source->timeSets.begin(); timeSetIt != source->timeSets.end(); ++timeSetIt) {
+        EnSightGoldTimeSet& timeSet = timeSetIt.value();
+        if (!timeSet.hasDeclaredSteps || timeSet.declaredSteps <= 0
+            || timeSet.declaredSteps > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount
+            || (source->hasMaximumTimeSteps
+                && timeSet.declaredSteps > source->maximumTimeSteps)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold time set %1 must declare between 1 and %2 steps.")
+                                    .arg(timeSet.id)
+                                    .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount);
+            }
+            return false;
+        }
+        if (timeSet.timeValues.size() != timeSet.declaredSteps) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold time set %1 has %2 time values, but declares %3 steps.")
+                                    .arg(timeSet.id)
+                                    .arg(timeSet.timeValues.size())
+                                    .arg(timeSet.declaredSteps);
+            }
+            return false;
+        }
+        for (qsizetype index = 1; index < timeSet.timeValues.size(); ++index) {
+            if (!(timeSet.timeValues.at(index) > timeSet.timeValues.at(index - 1))) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold time set %1 values must be finite and strictly increasing.")
+                                        .arg(timeSet.id);
+                }
+                return false;
+            }
+        }
+        if (timeSet.hasExplicitFilenameNumbers) {
+            if (timeSet.hasFilenameStart || timeSet.hasFilenameIncrement
+                || timeSet.filenameNumbers.size() != timeSet.declaredSteps) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold time set %1 has conflicting or incomplete filename-number declarations.")
+                                        .arg(timeSet.id);
+                }
+                return false;
+            }
+        } else if (timeSet.hasFilenameStart || timeSet.hasFilenameIncrement) {
+            if (!timeSet.hasFilenameStart || !timeSet.hasFilenameIncrement
+                || timeSet.filenameIncrement == 0) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "EnSight Gold time set %1 has an incomplete filename start/increment pair.")
+                                        .arg(timeSet.id);
+                }
+                return false;
+            }
+            timeSet.filenameNumbers.clear();
+            timeSet.filenameNumbers.reserve(timeSet.declaredSteps);
+            for (int index = 0; index < timeSet.declaredSteps; ++index) {
+                const qint64 number = timeSet.filenameStart
+                    + static_cast<qint64>(index) * timeSet.filenameIncrement;
+                if (number < std::numeric_limits<int>::min()
+                    || number > std::numeric_limits<int>::max()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                                            "EnSight Gold time set %1 filename-number arithmetic exceeds VTK's 32-bit range at step %2.")
+                                            .arg(timeSet.id)
+                                            .arg(index + 1);
+                    }
+                    return false;
+                }
+                timeSet.filenameNumbers.append(number);
+            }
+        }
+    }
+
+    for (const EnSightGoldConstantPerCase& constant : std::as_const(source->constantsPerCase)) {
+        if (constant.timeSetId == 0) {
+            if (constant.values.size() != 1) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "Static EnSight Gold constant per case on line %1 must contain exactly one value.")
+                                        .arg(constant.declarationLine);
+                }
+                return false;
+            }
+            continue;
+        }
+        const auto timeSet = source->timeSets.constFind(constant.timeSetId);
+        if (timeSet == source->timeSets.cend()
+            || constant.values.size() != timeSet->declaredSteps) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "Transient EnSight Gold constant per case on line %1 must reference an existing time set and provide exactly one value per declared step.")
+                                    .arg(constant.declarationLine);
+            }
+            return false;
+        }
+    }
+
+    for (auto fileSetIt = source->fileSets.cbegin(); fileSetIt != source->fileSets.cend(); ++fileSetIt) {
+        const EnSightGoldFileSet& fileSet = fileSetIt.value();
+        qint64 total = 0;
+        if (fileSet.chunks.isEmpty()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold file set %1 does not declare any step chunks.")
+                                    .arg(fileSet.id);
+            }
+            return false;
+        }
+        for (const EnSightGoldFileChunk& chunk : fileSet.chunks) {
+            if (chunk.stepCount <= 0) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold file set %1 contains a non-positive step count.")
+                                        .arg(fileSet.id);
+                }
+                return false;
+            }
+            total += chunk.stepCount;
+            if (total > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold file set %1 exceeds the %2-step limit.")
+                                        .arg(fileSet.id)
+                                        .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount);
+                }
+                return false;
+            }
+        }
+    }
+
+    QHash<int, int> fileSetToTimeSet;
+    QSet<int> volumeTimeSets;
+    source->referencedPaths.clear();
+    source->modelGeometryPaths.clear();
+    for (EnSightGoldReference& reference : source->references) {
+        const EnSightGoldTimeSet* timeSet = nullptr;
+        if (reference.timeSetId > 0) {
+            const auto timeIt = source->timeSets.constFind(reference.timeSetId);
+            if (timeIt == source->timeSets.cend()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold %1 on line %2 references missing time set %3.")
+                                        .arg(reference.declaration)
+                                        .arg(reference.declarationLine)
+                                        .arg(reference.timeSetId);
+                }
+                return false;
+            }
+            timeSet = &timeIt.value();
+        }
+        const EnSightGoldFileSet* fileSet = nullptr;
+        if (reference.fileSetId > 0) {
+            if (timeSet == nullptr) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold file set %1 on line %2 is not paired with a time set.")
+                                        .arg(reference.fileSetId)
+                                        .arg(reference.declarationLine);
+                }
+                return false;
+            }
+            const auto fileIt = source->fileSets.constFind(reference.fileSetId);
+            if (fileIt == source->fileSets.cend()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold %1 on line %2 references missing file set %3.")
+                                        .arg(reference.declaration)
+                                        .arg(reference.declarationLine)
+                                        .arg(reference.fileSetId);
+                }
+                return false;
+            }
+            fileSet = &fileIt.value();
+            const auto boundTime = fileSetToTimeSet.constFind(reference.fileSetId);
+            if (boundTime != fileSetToTimeSet.cend() && boundTime.value() != reference.timeSetId) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold file set %1 is bound to multiple time sets (%2 and %3).")
+                                        .arg(reference.fileSetId)
+                                        .arg(boundTime.value())
+                                        .arg(reference.timeSetId);
+                }
+                return false;
+            }
+            fileSetToTimeSet.insert(reference.fileSetId, reference.timeSetId);
+            const qint64 fileSteps = std::accumulate(
+                fileSet->chunks.cbegin(), fileSet->chunks.cend(), qint64{0},
+                [](qint64 sum, const EnSightGoldFileChunk& chunk) { return sum + chunk.stepCount; });
+            if (fileSteps != timeSet->declaredSteps) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold file set %1 contains %2 steps, but bound time set %3 contains %4.")
+                                        .arg(reference.fileSetId)
+                                        .arg(fileSteps)
+                                        .arg(reference.timeSetId)
+                                        .arg(timeSet->declaredSteps);
+                }
+                return false;
+            }
+        }
+        if ((reference.role == EnSightGoldReference::Role::ModelGeometry
+             || reference.role == EnSightGoldReference::Role::VolumeVariable)
+            && reference.timeSetId > 0) {
+            volumeTimeSets.insert(reference.timeSetId);
+        }
+
+        reference.resolvedPaths.clear();
+        reference.resolvedPatternPaths.clear();
+        reference.expandedPatternNames.clear();
+        reference.resolvedPatternPaths.reserve(reference.patterns.size());
+        reference.expandedPatternNames.reserve(reference.patterns.size());
+        for (const QString& pattern : std::as_const(reference.patterns)) {
+            QStringList expandedPatterns;
+            const bool hasWildcard = pattern.contains(QLatin1Char('*'));
+            const bool hasBlockWildcard = pattern.contains(QLatin1Char('%'));
+            const bool participatesInBlockContinuation =
+                reference.role != EnSightGoldReference::Role::Auxiliary;
+            if (hasBlockWildcard
+                && (!hasAnyBlockContinuation || !participatesInBlockContinuation)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                        "EnSight Gold line %1 uses a %% block wildcard outside a supported BLOCK_CONTINUATION geometry/variable declaration.")
+                                        .arg(reference.declarationLine);
+                }
+                return false;
+            }
+            if (hasAnyBlockContinuation && participatesInBlockContinuation
+                && !hasBlockWildcard) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                        "EnSight Gold line %1 must use a %% block wildcard because BLOCK_CONTINUATION is enabled.")
+                                        .arg(reference.declarationLine);
+                }
+                return false;
+            }
+            if (fileSet != nullptr) {
+                if (fileSet->usesFilenameIndices) {
+                    if (!hasWildcard) {
+                        if (errorMessage != nullptr) {
+                            *errorMessage = QStringLiteral("EnSight Gold line %1 binds continuation file set %2 to a filename without wildcards.")
+                                                .arg(reference.declarationLine)
+                                                .arg(reference.fileSetId);
+                        }
+                        return false;
+                    }
+                    for (const EnSightGoldFileChunk& chunk : fileSet->chunks) {
+                        expandedPatterns.append(expandEnSightGoldPattern(pattern, chunk.filenameIndex));
+                    }
+                } else {
+                    if (hasWildcard) {
+                        if (errorMessage != nullptr) {
+                            *errorMessage = QStringLiteral("EnSight Gold line %1 uses wildcards with single-file file set %2, which has no filename indices.")
+                                                .arg(reference.declarationLine)
+                                                .arg(reference.fileSetId);
+                        }
+                        return false;
+                    }
+                    expandedPatterns.append(pattern);
+                }
+            } else if (timeSet != nullptr && hasWildcard) {
+                if (timeSet->filenameNumbers.size() != timeSet->declaredSteps) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "EnSight Gold line %1 uses a transient wildcard, but time set %2 has no complete filename-number declaration.")
+                                            .arg(reference.declarationLine)
+                                            .arg(reference.timeSetId);
+                    }
+                    return false;
+                }
+                for (const qint64 filenameNumber : timeSet->filenameNumbers) {
+                    expandedPatterns.append(expandEnSightGoldPattern(pattern, filenameNumber));
+                }
+            } else {
+                if (timeSet == nullptr && hasWildcard) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight Gold line %1 uses a wildcard filename without a time or file set.")
+                                            .arg(reference.declarationLine);
+                    }
+                    return false;
+                }
+                expandedPatterns.append(pattern);
+            }
+            if (hasBlockWildcard) {
+                QStringList blockExpanded;
+                if (expandedPatterns.size()
+                    > Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount
+                        / source->blockContinuationCount) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "EnSight Gold block/time expansion on line %1 exceeds the bounded dependency count.")
+                                            .arg(reference.declarationLine);
+                    }
+                    return false;
+                }
+                blockExpanded.reserve(expandedPatterns.size()
+                                      * source->blockContinuationCount);
+                for (const QString& expanded : std::as_const(expandedPatterns)) {
+                    for (int blockIndex = 0;
+                         blockIndex < source->blockContinuationCount;
+                         ++blockIndex) {
+                        const qint64 blockNumber = source->blockContinuationStart
+                            + static_cast<qint64>(blockIndex)
+                                * source->blockContinuationIncrement;
+                        if (blockNumber < std::numeric_limits<int>::min()
+                            || blockNumber > std::numeric_limits<int>::max()) {
+                            if (errorMessage != nullptr) {
+                                *errorMessage = QStringLiteral(
+                                    "EnSight Gold BLOCK_CONTINUATION filename arithmetic exceeds the 32-bit range.");
+                            }
+                            return false;
+                        }
+                        blockExpanded.append(
+                            expandEnSightGoldBlockPattern(expanded, blockNumber));
+                    }
+                }
+                expandedPatterns = blockExpanded;
+            }
+            QStringList patternPaths;
+            patternPaths.reserve(expandedPatterns.size());
+            for (const QString& expanded : std::as_const(expandedPatterns)) {
+                const QString path = resolveEnSightGoldReferencedPath(*source, expanded);
+                patternPaths.append(path);
+                if (!containsSourcePath(reference.resolvedPaths, path)) {
+                    reference.resolvedPaths.append(path);
+                }
+                if (!containsSourcePath(source->referencedPaths, path)) {
+                    source->referencedPaths.append(path);
+                }
+                if (reference.role == EnSightGoldReference::Role::ModelGeometry
+                    && !containsSourcePath(source->modelGeometryPaths, path)) {
+                    source->modelGeometryPaths.append(path);
+                }
+            }
+            reference.resolvedPatternPaths.append(patternPaths);
+            reference.expandedPatternNames.append(expandedPatterns);
+        }
+    }
+
+    if (volumeTimeSets.size() > 1) {
+        QStringList ids;
+        for (const int id : std::as_const(volumeTimeSets)) {
+            ids.append(QString::number(id));
+        }
+        ids.sort();
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight Gold volume geometry/variables use multiple time sets (%1); Streamcenter+ cannot represent this asynchronous volume timeline safely.")
+                                .arg(ids.join(QStringLiteral(", ")));
+        }
+        return false;
+    }
+    if (volumeTimeSets.isEmpty()) {
+        source->timeValues = {0.0};
+    } else {
+        source->timeValues = source->timeSets.constFind(*volumeTimeSets.cbegin()).value().timeValues;
+    }
+    if (source->timeValues.size() > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case exceeds the %1-frame limit.")
+                                .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool parseEnSightGoldCaseSource(const QString& casePath,
+                                EnSightGoldCaseSource* source,
+                                QString* errorMessage,
+                                const QString& logicalCasePath = QString()) {
     if (source == nullptr) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("Internal error: EnSight Gold metadata storage was not provided.");
@@ -1603,9 +3340,10 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
     }
 
     const QFileInfo caseInfo(casePath);
-    if (!caseInfo.exists() || !caseInfo.isFile()) {
+    if (!caseInfo.exists() || !caseInfo.isFile() || caseInfo.isSymLink()) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("EnSight Gold case file does not exist: %1").arg(casePath);
+            *errorMessage = QString("EnSight Gold case file does not exist or is not a regular non-link file: %1")
+                                .arg(casePath);
         }
         return false;
     }
@@ -1616,6 +3354,15 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
         return false;
     }
 
+    if (caseInfo.size() <= 0
+        || caseInfo.size() > Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case metadata must be between 1 and %1 bytes: %2")
+                                .arg(Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes)
+                                .arg(caseInfo.absoluteFilePath());
+        }
+        return false;
+    }
     QFile file(caseInfo.absoluteFilePath());
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         if (errorMessage != nullptr) {
@@ -1625,79 +3372,427 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
     }
 
     *source = EnSightGoldCaseSource{};
-    source->path = normalizedPath(caseInfo.absoluteFilePath());
+    source->path = normalizedPath(QFileInfo(logicalCasePath.isEmpty()
+                                                ? caseInfo.absoluteFilePath()
+                                                : logicalCasePath)
+                                      .absoluteFilePath());
 
-    const QString text = QString::fromUtf8(file.readAll());
+    const QByteArray casePayload = file.read(
+        Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes + 1);
+    if (casePayload.size() > Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes
+        || !file.atEnd()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold case metadata exceeds the bounded read limit: %1")
+                                .arg(caseInfo.absoluteFilePath());
+        }
+        return false;
+    }
+    QVector<EnSightGoldCaseLine> lines;
+    if (!readBoundedEnSightGoldCaseLines(casePayload, &lines, errorMessage)) {
+        return false;
+    }
     QString section;
     bool foundGoldFormat = false;
-    bool readingTimeValues = false;
-    int declaredSteps = 0;
-    const QStringList lines = text.split(QRegularExpression(QStringLiteral(R"(\r\n|\n|\r)")));
-    for (const QString& rawLine : lines) {
-        QString line = rawLine.trimmed();
-        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
-            continue;
-        }
-
+    QSet<QString> seenSections;
+    EnSightGoldTimeSet* currentTimeSet = nullptr;
+    EnSightGoldFileSet* currentFileSet = nullptr;
+    bool pendingFileSetIndex = false;
+    qint64 pendingFilenameIndex = 0;
+    for (int lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+        const EnSightGoldCaseLine& caseLine = lines.at(lineIndex);
+        const QString& line = caseLine.text;
         const QString nextSection = enSightGoldSectionName(line);
         if (!nextSection.isEmpty()) {
+            if (pendingFileSetIndex) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold FILE section is missing number of steps after filename index near line %1.")
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            if (nextSection == QStringLiteral("MATERIAL")) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                        "EnSight Gold MATERIAL is a legal optional section, but material/species semantics are not supported safely by this flow-data importer (line %1).")
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            if (seenSections.contains(nextSection)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold section %1 is declared more than once (line %2).")
+                                        .arg(nextSection)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            seenSections.insert(nextSection);
             section = nextSection;
-            readingTimeValues = false;
+            currentTimeSet = nullptr;
+            currentFileSet = nullptr;
+            continue;
+        }
+        if (isEnSightGoldSectionSpelling(line)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight Gold section headers must use their required uppercase spelling (line %1): %2")
+                                    .arg(caseLine.number)
+                                    .arg(line);
+            }
+            return false;
+        }
+
+        if (section == QStringLiteral("QUERY")) {
+            // QUERY metadata does not affect geometry, variables, time, or
+            // files consumed by VTK.  It is intentionally stripped from the
+            // normalized private case after this bounded line parser sees it.
             continue;
         }
 
-        const int colon = line.indexOf(QLatin1Char(':'));
-        if (section == QStringLiteral("TIME") && readingTimeValues && colon < 0) {
-            const QVector<double> values = parseDoubleTokens(line);
-            source->timeValues += values;
-            continue;
-        }
+        const int colon = enSightGoldUnquotedColon(line);
         if (colon < 0) {
-            continue;
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Unexpected EnSight Gold content without a declaration key on line %1: %2")
+                                    .arg(caseLine.number)
+                                    .arg(line);
+            }
+            return false;
         }
 
-        const QString key = line.left(colon).trimmed().toLower();
+        const QString key = line.left(colon).trimmed();
+        const QString normalizedKey = key.simplified().toLower();
         const QString value = line.mid(colon + 1).trimmed();
-        readingTimeValues = false;
 
         if (section == QStringLiteral("FORMAT")) {
-            if (key == QStringLiteral("type") && value.toLower().contains(QStringLiteral("ensight gold"))) {
+            if (normalizedKey != QStringLiteral("type")) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Unsupported EnSight Gold FORMAT declaration \"%1\" on line %2.")
+                                        .arg(key)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            if (value.simplified().toLower().contains(QStringLiteral("ensight gold"))) {
                 foundGoldFormat = true;
             }
             continue;
         }
         if (section == QStringLiteral("GEOMETRY")) {
-            appendEnSightGoldGeometryPattern(value, source);
+            if (!parseEnSightGoldGeometryDeclaration(key, value, caseLine.number,
+                                                     source, errorMessage)) {
+                return false;
+            }
             continue;
         }
         if (section == QStringLiteral("VARIABLE")) {
-            appendEnSightGoldVariable(key, value, source);
+            if (!parseEnSightGoldVariableDeclaration(key, value, caseLine.number,
+                                                     source, errorMessage)) {
+                return false;
+            }
             continue;
         }
         if (section == QStringLiteral("TIME")) {
-            if (key == QStringLiteral("number of steps")) {
-                parseIntToken(value, &declaredSteps);
-            } else if (key == QStringLiteral("filename start number")) {
-                parseIntToken(value, &source->filenameStartNumber);
-            } else if (key == QStringLiteral("filename increment")) {
-                int increment = 0;
-                if (parseIntToken(value, &increment) && increment != 0) {
-                    source->filenameIncrement = increment;
+            if (normalizedKey == QStringLiteral("maximum time steps")) {
+                int maximum = 0;
+                if (source->hasMaximumTimeSteps || currentTimeSet != nullptr
+                    || !source->timeSets.isEmpty()
+                    || !parsePositiveIntToken(value, &maximum)) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "EnSight Gold maximum time steps on line %1 must be one positive integer declared once before the first time set.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
                 }
-            } else if (key == QStringLiteral("time values")) {
-                source->timeValues += parseDoubleTokens(value);
-                readingTimeValues = true;
+                source->hasMaximumTimeSteps = true;
+                source->maximumTimeSteps = std::min(
+                    maximum,
+                    static_cast<int>(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount));
+                continue;
             }
+            if (normalizedKey == QStringLiteral("time set")) {
+                QStringList tokens;
+                int id = 0;
+                if (!tokenizeEnSightGoldPayload(value, &tokens, errorMessage, caseLine.number)
+                    || tokens.isEmpty() || !parsePositiveIntToken(tokens.first(), &id)
+                    || source->timeSets.contains(id)
+                    || source->timeSets.size()
+                        >= Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                    if (errorMessage != nullptr && errorMessage->isEmpty()) {
+                        *errorMessage = QStringLiteral("Invalid or duplicate EnSight Gold time set on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                source->timeSets.insert(id, EnSightGoldTimeSet{id, caseLine.number});
+                currentTimeSet = &source->timeSets[id];
+                continue;
+            }
+            if (currentTimeSet == nullptr) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight Gold TIME declaration on line %1 appears before a time set.")
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            if (normalizedKey == QStringLiteral("number of steps")) {
+                int steps = 0;
+                if (currentTimeSet->hasDeclaredSteps || !parsePositiveIntToken(value, &steps)
+                    || steps > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight Gold time set %1 line %2 must declare 1..%3 steps exactly once.")
+                                            .arg(currentTimeSet->id)
+                                            .arg(caseLine.number)
+                                            .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount);
+                    }
+                    return false;
+                }
+                currentTimeSet->declaredSteps = steps;
+                currentTimeSet->hasDeclaredSteps = true;
+            } else if (normalizedKey == QStringLiteral("filename numbers")) {
+                if (!currentTimeSet->hasDeclaredSteps || currentTimeSet->hasExplicitFilenameNumbers
+                    || currentTimeSet->hasFilenameStart || currentTimeSet->hasFilenameIncrement) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Conflicting or out-of-order filename numbers for EnSight time set %1 on line %2.")
+                                            .arg(currentTimeSet->id)
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                currentTimeSet->hasExplicitFilenameNumbers = true;
+                if (!parseEnSightGoldIntegerList(value, currentTimeSet->declaredSteps,
+                                                 lines, &lineIndex,
+                                                 &currentTimeSet->filenameNumbers,
+                                                 errorMessage,
+                                                 QStringLiteral("filename numbers"))) {
+                    return false;
+                }
+            } else if (normalizedKey == QStringLiteral("filename start number")) {
+                qint64 number = 0;
+                if (currentTimeSet->hasExplicitFilenameNumbers || currentTimeSet->hasFilenameStart
+                    || !parseEnSightGoldIntegerToken(value, &number)) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Invalid or duplicate filename start number for EnSight time set %1 on line %2.")
+                                            .arg(currentTimeSet->id)
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                currentTimeSet->hasFilenameStart = true;
+                currentTimeSet->filenameStart = number;
+            } else if (normalizedKey == QStringLiteral("filename increment")) {
+                qint64 increment = 0;
+                if (currentTimeSet->hasExplicitFilenameNumbers || currentTimeSet->hasFilenameIncrement
+                    || !parseEnSightGoldIntegerToken(value, &increment) || increment == 0) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Invalid or duplicate filename increment for EnSight time set %1 on line %2.")
+                                            .arg(currentTimeSet->id)
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                currentTimeSet->hasFilenameIncrement = true;
+                currentTimeSet->filenameIncrement = increment;
+            } else if (normalizedKey == QStringLiteral("time values")) {
+                if (!currentTimeSet->hasDeclaredSteps || !currentTimeSet->timeValues.isEmpty()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Invalid, duplicate, or out-of-order time values for EnSight time set %1 on line %2.")
+                                            .arg(currentTimeSet->id)
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                if (!parseEnSightGoldDoubleList(value, currentTimeSet->declaredSteps,
+                                                lines, &lineIndex,
+                                                &currentTimeSet->timeValues,
+                                                errorMessage,
+                                                QStringLiteral("time values"))) {
+                    return false;
+                }
+            } else if (normalizedKey == QStringLiteral("filename numbers file")
+                       || normalizedKey == QStringLiteral("time values file")) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "EnSight Gold external %1 on line %2 is a legal variant that this importer does not support safely.")
+                                        .arg(normalizedKey)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            } else {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Unsupported EnSight Gold TIME declaration \"%1\" on line %2.")
+                                        .arg(key)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            continue;
         }
+        if (section == QStringLiteral("BLOCK_CONTINUATION")) {
+            if (normalizedKey == QStringLiteral("number of sets")) {
+                int count = 0;
+                if (source->hasBlockContinuationCount
+                    || !parsePositiveIntToken(value, &count)
+                    || count > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "Invalid or duplicate BLOCK_CONTINUATION number of sets on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                source->hasBlockContinuationCount = true;
+                source->blockContinuationCount = count;
+            } else if (normalizedKey == QStringLiteral("filename start number")) {
+                qint64 start = 0;
+                if (source->hasBlockContinuationStart
+                    || !parseEnSightGoldIntegerToken(value, &start)) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "Invalid or duplicate BLOCK_CONTINUATION filename start number on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                source->hasBlockContinuationStart = true;
+                source->blockContinuationStart = start;
+            } else if (normalizedKey == QStringLiteral("filename increment")) {
+                qint64 increment = 0;
+                if (source->hasBlockContinuationIncrement
+                    || !parseEnSightGoldIntegerToken(value, &increment)
+                    || increment == 0) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "Invalid or duplicate BLOCK_CONTINUATION filename increment on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                source->hasBlockContinuationIncrement = true;
+                source->blockContinuationIncrement = increment;
+            } else {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                        "Unsupported EnSight Gold BLOCK_CONTINUATION declaration \"%1\" on line %2.")
+                                        .arg(key)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            continue;
+        }
+        if (section == QStringLiteral("FILE")) {
+            if (normalizedKey == QStringLiteral("file set")) {
+                if (pendingFileSetIndex) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight Gold FILE set before line %1 is missing number of steps.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                QStringList tokens;
+                int id = 0;
+                if (!tokenizeEnSightGoldPayload(value, &tokens, errorMessage, caseLine.number)
+                    || tokens.isEmpty() || !parsePositiveIntToken(tokens.first(), &id)
+                    || source->fileSets.contains(id)
+                    || source->fileSets.size()
+                        >= Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                    if (errorMessage != nullptr && errorMessage->isEmpty()) {
+                        *errorMessage = QStringLiteral("Invalid or duplicate EnSight Gold file set on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                source->fileSets.insert(id, EnSightGoldFileSet{id, caseLine.number});
+                currentFileSet = &source->fileSets[id];
+            } else if (normalizedKey == QStringLiteral("filename index")) {
+                if (currentFileSet == nullptr || pendingFileSetIndex
+                    || (!currentFileSet->chunks.isEmpty() && !currentFileSet->usesFilenameIndices)
+                    || !parseEnSightGoldIntegerToken(value, &pendingFilenameIndex)) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Invalid filename index in EnSight Gold FILE section on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                currentFileSet->usesFilenameIndices = true;
+                pendingFileSetIndex = true;
+            } else if (normalizedKey == QStringLiteral("number of steps")) {
+                int steps = 0;
+                if (currentFileSet == nullptr || !parsePositiveIntToken(value, &steps)
+                    || steps > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount
+                    || (!pendingFileSetIndex && !currentFileSet->chunks.isEmpty())
+                    || (!pendingFileSetIndex && currentFileSet->usesFilenameIndices)) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("Invalid or duplicate number of steps in EnSight Gold FILE section on line %1.")
+                                            .arg(caseLine.number);
+                    }
+                    return false;
+                }
+                currentFileSet->chunks.append(
+                    EnSightGoldFileChunk{pendingFileSetIndex, pendingFilenameIndex, steps});
+                pendingFileSetIndex = false;
+            } else {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Unsupported EnSight Gold FILE declaration \"%1\" on line %2.")
+                                        .arg(key)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            continue;
+        }
+        if (section == QStringLiteral("SCRIPTS")) {
+            if (normalizedKey != QStringLiteral("metadata")) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Unsupported EnSight Gold SCRIPTS declaration \"%1\" on line %2.")
+                                        .arg(key)
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            QStringList tokens;
+            if (!tokenizeEnSightGoldPayload(value, &tokens, errorMessage, caseLine.number)
+                || tokens.size() != 1) {
+                if (errorMessage != nullptr && errorMessage->isEmpty()) {
+                    *errorMessage = QStringLiteral("EnSight Gold metadata script path on line %1 must be one quoted-or-unquoted filename.")
+                                        .arg(caseLine.number);
+                }
+                return false;
+            }
+            EnSightGoldReference reference;
+            reference.role = EnSightGoldReference::Role::Auxiliary;
+            reference.declaration = normalizedKey;
+            reference.declarationLine = caseLine.number;
+            reference.patterns = {tokens.first()};
+            if (!appendEnSightGoldReference(std::move(reference), source, errorMessage)) {
+                return false;
+            }
+            continue;
+        }
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold declaration appears before a supported section on line %1.")
+                                .arg(caseLine.number);
+        }
+        return false;
     }
 
+    if (pendingFileSetIndex) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight Gold FILE section ends before the final filename index's step count.");
+        }
+        return false;
+    }
     if (!foundGoldFormat) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("The selected *.case file is not an EnSight Gold case.");
         }
         return false;
     }
-    if (source->geometryPatterns.isEmpty()) {
+    const bool hasModelGeometry = std::any_of(
+        source->references.cbegin(), source->references.cend(), [](const EnSightGoldReference& reference) {
+            return reference.role == EnSightGoldReference::Role::ModelGeometry;
+        });
+    if (!hasModelGeometry) {
         if (errorMessage != nullptr) {
             *errorMessage = QString("The EnSight Gold case does not declare a geometry file: %1").arg(source->path);
         }
@@ -1709,108 +3804,190 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
         }
         return false;
     }
-    if (source->timeValues.isEmpty() && declaredSteps > 0) {
-        source->timeValues.reserve(declaredSteps);
-        for (int index = 0; index < declaredSteps; ++index) {
-            source->timeValues.push_back(static_cast<double>(index));
+    return finalizeEnSightGoldCaseSource(source, errorMessage);
+}
+
+bool verifyEnSightGoldReferences(const EnSightGoldCaseSource& source, QString* errorMessage) {
+    for (const QString& path : source.referencedPaths) {
+        const QFileInfo info(path);
+        if (!info.exists() || !info.isFile() || info.isSymLink() || !info.isReadable()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "EnSight Gold case references a missing, unreadable, non-file, or linked dependency: %1")
+                                    .arg(path);
+            }
+            return false;
         }
-    }
-    if (source->timeValues.isEmpty()) {
-        source->timeValues.push_back(0.0);
     }
     return true;
 }
 
-QString expandEnSightGoldPattern(QString pattern, int frameIndex, const EnSightGoldCaseSource& source) {
-    const QRegularExpression stars(QStringLiteral(R"(\*+)"));
-    const QRegularExpressionMatch match = stars.match(pattern);
-    if (!match.hasMatch()) {
-        return pattern;
+bool buildEnSightGoldInventoryFromCases(
+    const QVector<EnSightGoldCaseSource>& cases,
+    QVector<FlowDataSourceFingerprint>* inventory,
+    QString* errorMessage,
+    const FlowDataInspector::ProgressCallback& progress,
+    const FlowDataInspector::CancellationCallback& shouldCancel) {
+    if (inventory == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Internal error: EnSight inventory output is null.");
+        }
+        return false;
     }
-
-    const int width = match.capturedLength();
-    const int frameNumber = source.filenameStartNumber + frameIndex * source.filenameIncrement;
-    const QString number = QString::number(frameNumber).rightJustified(width, QLatin1Char('0'));
-    pattern.replace(match.capturedStart(), width, number);
-    return pattern;
-}
-
-QString resolveEnSightGoldReferencedPath(const EnSightGoldCaseSource& source,
-                                         const QString& pattern,
-                                         int frameIndex) {
-    const QString expanded = expandEnSightGoldPattern(pattern, frameIndex, source);
-    if (QDir::isAbsolutePath(expanded)) {
-        return normalizedPath(QFileInfo(expanded).absoluteFilePath());
-    }
-    return normalizedPath(QFileInfo(QDir(QFileInfo(source.path).absolutePath()).absoluteFilePath(expanded)).absoluteFilePath());
-}
-
-bool checkEnSightGoldReference(const EnSightGoldCaseSource& source,
-                               const QString& pattern,
-                               int frameIndex,
-                               QString* errorMessage) {
-    const QString path = resolveEnSightGoldReferencedPath(source, pattern, frameIndex);
-    if (QFileInfo::exists(path)) {
-        return true;
-    }
-    if (errorMessage != nullptr) {
-        *errorMessage = QString("EnSight Gold case references a missing file: %1").arg(path);
-    }
-    return false;
-}
-
-bool verifyEnSightGoldReferences(const EnSightGoldCaseSource& source, QString* errorMessage) {
-    const int lastFrameIndex = source.timeValues.isEmpty() ? 0 : static_cast<int>(source.timeValues.size() - 1);
-    auto checkFirstAndLast = [&](const QString& pattern) {
-        if (!checkEnSightGoldReference(source, pattern, 0, errorMessage)) {
+    inventory->clear();
+    QStringList paths;
+    QSet<QString> identities;
+    qint64 aggregatePathBytes = 0;
+    auto appendPath = [&](const QString& path) {
+        const QString normalized = normalizedPath(QFileInfo(path).absoluteFilePath());
+        const QString identity = sourcePathIdentityKey(normalized);
+        if (identities.contains(identity)) {
+            return true;
+        }
+        const qsizetype pathBytes = normalized.toUtf8().size();
+        if (paths.size() >= Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount
+            || pathBytes > Streamcenter::FlowDataProtocolLimits::MaximumStringBytes
+            || aggregatePathBytes + pathBytes
+                > Streamcenter::FlowDataProtocolLimits::MaximumAggregateStringBytes) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source inventory exceeds its bounded entry/path limits.");
+            }
             return false;
         }
-        if (lastFrameIndex > 0 && pattern.contains(QLatin1Char('*'))) {
-            return checkEnSightGoldReference(source, pattern, lastFrameIndex, errorMessage);
-        }
+        identities.insert(identity);
+        paths.append(normalized);
+        aggregatePathBytes += pathBytes;
         return true;
     };
 
-    for (const QString& pattern : source.geometryPatterns) {
-        if (!checkFirstAndLast(pattern)) {
+    for (const EnSightGoldCaseSource& source : cases) {
+        if (!appendPath(source.path)) {
             return false;
         }
+        for (const QString& path : source.referencedPaths) {
+            if (!appendPath(path)) {
+                return false;
+            }
+        }
     }
-    for (const QString& pattern : source.variablePatterns) {
-        if (!checkFirstAndLast(pattern)) {
+    std::sort(paths.begin(), paths.end(), [](const QString& lhs, const QString& rhs) {
+        return sourcePathIdentityKey(lhs) < sourcePathIdentityKey(rhs);
+    });
+
+    inventory->reserve(paths.size());
+    constexpr qint64 kHashChunkBytes = 4 * 1024 * 1024;
+    for (qsizetype index = 0; index < paths.size(); ++index) {
+        if (shouldCancel && shouldCancel()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source inventory hashing was canceled.");
+            }
+            inventory->clear();
             return false;
+        }
+        const QString& path = paths.at(index);
+        const QFileInfo before(path);
+        if (!before.exists() || !before.isFile() || before.isSymLink()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source inventory contains a missing, non-file, or linked dependency: %1")
+                                    .arg(path);
+            }
+            inventory->clear();
+            return false;
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot hash EnSight source dependency %1: %2")
+                                    .arg(path, file.errorString());
+            }
+            inventory->clear();
+            return false;
+        }
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        qint64 hashedBytes = 0;
+        while (!file.atEnd()) {
+            if (shouldCancel && shouldCancel()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("EnSight source inventory hashing was canceled.");
+                }
+                inventory->clear();
+                return false;
+            }
+            const QByteArray chunk = file.read(kHashChunkBytes);
+            if (chunk.isEmpty() && file.error() != QFileDevice::NoError) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral("Cannot finish hashing EnSight dependency %1: %2")
+                                        .arg(path, file.errorString());
+                }
+                inventory->clear();
+                return false;
+            }
+            hash.addData(chunk);
+            hashedBytes += chunk.size();
+            if (progress) {
+                const qint64 totalChunks = std::max<qint64>(1,
+                    (before.size() + kHashChunkBytes - 1) / kHashChunkBytes);
+                const qint64 completedChunks = std::min(
+                    totalChunks,
+                    (hashedBytes + kHashChunkBytes - 1) / kHashChunkBytes);
+                progress(QStringLiteral("Hashing EnSight source dependency %1 of %2")
+                             .arg(index + 1)
+                             .arg(paths.size()),
+                         static_cast<int>(std::min<qint64>(completedChunks,
+                                                          std::numeric_limits<int>::max())),
+                         static_cast<int>(std::min<qint64>(totalChunks,
+                                                          std::numeric_limits<int>::max())));
+            }
+        }
+        file.close();
+        const QFileInfo after(path);
+        if (!after.exists() || after.isSymLink()
+            || before.size() != after.size()
+            || before.lastModified() != after.lastModified()
+            || !sameSourcePath(before.canonicalFilePath(), after.canonicalFilePath())) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight dependency changed while it was being hashed: %1").arg(path);
+            }
+            inventory->clear();
+            return false;
+        }
+        FlowDataSourceFingerprint fingerprint;
+        fingerprint.path = sourcePathIdentity(path);
+        fingerprint.size = before.size();
+        fingerprint.sha256Hex = QString::fromLatin1(hash.result().toHex());
+        inventory->append(fingerprint);
+        if (progress) {
+            progress(QStringLiteral("Hashing EnSight source dependencies"),
+                     static_cast<int>(index + 1),
+                     static_cast<int>(paths.size()));
         }
     }
     return true;
 }
 
 bool enSightGoldSourceLooksLarge(const EnSightGoldCaseSource& source) {
-    QStringList firstFramePaths;
-    firstFramePaths.reserve(source.geometryPatterns.size() + source.variablePatterns.size());
-    for (const QString& pattern : source.geometryPatterns) {
-        const QString path = resolveEnSightGoldReferencedPath(source, pattern, 0);
-        if (!firstFramePaths.contains(path, Qt::CaseInsensitive)) {
-            firstFramePaths.append(path);
-        }
-    }
-    for (const QString& pattern : source.variablePatterns) {
-        const QString path = resolveEnSightGoldReferencedPath(source, pattern, 0);
-        if (!firstFramePaths.contains(path, Qt::CaseInsensitive)) {
-            firstFramePaths.append(path);
+    QStringList resolvedPaths;
+    for (const EnSightGoldReference& reference : source.references) {
+        for (const QString& path : reference.resolvedPaths) {
+            if (!containsSourcePath(resolvedPaths, path)) {
+                resolvedPaths.append(path);
+            }
         }
     }
 
-    qint64 firstFrameBytes = 0;
-    for (const QString& path : std::as_const(firstFramePaths)) {
+    qint64 aggregateBytes = 0;
+    for (const QString& path : std::as_const(resolvedPaths)) {
         const qint64 bytes = QFileInfo(path).size();
         if (bytes >= kLargeEnSightGoldSingleFileBytes) {
             return true;
         }
         if (bytes > 0) {
-            firstFrameBytes += bytes;
-        }
-        if (firstFrameBytes >= kLargeEnSightGoldFrameBytes) {
-            return true;
+            // Stop at the threshold instead of allowing an untrusted set of
+            // file sizes to overflow the signed accumulator.
+            if (aggregateBytes >= kLargeEnSightGoldFrameBytes - bytes) {
+                return true;
+            }
+            aggregateBytes += bytes;
         }
     }
     return false;
@@ -1836,299 +4013,20 @@ QStringList arrayInfoNames(const QList<ArrayInfo>& arrays) {
     return names;
 }
 
-bool readEnSightGoldTextRecord(QFile* file, QString* text) {
-    if (file == nullptr || text == nullptr) {
-        return false;
-    }
-    const QByteArray bytes = file->read(80);
-    if (bytes.size() != 80) {
-        return false;
-    }
-    *text = QString::fromLatin1(bytes).trimmed();
-    return true;
-}
-
-bool readEnSightGoldInt32(QFile* file, qint32* value) {
-    if (file == nullptr || value == nullptr) {
-        return false;
-    }
-    const QByteArray bytes = file->read(4);
-    if (bytes.size() != 4) {
-        return false;
-    }
-    const uchar* raw = reinterpret_cast<const uchar*>(bytes.constData());
-    *value = static_cast<qint32>(raw[0])
-        | (static_cast<qint32>(raw[1]) << 8)
-        | (static_cast<qint32>(raw[2]) << 16)
-        | (static_cast<qint32>(raw[3]) << 24);
-    return true;
-}
-
-bool skipEnSightGoldBytes(QFile* file, qint64 byteCount) {
-    if (file == nullptr || byteCount < 0) {
-        return false;
-    }
-    return file->seek(file->pos() + byteCount);
-}
-
-int enSightGoldFixedNodesPerElement(const QString& elementType) {
-    const QString type = elementType.trimmed().toLower();
-    if (type == QStringLiteral("point")) {
-        return 1;
-    }
-    if (type == QStringLiteral("bar2")) {
-        return 2;
-    }
-    if (type == QStringLiteral("bar3") || type == QStringLiteral("tria3")) {
-        return 3;
-    }
-    if (type == QStringLiteral("quad4") || type == QStringLiteral("tetra4")) {
-        return 4;
-    }
-    if (type == QStringLiteral("pyramid5")) {
-        return 5;
-    }
-    if (type == QStringLiteral("tria6") || type == QStringLiteral("penta6")) {
-        return 6;
-    }
-    if (type == QStringLiteral("quad8") || type == QStringLiteral("hexa8")) {
-        return 8;
-    }
-    if (type == QStringLiteral("tetra10")) {
-        return 10;
-    }
-    if (type == QStringLiteral("pyramid13")) {
-        return 13;
-    }
-    if (type == QStringLiteral("penta15")) {
-        return 15;
-    }
-    if (type == QStringLiteral("hexa20")) {
-        return 20;
-    }
-    return 0;
-}
-
-bool sumEnSightGoldInt32Block(QFile* file,
-                              qint64 count,
-                              qint64* sum,
-                              qint32* minValue,
-                              qint32* maxValue) {
-    if (file == nullptr || count < 0 || sum == nullptr) {
-        return false;
-    }
-    constexpr qint64 kChunkInts = 1024 * 1024;
-    *sum = 0;
-    if (minValue != nullptr) {
-        *minValue = std::numeric_limits<qint32>::max();
-    }
-    if (maxValue != nullptr) {
-        *maxValue = std::numeric_limits<qint32>::min();
-    }
-
-    QByteArray buffer;
-    buffer.resize(static_cast<int>(kChunkInts * 4));
-    qint64 consumed = 0;
-    while (consumed < count) {
-        const qint64 intsToRead = std::min(kChunkInts, count - consumed);
-        const qint64 bytesToRead = intsToRead * 4;
-        const qint64 bytesRead = file->read(buffer.data(), bytesToRead);
-        if (bytesRead != bytesToRead) {
-            return false;
-        }
-        const uchar* raw = reinterpret_cast<const uchar*>(buffer.constData());
-        for (qint64 index = 0; index < intsToRead; ++index) {
-            const qint64 offset = index * 4;
-            const qint32 value = static_cast<qint32>(raw[offset])
-                | (static_cast<qint32>(raw[offset + 1]) << 8)
-                | (static_cast<qint32>(raw[offset + 2]) << 16)
-                | (static_cast<qint32>(raw[offset + 3]) << 24);
-            if (value < 0) {
-                return false;
-            }
-            *sum += value;
-            if (minValue != nullptr) {
-                *minValue = std::min(*minValue, value);
-            }
-            if (maxValue != nullptr) {
-                *maxValue = std::max(*maxValue, value);
-            }
-        }
-        consumed += intsToRead;
-    }
-    return true;
-}
-
-bool checkEnSightGoldGeometryForVtk(const QString& geometryPath, QString* errorMessage) {
-    QFile file(geometryPath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        if (errorMessage != nullptr) {
-            *errorMessage = QString("Cannot inspect EnSight Gold geometry file: %1").arg(geometryPath);
-        }
-        return false;
-    }
-
-    QString text;
-    for (int header = 0; header < 5; ++header) {
-        if (!readEnSightGoldTextRecord(&file, &text)) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QString("EnSight Gold geometry header is incomplete: %1").arg(geometryPath);
-            }
-            return false;
-        }
-    }
-
-    while (file.pos() < file.size()) {
-        if (!readEnSightGoldTextRecord(&file, &text)) {
-            break;
-        }
-        if (text != QStringLiteral("part")) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QString("Unexpected EnSight Gold geometry record \"%1\" in %2 at byte %3.")
-                                    .arg(text, geometryPath)
-                                    .arg(file.pos() - 80);
-            }
-            return false;
-        }
-
-        qint32 partId = 0;
-        qint32 nodeCount = 0;
-        if (!readEnSightGoldInt32(&file, &partId)
-            || !readEnSightGoldTextRecord(&file, &text)
-            || !readEnSightGoldTextRecord(&file, &text)
-            || text != QStringLiteral("coordinates")
-            || !readEnSightGoldInt32(&file, &nodeCount)
-            || nodeCount < 0) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QString("EnSight Gold geometry part metadata is invalid in %1.").arg(geometryPath);
-            }
-            return false;
-        }
-        if (!skipEnSightGoldBytes(&file, static_cast<qint64>(nodeCount) * 3 * 4)) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QString("EnSight Gold geometry coordinates are truncated in %1, part %2.")
-                                    .arg(geometryPath)
-                                    .arg(partId);
-            }
-            return false;
-        }
-
-        while (file.pos() < file.size()) {
-            const qint64 recordOffset = file.pos();
-            if (!readEnSightGoldTextRecord(&file, &text)) {
-                break;
-            }
-            if (text == QStringLiteral("part")) {
-                file.seek(recordOffset);
-                break;
-            }
-
-            qint32 elementCount = 0;
-            if (!readEnSightGoldInt32(&file, &elementCount) || elementCount < 0) {
-                if (errorMessage != nullptr) {
-                    *errorMessage = QString("EnSight Gold geometry element count is invalid in %1, part %2, element type %3.")
-                                        .arg(geometryPath)
-                                        .arg(partId)
-                                        .arg(text);
-                }
-                return false;
-            }
-
-            if (text == QStringLiteral("nfaced")) {
-                qint64 faceCount = 0;
-                qint32 minFaces = 0;
-                qint32 maxFaces = 0;
-                if (!sumEnSightGoldInt32Block(&file, elementCount, &faceCount, &minFaces, &maxFaces)) {
-                    if (errorMessage != nullptr) {
-                        *errorMessage = QString("EnSight Gold nfaced face counts are invalid or truncated in %1, part %2.")
-                                            .arg(geometryPath)
-                                            .arg(partId);
-                    }
-                    return false;
-                }
-
-                qint64 connectivityCount = 0;
-                qint32 minFaceNodes = 0;
-                qint32 maxFaceNodes = 0;
-                if (!sumEnSightGoldInt32Block(&file, faceCount, &connectivityCount, &minFaceNodes, &maxFaceNodes)) {
-                    if (errorMessage != nullptr) {
-                        *errorMessage = QString("EnSight Gold nfaced node counts are invalid or truncated in %1, part %2.")
-                                            .arg(geometryPath)
-                                            .arg(partId);
-                    }
-                    return false;
-                }
-
-                if (faceCount > std::numeric_limits<qint32>::max()
-                    || connectivityCount > std::numeric_limits<qint32>::max()) {
-                    if (errorMessage != nullptr) {
-                        *errorMessage = QString("EnSight Gold geometry is valid but too large for the current VTK EnSight reader. "
-                                                "Part %1 contains %2 nfaced cells, %3 faces, and %4 face-node connectivity indices. "
-                                                "The connectivity index count exceeds the 32-bit limit (%5), which triggers VTK's "
-                                                "\"bad array new length\" failure during UpdateTimeStep. Re-export the STAR-CCM+ data "
-                                                "as partitioned/split EnSight parts, VTU/VTK, CGNS, or another chunked format before importing.")
-                                            .arg(partId)
-                                            .arg(elementCount)
-                                            .arg(faceCount)
-                                            .arg(connectivityCount)
-                                            .arg(std::numeric_limits<qint32>::max());
-                    }
-                    return false;
-                }
-
-                if (!skipEnSightGoldBytes(&file, connectivityCount * 4)) {
-                    if (errorMessage != nullptr) {
-                        *errorMessage = QString("EnSight Gold nfaced connectivity is truncated in %1, part %2.")
-                                            .arg(geometryPath)
-                                            .arg(partId);
-                    }
-                    return false;
-                }
-                continue;
-            }
-
-            const int nodesPerElement = enSightGoldFixedNodesPerElement(text);
-            if (nodesPerElement <= 0) {
-                if (errorMessage != nullptr) {
-                    *errorMessage = QString("Unsupported EnSight Gold element type \"%1\" in %2, part %3.")
-                                        .arg(text, geometryPath)
-                                        .arg(partId);
-                }
-                return false;
-            }
-            if (!skipEnSightGoldBytes(&file, static_cast<qint64>(elementCount) * nodesPerElement * 4)) {
-                if (errorMessage != nullptr) {
-                    *errorMessage = QString("EnSight Gold connectivity is truncated in %1, part %2, element type %3.")
-                                        .arg(geometryPath)
-                                        .arg(partId)
-                                        .arg(text);
-                }
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 bool checkEnSightGoldSourcesForVtk(const QVector<EnSightGoldCaseSource>& cases, QString* errorMessage) {
-    QStringList checkedGeometryFiles;
-    for (const EnSightGoldCaseSource& source : cases) {
-        for (const QString& pattern : source.geometryPatterns) {
-            const QString geometryPath = resolveEnSightGoldReferencedPath(source, pattern, 0);
-            if (checkedGeometryFiles.contains(geometryPath, Qt::CaseInsensitive)) {
-                continue;
-            }
-            checkedGeometryFiles.append(geometryPath);
-            if (!checkEnSightGoldGeometryForVtk(geometryPath, errorMessage)) {
-                return false;
-            }
-        }
-    }
+    Q_UNUSED(cases)
+    Q_UNUSED(errorMessage)
+    // EnSight Gold binary geometry has several legal encodings (C/Fortran,
+    // endian variants, time-step wrappers, ids, structured blocks, nsided,
+    // and ghost types).  The former narrow little-endian/no-id parser could
+    // misclassify and reject those inputs.  Native parsing is already isolated
+    // in the bounded helper, so unknown legal encodings must be delegated to
+    // VTK instead of being rejected by an incomplete pre-parser.
     return true;
 }
 
 bool timeCodesEquivalent(double lhs, double rhs) {
-    return std::abs(lhs - rhs) <= 1e-12;
+    return lhs == rhs;
 }
 
 QString enSightGoldSourceName(const QVector<EnSightGoldCaseSource>& cases, int caseIndex) {
@@ -2161,6 +4059,7 @@ bool loadEnSightGoldCaseSources(const QStringList& sources,
     }
 
     cases->reserve(caseFiles.size());
+    qsizetype aggregateFrameCount = 0;
     for (const QString& casePath : caseFiles) {
         EnSightGoldCaseSource source;
         if (!parseEnSightGoldCaseSource(casePath, &source, errorMessage)
@@ -2177,9 +4076,25 @@ bool loadEnSightGoldCaseSources(const QStringList& sources,
             frames->clear();
             return false;
         }
+        if (source.timeValues.size()
+                > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount
+            || aggregateFrameCount
+                    > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount
+                        - source.timeValues.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "Selected EnSight Gold cases exceed the %1-frame conversion limit.")
+                                    .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount);
+            }
+            cases->clear();
+            frames->clear();
+            return false;
+        }
+        aggregateFrameCount += source.timeValues.size();
         cases->append(source);
     }
 
+    frames->reserve(aggregateFrameCount);
     for (int caseIndex = 0; caseIndex < cases->size(); ++caseIndex) {
         const EnSightGoldCaseSource& source = cases->at(caseIndex);
         for (const double timeValue : source.timeValues) {
@@ -2188,7 +4103,7 @@ bool loadEnSightGoldCaseSources(const QStringList& sources,
     }
 
     std::sort(frames->begin(), frames->end(), [](const EnSightGoldFrameSource& lhs, const EnSightGoldFrameSource& rhs) {
-        if (!timeCodesEquivalent(lhs.timeValue, rhs.timeValue)) {
+        if (lhs.timeValue != rhs.timeValue) {
             return lhs.timeValue < rhs.timeValue;
         }
         return lhs.caseIndex < rhs.caseIndex;
@@ -2210,7 +4125,1012 @@ bool loadEnSightGoldCaseSources(const QStringList& sources,
     return true;
 }
 
+struct EnSightGoldSnapshotFile {
+    FlowDataSourceFingerprint fingerprint;
+    QString snapshotPath;
+};
+
+bool copyAndVerifySnapshotFile(const QString& sourcePath,
+                               const QString& destinationPath,
+                               const FlowDataSourceFingerprint& expected,
+                               bool requireExpectedSourceIdentity,
+                               QString* errorMessage,
+                               const FlowDataInspector::CancellationCallback& shouldCancel,
+                               const FlowDataInspector::ProgressCallback& progress = {}) {
+    const QFileInfo before(sourcePath);
+    if (!before.exists() || !before.isFile() || before.isSymLink() || !before.isReadable()
+        || before.size() != expected.size
+        || (requireExpectedSourceIdentity
+            && !sameSourcePath(before.canonicalFilePath(), expected.path))) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight snapshot source is missing, linked, unreadable, has the wrong size, or resolves to a different path: %1")
+                                .arg(sourcePath);
+        }
+        return false;
+    }
+
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::ReadOnly)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot open EnSight snapshot source %1: %2")
+                                .arg(sourcePath, source.errorString());
+        }
+        return false;
+    }
+    QSaveFile destination(destinationPath);
+    destination.setDirectWriteFallback(false);
+    if (!destination.open(QIODevice::WriteOnly)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot create private EnSight snapshot file %1: %2")
+                                .arg(destinationPath, destination.errorString());
+        }
+        return false;
+    }
+
+    constexpr qint64 kCopyChunkBytes = 4 * 1024 * 1024;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    qint64 copiedBytes = 0;
+    while (!source.atEnd()) {
+        if (shouldCancel && shouldCancel()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source snapshot creation was canceled.");
+            }
+            destination.cancelWriting();
+            return false;
+        }
+        const QByteArray chunk = source.read(kCopyChunkBytes);
+        if (chunk.isEmpty() && source.error() != QFileDevice::NoError) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot finish reading EnSight snapshot source %1: %2")
+                                    .arg(sourcePath, source.errorString());
+            }
+            destination.cancelWriting();
+            return false;
+        }
+        if (destination.write(chunk) != chunk.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot finish writing private EnSight snapshot file %1: %2")
+                                    .arg(destinationPath, destination.errorString());
+            }
+            destination.cancelWriting();
+            return false;
+        }
+        copiedBytes += chunk.size();
+        if (copiedBytes > expected.size) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source grew while it was copied into the snapshot: %1")
+                                    .arg(sourcePath);
+            }
+            destination.cancelWriting();
+            return false;
+        }
+        hash.addData(chunk);
+        if (progress) {
+            const qint64 totalChunks = std::max<qint64>(
+                1, (expected.size + kCopyChunkBytes - 1) / kCopyChunkBytes);
+            const qint64 completedChunks = std::min(
+                totalChunks,
+                (copiedBytes + kCopyChunkBytes - 1) / kCopyChunkBytes);
+            progress(QStringLiteral("Copying immutable EnSight dependency"),
+                     static_cast<int>(std::min<qint64>(completedChunks,
+                                                      std::numeric_limits<int>::max())),
+                     static_cast<int>(std::min<qint64>(totalChunks,
+                                                      std::numeric_limits<int>::max())));
+        }
+    }
+    source.close();
+    const QFileInfo after(sourcePath);
+    const QString copiedHash = QString::fromLatin1(hash.result().toHex());
+    if (copiedBytes != expected.size || copiedHash != expected.sha256Hex
+        || !after.exists() || !after.isFile() || after.isSymLink()
+        || after.size() != before.size()
+        || after.lastModified() != before.lastModified()
+        || !sameSourcePath(after.canonicalFilePath(), before.canonicalFilePath())) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight source dependency changed after validation or did not match the validated inventory while snapshotting: %1")
+                                .arg(sourcePath);
+        }
+        destination.cancelWriting();
+        return false;
+    }
+    if (!destination.commit()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot atomically publish private EnSight snapshot file %1: %2")
+                                .arg(destinationPath, destination.errorString());
+        }
+        return false;
+    }
+    if (!makeSnapshotFileOwnerReadOnly(destinationPath, errorMessage)) {
+        return false;
+    }
+    const QFileInfo snapshotInfo(destinationPath);
+    if (!snapshotInfo.exists() || !snapshotInfo.isFile() || snapshotInfo.isSymLink()
+        || snapshotInfo.size() != expected.size) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Private EnSight snapshot file failed its post-copy check: %1")
+                                .arg(destinationPath);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool createVerifiedSnapshotHardLink(const QString& sourcePath,
+                                    const QString& destinationPath,
+                                    const FlowDataSourceFingerprint& expected,
+                                    QString* errorMessage) {
+    std::error_code error;
+    try {
+        std::filesystem::create_hard_link(fsPathFromQString(sourcePath),
+                                          fsPathFromQString(destinationPath), error);
+    } catch (const std::filesystem::filesystem_error& ex) {
+        error = ex.code();
+    }
+    if (error) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot create private EnSight snapshot hardlink %1: %2")
+                                .arg(destinationPath,
+                                     QString::fromStdString(error.message()));
+        }
+        return false;
+    }
+    bool equivalent = false;
+    try {
+        equivalent = std::filesystem::equivalent(
+            fsPathFromQString(sourcePath), fsPathFromQString(destinationPath), error);
+    } catch (const std::filesystem::filesystem_error& ex) {
+        error = ex.code();
+    }
+    const QFileInfo destination(destinationPath);
+    if (error || !equivalent || !destination.exists() || !destination.isFile()
+        || destination.isSymLink() || isFileSystemReparsePoint(destinationPath)
+        || destination.size() != expected.size) {
+        QFile::remove(destinationPath);
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "Private EnSight snapshot hardlink failed its identity or safety check: %1")
+                                .arg(destinationPath);
+        }
+        return false;
+    }
+    return makeSnapshotFileOwnerReadOnly(destinationPath, errorMessage);
+}
+
+bool snapshotFileSystemSupportsHardLinks(const QString& verifiedFolder,
+                                         const QString& casesFolder) {
+    const QString sourcePath = QDir(verifiedFolder).absoluteFilePath(
+        QStringLiteral(".hardlink-probe-source"));
+    const QString targetPath = QDir(casesFolder).absoluteFilePath(
+        QStringLiteral(".hardlink-probe-target"));
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::WriteOnly) || source.write("probe", 5) != 5) {
+        source.close();
+        QFile::remove(sourcePath);
+        return false;
+    }
+    source.close();
+    std::error_code error;
+    bool supported = false;
+    try {
+        std::filesystem::create_hard_link(fsPathFromQString(sourcePath),
+                                          fsPathFromQString(targetPath), error);
+        supported = !error
+            && std::filesystem::equivalent(fsPathFromQString(sourcePath),
+                                           fsPathFromQString(targetPath), error)
+            && !error;
+    } catch (const std::filesystem::filesystem_error&) {
+        supported = false;
+    }
+    QFile::remove(targetPath);
+    QFile::remove(sourcePath);
+    return supported;
+}
+
+bool addSnapshotRequiredBytes(qint64 value,
+                              qint64* total,
+                              QString* errorMessage) {
+    if (value < 0 || *total > std::numeric_limits<qint64>::max() - value) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight snapshot required-size calculation overflowed.");
+        }
+        return false;
+    }
+    *total += value;
+    return true;
+}
+
+QString snapshotToken(const QString& token) {
+    if (token.contains(QRegularExpression(QStringLiteral(R"([\s#,:])")))) {
+        return QStringLiteral("\"%1\"").arg(token);
+    }
+    return token;
+}
+
+QString enSightSnapshotPattern(const QString& originalPattern,
+                               int referenceIndex,
+                               int patternIndex) {
+    const QRegularExpression wildcard(QStringLiteral(R"([*%]+)"));
+    QString suffix = QFileInfo(originalPattern).suffix().toLower();
+    if (!QRegularExpression(QStringLiteral(R"(^[a-z0-9]{1,16}$)"))
+             .match(suffix)
+             .hasMatch()) {
+        suffix = QStringLiteral("bin");
+    }
+    QString name = QStringLiteral("dependency_%1_%2")
+                       .arg(referenceIndex, 5, 10, QLatin1Char('0'))
+                       .arg(patternIndex, 2, 10, QLatin1Char('0'));
+    QRegularExpressionMatchIterator matches = wildcard.globalMatch(originalPattern);
+    while (matches.hasNext()) {
+        name += QStringLiteral("_") + matches.next().captured();
+    }
+    return name + QLatin1Char('.') + suffix;
+}
+
+QString remapExpandedSnapshotPattern(const QString& originalPattern,
+                                     const QString& mappedPattern,
+                                     const QString& expandedPattern,
+                                     bool* ok) {
+    QString expression = QStringLiteral("^");
+    qsizetype cursor = 0;
+    QRegularExpressionMatchIterator groups =
+        QRegularExpression(QStringLiteral(R"([*%]+)"))
+            .globalMatch(originalPattern);
+    int groupCount = 0;
+    while (groups.hasNext()) {
+        const QRegularExpressionMatch group = groups.next();
+        expression += QRegularExpression::escape(
+            originalPattern.mid(cursor, group.capturedStart() - cursor));
+        expression += QStringLiteral("(-?\\d+)");
+        cursor = group.capturedEnd();
+        ++groupCount;
+    }
+    expression += QRegularExpression::escape(originalPattern.mid(cursor));
+    expression += QLatin1Char('$');
+    const QRegularExpressionMatch expansion =
+        QRegularExpression(expression).match(expandedPattern);
+    if (!expansion.hasMatch()) {
+        if (ok != nullptr) {
+            *ok = false;
+        }
+        return {};
+    }
+    QString result = mappedPattern;
+    qsizetype searchOffset = 0;
+    for (int groupIndex = 1; groupIndex <= groupCount; ++groupIndex) {
+        const QRegularExpressionMatch mappedGroup =
+            QRegularExpression(QStringLiteral(R"([*%]+)"))
+                .match(result, searchOffset);
+        if (!mappedGroup.hasMatch()) {
+            if (ok != nullptr) {
+                *ok = false;
+            }
+            return {};
+        }
+        const QString number = expansion.captured(groupIndex);
+        result.replace(mappedGroup.capturedStart(), mappedGroup.capturedLength(), number);
+        searchOffset = mappedGroup.capturedStart() + number.size();
+    }
+    if (ok != nullptr) {
+        *ok = true;
+    }
+    return result;
+}
+
+void appendWrappedSnapshotValues(const QString& label,
+                                 const QStringList& values,
+                                 QStringList* lines) {
+    if (lines == nullptr) {
+        return;
+    }
+    lines->append(label + QLatin1Char(':'));
+    constexpr qsizetype kMaximumVtkCaseLineBytes = 254;
+    QString currentLine;
+    for (const QString& value : values) {
+        const QString candidate = currentLine.isEmpty()
+            ? value
+            : currentLine + QLatin1Char(' ') + value;
+        if (!currentLine.isEmpty()
+            && candidate.toUtf8().size() > kMaximumVtkCaseLineBytes) {
+            lines->append(currentLine);
+            currentLine = value;
+        } else {
+            currentLine = candidate;
+        }
+        if (currentLine.toUtf8().size() > kMaximumVtkCaseLineBytes) {
+            // Machine-formatted qint64/double values are far below this, but
+            // keep the serializer total if a future token type is added.
+            lines->append(currentLine);
+            currentLine.clear();
+        }
+    }
+    if (!currentLine.isEmpty()) {
+        lines->append(currentLine);
+    }
+}
+
+bool materializeEnSightGoldSnapshotCase(
+    const EnSightGoldCaseSource& source,
+    int caseIndex,
+    const QString& caseFolder,
+    const QHash<QString, EnSightGoldSnapshotFile>& verifiedFiles,
+    bool useHardLinks,
+    QString* snapshotCasePath,
+    QString* errorMessage,
+    const FlowDataInspector::ProgressCallback& progress,
+    const FlowDataInspector::CancellationCallback& shouldCancel) {
+    if (snapshotCasePath == nullptr) {
+        return false;
+    }
+    QVector<QStringList> snapshotPatterns;
+    snapshotPatterns.reserve(source.references.size());
+    QHash<QString, QString> materializedTargetSources;
+    int copiedDependencyCount = 0;
+    const int totalDependencyCount = std::accumulate(
+        source.references.cbegin(), source.references.cend(), 0,
+        [](int sum, const EnSightGoldReference& reference) {
+            return sum + std::accumulate(
+                             reference.resolvedPatternPaths.cbegin(),
+                             reference.resolvedPatternPaths.cend(), 0,
+                             [](int patternSum, const QStringList& paths) {
+                                 return patternSum + paths.size();
+                             });
+        });
+
+    for (int referenceIndex = 0; referenceIndex < source.references.size(); ++referenceIndex) {
+        const EnSightGoldReference& reference = source.references.at(referenceIndex);
+        QStringList mappedPatterns;
+        mappedPatterns.reserve(reference.patterns.size());
+        for (int patternIndex = 0; patternIndex < reference.patterns.size(); ++patternIndex) {
+            const QString& originalPattern = reference.patterns.at(patternIndex);
+            const QString mappedPattern = enSightSnapshotPattern(
+                originalPattern, referenceIndex, patternIndex);
+            mappedPatterns.append(mappedPattern);
+            const QStringList& originalPaths = reference.resolvedPatternPaths.at(patternIndex);
+            const QStringList& expandedNames =
+                reference.expandedPatternNames.at(patternIndex);
+            if (expandedNames.size() != originalPaths.size()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = QStringLiteral(
+                                        "Internal error: EnSight snapshot wildcard expansion count is inconsistent on source line %1.")
+                                        .arg(reference.declarationLine);
+                }
+                return false;
+            }
+            for (qsizetype pathIndex = 0; pathIndex < originalPaths.size(); ++pathIndex) {
+                if (shouldCancel && shouldCancel()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral("EnSight source snapshot creation was canceled.");
+                    }
+                    return false;
+                }
+                const QString& originalPath = originalPaths.at(pathIndex);
+                const QString identity = sourcePathIdentityKey(originalPath);
+                const auto verified = verifiedFiles.constFind(identity);
+                if (verified == verifiedFiles.cend()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                                            "Validated EnSight inventory does not contain parsed dependency: %1")
+                                            .arg(originalPath);
+                    }
+                    return false;
+                }
+                bool mappedOk = false;
+                const QString targetName = remapExpandedSnapshotPattern(
+                    originalPattern, mappedPattern, expandedNames.at(pathIndex), &mappedOk);
+                if (!mappedOk) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                            "Internal error: cannot map expanded EnSight snapshot dependency on source line %1.")
+                                            .arg(reference.declarationLine);
+                    }
+                    return false;
+                }
+                const QString targetPath = normalizedPath(
+                    QDir(caseFolder).absoluteFilePath(targetName));
+                const QString targetIdentity = sourcePathIdentityKey(targetPath);
+                const auto existingTarget = materializedTargetSources.constFind(
+                    targetIdentity);
+                if (existingTarget != materializedTargetSources.cend()) {
+                    if (existingTarget.value() != identity) {
+                        if (errorMessage != nullptr) {
+                            *errorMessage = QStringLiteral(
+                                "EnSight snapshot maps different dependencies to the same normalized target: %1")
+                                                .arg(targetPath);
+                        }
+                        return false;
+                    }
+                    ++copiedDependencyCount;
+                    if (progress) {
+                        progress(QStringLiteral("Reusing immutable EnSight snapshot mapping"),
+                                 copiedDependencyCount,
+                                 std::max(1, totalDependencyCount));
+                    }
+                    continue;
+                }
+                bool materialized = false;
+                if (useHardLinks) {
+                    QString hardLinkError;
+                    materialized = createVerifiedSnapshotHardLink(
+                        verified->snapshotPath, targetPath, verified->fingerprint,
+                        &hardLinkError);
+                    if (!materialized) {
+                        constexpr qint64 kFallbackReserve = 16LL * 1024LL * 1024LL;
+                        QStorageInfo storage(QFileInfo(targetPath).absolutePath());
+                        storage.refresh();
+                        if (!storage.isValid() || !storage.isReady()
+                            || verified->fingerprint.size
+                                > storage.bytesAvailable() - std::min(
+                                      storage.bytesAvailable(), kFallbackReserve)) {
+                            if (errorMessage != nullptr) {
+                                *errorMessage = QStringLiteral(
+                                    "EnSight snapshot hardlink failed (%1), and there is insufficient space for the controlled copy fallback of %2 bytes.")
+                                                    .arg(hardLinkError)
+                                                    .arg(verified->fingerprint.size);
+                            }
+                            return false;
+                        }
+                        materialized = copyAndVerifySnapshotFile(
+                            verified->snapshotPath, targetPath,
+                            verified->fingerprint, false, errorMessage,
+                            shouldCancel, progress);
+                    }
+                } else {
+                    materialized = copyAndVerifySnapshotFile(
+                        verified->snapshotPath, targetPath,
+                        verified->fingerprint, false, errorMessage,
+                        shouldCancel, progress);
+                }
+                if (!materialized) {
+                    return false;
+                }
+                materializedTargetSources.insert(targetIdentity, identity);
+                ++copiedDependencyCount;
+                if (progress) {
+                    progress(QStringLiteral("Materializing immutable EnSight snapshot"),
+                             copiedDependencyCount,
+                             std::max(1, totalDependencyCount));
+                }
+            }
+        }
+        snapshotPatterns.append(mappedPatterns);
+    }
+
+    QStringList geometryLines;
+    QStringList variableLines;
+    for (int constantIndex = 0;
+         constantIndex < source.constantsPerCase.size();
+         ++constantIndex) {
+        if (shouldCancel && shouldCancel()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                    "EnSight source snapshot creation was canceled while materializing constants.");
+            }
+            return false;
+        }
+        const EnSightGoldConstantPerCase& constant =
+            source.constantsPerCase.at(constantIndex);
+        if (constant.timeSetId == 0) {
+            variableLines.append(QStringLiteral("constant per case: %1 %2")
+                                     .arg(constant.variableName,
+                                          formatMachineDouble(
+                                              constant.values.constFirst())));
+            if (progress) {
+                progress(QStringLiteral("Materializing EnSight constants"),
+                         constantIndex + 1,
+                         source.constantsPerCase.size());
+            }
+            continue;
+        }
+        const QString valueFileName = QStringLiteral("constant_%1.values")
+                                          .arg(constantIndex, 5, 10,
+                                               QLatin1Char('0'));
+        const QString valueFilePath = normalizedPath(
+            QDir(caseFolder).absoluteFilePath(valueFileName));
+        QByteArray valuePayload;
+        for (const double value : constant.values) {
+            valuePayload += formatMachineDouble(value).toUtf8();
+            valuePayload += '\n';
+        }
+        QSaveFile valueFile(valueFilePath);
+        valueFile.setDirectWriteFallback(false);
+        if (!valueFile.open(QIODevice::WriteOnly)
+            || valueFile.write(valuePayload) != valuePayload.size()
+            || !valueFile.commit()
+            || !makeSnapshotFileOwnerReadOnly(valueFilePath, errorMessage)) {
+            if (errorMessage != nullptr && errorMessage->isEmpty()) {
+                *errorMessage = QStringLiteral(
+                    "Cannot write transient EnSight constant-per-case snapshot file.");
+            }
+            return false;
+        }
+        variableLines.append(
+            QStringLiteral("constant per case file: %1 %2 %3")
+                .arg(constant.timeSetId)
+                .arg(constant.variableName, snapshotToken(valueFileName)));
+        if (progress) {
+            progress(QStringLiteral("Materializing EnSight transient constants"),
+                     constantIndex + 1,
+                     source.constantsPerCase.size());
+        }
+    }
+    QStringList scriptLines;
+    for (int referenceIndex = 0; referenceIndex < source.references.size(); ++referenceIndex) {
+        const EnSightGoldReference& reference = source.references.at(referenceIndex);
+        QStringList payload;
+        if (reference.timeSetId > 0) {
+            payload.append(QString::number(reference.timeSetId));
+        }
+        if (reference.fileSetId > 0) {
+            payload.append(QString::number(reference.fileSetId));
+        }
+        const QStringList& mappedPatterns = snapshotPatterns.at(referenceIndex);
+        if (reference.role == EnSightGoldReference::Role::ModelGeometry
+            || reference.role == EnSightGoldReference::Role::MeasuredGeometry) {
+            payload += mappedPatterns;
+            geometryLines.append(reference.declaration + QStringLiteral(": ")
+                                 + payload.join(QLatin1Char(' ')));
+        } else if (reference.role == EnSightGoldReference::Role::Auxiliary) {
+            payload += mappedPatterns;
+            const QString line = reference.declaration + QStringLiteral(": ")
+                + payload.join(QLatin1Char(' '));
+            if (reference.declaration == QStringLiteral("metadata")) {
+                scriptLines.append(line);
+            } else {
+                geometryLines.append(line);
+            }
+        } else {
+            payload.append(snapshotToken(reference.variableName));
+            payload += mappedPatterns;
+            if (reference.hasFrequency) {
+                payload.append(formatMachineDouble(reference.frequency));
+            } else if (reference.frequencyUndefined) {
+                payload.append(QStringLiteral("UNDEFINED"));
+            }
+            variableLines.append(reference.declaration + QStringLiteral(": ")
+                                 + payload.join(QLatin1Char(' ')));
+        }
+    }
+
+    QStringList outputLines = {
+        QStringLiteral("FORMAT"),
+        QStringLiteral("type: ensight gold"),
+        QString(),
+        QStringLiteral("GEOMETRY"),
+    };
+    outputLines += geometryLines;
+    outputLines.append(QString());
+    outputLines.append(QStringLiteral("VARIABLE"));
+    outputLines += variableLines;
+
+    if (!source.timeSets.isEmpty()) {
+        outputLines.append(QString());
+        outputLines.append(QStringLiteral("TIME"));
+        if (source.hasMaximumTimeSteps) {
+            outputLines.append(QStringLiteral("maximum time steps: %1")
+                                   .arg(source.maximumTimeSteps));
+        }
+        QList<int> ids = source.timeSets.keys();
+        std::sort(ids.begin(), ids.end());
+        for (const int id : std::as_const(ids)) {
+            const EnSightGoldTimeSet& timeSet = source.timeSets[id];
+            outputLines.append(QStringLiteral("time set: %1").arg(id));
+            outputLines.append(QStringLiteral("number of steps: %1")
+                                   .arg(timeSet.declaredSteps));
+            QStringList filenameNumbers;
+            filenameNumbers.reserve(timeSet.filenameNumbers.size());
+            for (const qint64 number : timeSet.filenameNumbers) {
+                filenameNumbers.append(QString::number(number));
+            }
+            if (!filenameNumbers.isEmpty()) {
+                appendWrappedSnapshotValues(QStringLiteral("filename numbers"),
+                                            filenameNumbers, &outputLines);
+            }
+            QStringList timeValues;
+            timeValues.reserve(timeSet.timeValues.size());
+            for (const double value : timeSet.timeValues) {
+                timeValues.append(formatMachineDouble(value));
+            }
+            appendWrappedSnapshotValues(QStringLiteral("time values"),
+                                        timeValues, &outputLines);
+        }
+    }
+    if (!source.fileSets.isEmpty()) {
+        outputLines.append(QString());
+        outputLines.append(QStringLiteral("FILE"));
+        QList<int> ids = source.fileSets.keys();
+        std::sort(ids.begin(), ids.end());
+        for (const int id : std::as_const(ids)) {
+            const EnSightGoldFileSet& fileSet = source.fileSets[id];
+            outputLines.append(QStringLiteral("file set: %1").arg(id));
+            for (const EnSightGoldFileChunk& chunk : fileSet.chunks) {
+                if (chunk.hasFilenameIndex) {
+                    outputLines.append(QStringLiteral("filename index: %1")
+                                           .arg(chunk.filenameIndex));
+                }
+                outputLines.append(QStringLiteral("number of steps: %1")
+                                       .arg(chunk.stepCount));
+            }
+        }
+    }
+    if (!scriptLines.isEmpty()) {
+        outputLines.append(QString());
+        outputLines.append(QStringLiteral("SCRIPTS"));
+        outputLines += scriptLines;
+    }
+    if (source.hasBlockContinuationCount) {
+        outputLines.append(QString());
+        outputLines.append(QStringLiteral("BLOCK_CONTINUATION"));
+        outputLines.append(QStringLiteral("number of sets: %1")
+                               .arg(source.blockContinuationCount));
+        outputLines.append(QStringLiteral("filename start number: %1")
+                               .arg(source.blockContinuationStart));
+        outputLines.append(QStringLiteral("filename increment: %1")
+                               .arg(source.blockContinuationIncrement));
+    }
+
+    for (const QString& line : std::as_const(outputLines)) {
+        if (line.toUtf8().size() > 254) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                                    "Normalized EnSight snapshot case would exceed the bundled VTK reader's 254-byte safe line limit.");
+            }
+            return false;
+        }
+    }
+    const QByteArray payload = outputLines.join(QLatin1Char('\n')).toUtf8()
+        + QByteArrayLiteral("\n");
+    if (payload.size() > Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Normalized EnSight snapshot case exceeds the bounded metadata size.");
+        }
+        return false;
+    }
+    const QString casePath = normalizedPath(
+        QDir(caseFolder).absoluteFilePath(
+            QStringLiteral("snapshot_%1.case").arg(caseIndex, 5, 10, QLatin1Char('0'))));
+    QSaveFile caseFile(casePath);
+    caseFile.setDirectWriteFallback(false);
+    if (!caseFile.open(QIODevice::WriteOnly)
+        || caseFile.write(payload) != payload.size()
+        || !caseFile.commit()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot write normalized private EnSight snapshot case: %1")
+                                .arg(casePath);
+        }
+        return false;
+    }
+    if (!makeSnapshotFileOwnerReadOnly(casePath, errorMessage)) {
+        return false;
+    }
+    *snapshotCasePath = casePath;
+    return true;
+}
+
 }  // namespace
+
+bool FlowDataInspector::buildEnSightGoldSourceInventory(
+    const QStringList& casePaths,
+    QVector<FlowDataSourceFingerprint>* inventory,
+    QString* errorMessage,
+    const ProgressCallback& progress,
+    const CancellationCallback& shouldCancel) {
+    QVector<EnSightGoldCaseSource> cases;
+    QVector<EnSightGoldFrameSource> frames;
+    if (!loadEnSightGoldCaseSources(casePaths, &cases, &frames, errorMessage)) {
+        return false;
+    }
+    return buildEnSightGoldInventoryFromCases(
+        cases, inventory, errorMessage, progress, shouldCancel);
+}
+
+bool FlowDataInspector::materializeEnSightGoldSourceSnapshot(
+    const QStringList& casePaths,
+    const QVector<FlowDataSourceFingerprint>& expectedInventory,
+    const QString& snapshotRoot,
+    QStringList* snapshotCasePaths,
+    QString* errorMessage,
+    const ProgressCallback& progress,
+    const CancellationCallback& shouldCancel) {
+    if (snapshotCasePaths == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Internal error: EnSight snapshot case output is null.");
+        }
+        return false;
+    }
+    snapshotCasePaths->clear();
+    const QFileInfo rootInfo(snapshotRoot);
+    if (snapshotRoot.trimmed().isEmpty() || !QDir::isAbsolutePath(snapshotRoot)
+        || !rootInfo.exists() || !rootInfo.isDir() || rootInfo.isSymLink()
+        || directoryChainContainsReparsePoint(snapshotRoot)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "EnSight snapshot root must be an existing absolute regular, non-link directory.");
+        }
+        return false;
+    }
+    QDir root(snapshotRoot);
+    if (!root.entryList(QDir::AllEntries | QDir::NoDotAndDotDot
+                        | QDir::Hidden | QDir::System)
+             .isEmpty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("EnSight snapshot root must be private and empty before materialization.");
+        }
+        return false;
+    }
+    if (expectedInventory.isEmpty()
+        || expectedInventory.size()
+            > Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Validated EnSight source inventory is empty or exceeds its entry limit.");
+        }
+        return false;
+    }
+#ifdef Q_OS_UNIX
+    if (!QFile::setPermissions(snapshotRoot,
+                               QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                   | QFileDevice::ExeOwner)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot restrict EnSight snapshot root permissions to its owner.");
+        }
+        return false;
+    }
+#endif
+
+    const QString verifiedFolder = normalizedPath(
+        root.absoluteFilePath(QStringLiteral("verified")));
+    const QString casesFolder = normalizedPath(
+        root.absoluteFilePath(QStringLiteral("cases")));
+    if (!QDir().mkpath(verifiedFolder) || !QDir().mkpath(casesFolder)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot create private EnSight snapshot subdirectories.");
+        }
+        return false;
+    }
+    if (directoryChainContainsReparsePoint(verifiedFolder)
+        || directoryChainContainsReparsePoint(casesFolder)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "EnSight snapshot subdirectories must not resolve through links or reparse points.");
+        }
+        return false;
+    }
+#ifdef Q_OS_UNIX
+    const auto ownerDirectoryPermissions = QFileDevice::ReadOwner
+        | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+    if (!QFile::setPermissions(verifiedFolder, ownerDirectoryPermissions)
+        || !QFile::setPermissions(casesFolder, ownerDirectoryPermissions)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot restrict EnSight snapshot subdirectory permissions.");
+        }
+        return false;
+    }
+#endif
+
+    const bool useHardLinks = snapshotFileSystemSupportsHardLinks(
+        verifiedFolder, casesFolder);
+    constexpr qint64 kSnapshotFreeSpaceReserve = 16LL * 1024LL * 1024LL;
+    qint64 initialRequiredBytes = kSnapshotFreeSpaceReserve;
+    for (const FlowDataSourceFingerprint& fingerprint : expectedInventory) {
+        if (!addSnapshotRequiredBytes(fingerprint.size,
+                                      &initialRequiredBytes, errorMessage)) {
+            return false;
+        }
+    }
+    QStorageInfo snapshotStorage(snapshotRoot);
+    snapshotStorage.refresh();
+    if (!snapshotStorage.isValid() || !snapshotStorage.isReady()
+        || snapshotStorage.bytesAvailable() < initialRequiredBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "Insufficient free space for the verified EnSight snapshot: %1 bytes are required, %2 bytes are available.")
+                                .arg(initialRequiredBytes)
+                                .arg(snapshotStorage.bytesAvailable());
+        }
+        return false;
+    }
+
+    QHash<QString, EnSightGoldSnapshotFile> verifiedFiles;
+    verifiedFiles.reserve(expectedInventory.size());
+    for (qsizetype index = 0; index < expectedInventory.size(); ++index) {
+        if (shouldCancel && shouldCancel()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("EnSight source snapshot creation was canceled.");
+            }
+            return false;
+        }
+        const FlowDataSourceFingerprint& fingerprint = expectedInventory.at(index);
+        const QString identity = sourcePathIdentityKey(fingerprint.path);
+        if (fingerprint.path.isEmpty() || !QDir::isAbsolutePath(fingerprint.path)
+            || fingerprint.size < 0 || fingerprint.sha256Hex.size() != 64
+            || verifiedFiles.contains(identity)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Validated EnSight inventory contains an invalid or duplicate fingerprint.");
+            }
+            return false;
+        }
+        const QString suffix = QFileInfo(fingerprint.path).suffix()
+                                   .compare(QStringLiteral("case"), Qt::CaseInsensitive) == 0
+            ? QStringLiteral("case")
+            : QStringLiteral("src");
+        const QString copyPath = normalizedPath(
+            QDir(verifiedFolder).absoluteFilePath(
+                QStringLiteral("source_%1.%2")
+                    .arg(index, 5, 10, QLatin1Char('0'))
+                    .arg(suffix)));
+        if (!copyAndVerifySnapshotFile(fingerprint.path,
+                                       copyPath,
+                                       fingerprint,
+                                       true,
+                                       errorMessage,
+                                       shouldCancel,
+                                       progress)) {
+            return false;
+        }
+        verifiedFiles.insert(identity, EnSightGoldSnapshotFile{fingerprint, copyPath});
+        if (progress) {
+            progress(QStringLiteral("Verifying EnSight source snapshot"),
+                     static_cast<int>(index + 1),
+                     static_cast<int>(expectedInventory.size()));
+        }
+    }
+
+    QString collectError;
+    const QStringList actualCasePaths = collectEnSightGoldCaseFiles(casePaths, &collectError);
+    if (actualCasePaths.isEmpty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = collectError;
+        }
+        return false;
+    }
+    QVector<EnSightGoldCaseSource> parsedCases;
+    parsedCases.reserve(actualCasePaths.size());
+    QSet<QString> parsedInventoryIdentities;
+    qsizetype aggregateReferenceCount = 0;
+    for (const QString& requestedCasePath : actualCasePaths) {
+        const QString logicalCasePath = sourcePathIdentity(requestedCasePath);
+        const QString identity = sourcePathIdentityKey(logicalCasePath);
+        const auto copiedCase = verifiedFiles.constFind(identity);
+        if (copiedCase == verifiedFiles.cend()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Validated EnSight inventory does not contain selected case: %1")
+                                    .arg(requestedCasePath);
+            }
+            return false;
+        }
+        EnSightGoldCaseSource parsed;
+        if (!parseEnSightGoldCaseSource(copiedCase->snapshotPath,
+                                        &parsed,
+                                        errorMessage,
+                                        logicalCasePath)) {
+            return false;
+        }
+        parsedInventoryIdentities.insert(sourcePathIdentityKey(parsed.path));
+        for (const QString& dependency : parsed.referencedPaths) {
+            parsedInventoryIdentities.insert(sourcePathIdentityKey(dependency));
+        }
+        for (const EnSightGoldReference& reference : parsed.references) {
+            for (const QStringList& paths : reference.resolvedPatternPaths) {
+                if (aggregateReferenceCount
+                    > Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount
+                        - paths.size()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = QStringLiteral(
+                                            "EnSight snapshot expansion exceeds the bounded dependency-reference count.");
+                    }
+                    return false;
+                }
+                aggregateReferenceCount += paths.size();
+            }
+        }
+        if (aggregateReferenceCount
+            > Streamcenter::FlowDataProtocolLimits::MaximumInventoryEntryCount
+                - parsed.constantsPerCase.size()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                    "EnSight snapshot exceeds the unified dependency/generated-file entry budget.");
+            }
+            return false;
+        }
+        aggregateReferenceCount += parsed.constantsPerCase.size();
+        parsedCases.append(std::move(parsed));
+    }
+    QSet<QString> expectedIdentities;
+    for (const FlowDataSourceFingerprint& fingerprint : expectedInventory) {
+        expectedIdentities.insert(sourcePathIdentityKey(fingerprint.path));
+    }
+    if (parsedInventoryIdentities != expectedIdentities) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "Validated EnSight inventory does not exactly match dependencies parsed from the immutable case snapshot.");
+        }
+        return false;
+    }
+
+    qint64 remainingRequiredBytes = kSnapshotFreeSpaceReserve;
+    if (!addSnapshotRequiredBytes(
+            static_cast<qint64>(parsedCases.size())
+                * Streamcenter::FlowDataProtocolLimits::MaximumCaseMetadataBytes,
+            &remainingRequiredBytes, errorMessage)) {
+        return false;
+    }
+    if (!useHardLinks) {
+        for (const EnSightGoldCaseSource& parsed : std::as_const(parsedCases)) {
+            for (const EnSightGoldReference& reference : parsed.references) {
+                for (const QStringList& paths : reference.resolvedPatternPaths) {
+                    for (const QString& path : paths) {
+                        const auto verified = verifiedFiles.constFind(
+                            sourcePathIdentityKey(path));
+                        if (verified == verifiedFiles.cend()) {
+                            if (errorMessage != nullptr) {
+                                *errorMessage = QStringLiteral(
+                                    "Validated EnSight inventory is missing a dependency during space preflight: %1")
+                                                    .arg(path);
+                            }
+                            return false;
+                        }
+                        if (!addSnapshotRequiredBytes(verified->fingerprint.size,
+                                                      &remainingRequiredBytes,
+                                                      errorMessage)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    snapshotStorage.refresh();
+    if (snapshotStorage.bytesAvailable() < remainingRequiredBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                                "Insufficient free space to materialize EnSight snapshot mappings: %1 bytes are required, %2 bytes are available.")
+                                .arg(remainingRequiredBytes)
+                                .arg(snapshotStorage.bytesAvailable());
+        }
+        return false;
+    }
+
+    snapshotCasePaths->reserve(parsedCases.size());
+    for (int caseIndex = 0; caseIndex < parsedCases.size(); ++caseIndex) {
+        const QString caseFolder = normalizedPath(
+            QDir(casesFolder).absoluteFilePath(
+                QStringLiteral("case_%1").arg(caseIndex, 5, 10, QLatin1Char('0'))));
+        if (!QDir().mkpath(caseFolder)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot create private EnSight snapshot case directory.");
+            }
+            snapshotCasePaths->clear();
+            return false;
+        }
+#ifdef Q_OS_UNIX
+        if (!QFile::setPermissions(caseFolder,
+                                   QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                       | QFileDevice::ExeOwner)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot restrict EnSight snapshot case directory permissions.");
+            }
+            snapshotCasePaths->clear();
+            return false;
+        }
+#endif
+        QString snapshotCase;
+        if (!materializeEnSightGoldSnapshotCase(parsedCases.at(caseIndex),
+                                                caseIndex,
+                                                 caseFolder,
+                                                 verifiedFiles,
+                                                 useHardLinks,
+                                                 &snapshotCase,
+                                                errorMessage,
+                                                progress,
+                                                shouldCancel)) {
+            snapshotCasePaths->clear();
+            return false;
+        }
+        snapshotCasePaths->append(snapshotCase);
+    }
+    return !snapshotCasePaths->isEmpty();
+}
 
 FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                                                  FlowDataKind dataKind,
@@ -2309,9 +5229,8 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
     result.entry.xRange = formatRange(bounds[0], bounds[1]);
     result.entry.yRange = formatRange(bounds[2], bounds[3]);
     result.entry.zRange = formatRange(bounds[4], bounds[5]);
-    const bool reducedZ = (dims[2] > 0 && dims[2] <= 1) || std::abs(bounds[5] - bounds[4]) <= 1e-12;
-    result.entry.dimension = reducedZ ? QStringLiteral("2") : QStringLiteral("3");
-    const int dimension = result.entry.dimension == QStringLiteral("2") ? 2 : 3;
+    const int dimension = first.spatialDimension;
+    result.entry.dimension = QString::number(dimension);
 
     if (dataKind == FlowDataKind::Resampled) {
         result.entry.meshCount = QStringLiteral("%1 %2 %3")
@@ -2365,6 +5284,639 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
         }
     }
 
+    result.entry.checkStatus = QStringLiteral("passed");
+    result.passed = true;
+    return result;
+}
+
+bool fingerprintStableRegularFile(
+    const QString& filePath,
+    const QFileInfo& expectedInfo,
+    FlowDataSourceFingerprint* fingerprint,
+    QString* errorMessage,
+    const FlowDataInspector::ProgressCallback& progress,
+    const FlowDataInspector::CancellationCallback& shouldCancel) {
+    if (fingerprint == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Internal fingerprint output is null.");
+        }
+        return false;
+    }
+    const QFileInfo before(filePath);
+    if (!before.exists() || !before.isFile() || before.isSymLink()
+        || isFileSystemReparsePoint(before.absoluteFilePath())
+        || before.size() != expectedInfo.size()
+        || !sameSourcePath(before.canonicalFilePath(),
+                           expectedInfo.canonicalFilePath())) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "Converted staging file changed before fingerprinting: %1")
+                                .arg(filePath);
+        }
+        return false;
+    }
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Cannot fingerprint converted staging file %1: %2")
+                                .arg(filePath, file.errorString());
+        }
+        return false;
+    }
+    constexpr qint64 kHashChunkBytes = 4 * 1024 * 1024;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    qint64 hashedBytes = 0;
+    while (!file.atEnd()) {
+        if (shouldCancel && shouldCancel()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Converted PVD staging validation interrupted.");
+            }
+            return false;
+        }
+        const QByteArray chunk = file.read(kHashChunkBytes);
+        if (chunk.isEmpty() && file.error() != QFileDevice::NoError) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral("Cannot finish fingerprinting %1: %2")
+                                    .arg(filePath, file.errorString());
+            }
+            return false;
+        }
+        hash.addData(chunk);
+        hashedBytes += chunk.size();
+        if (progress) {
+            constexpr int kProgressUnits = 1000;
+            const int completed = before.size() <= 0
+                ? kProgressUnits
+                : std::clamp(static_cast<int>(
+                                 (static_cast<long double>(hashedBytes)
+                                  / static_cast<long double>(before.size()))
+                                 * kProgressUnits),
+                             0, kProgressUnits);
+            progress(QStringLiteral("Fingerprinting converted PVD staging"),
+                     completed, kProgressUnits);
+        }
+    }
+    file.close();
+    const QFileInfo after(filePath);
+    if (!after.exists() || !after.isFile() || after.isSymLink()
+        || isFileSystemReparsePoint(after.absoluteFilePath())
+        || after.size() != before.size()
+        || after.lastModified() != before.lastModified()
+        || !sameSourcePath(after.canonicalFilePath(), before.canonicalFilePath())) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "Converted staging file changed while fingerprinting: %1")
+                                .arg(filePath);
+        }
+        return false;
+    }
+    fingerprint->path = sourcePathIdentity(filePath);
+    fingerprint->size = before.size();
+    fingerprint->sha256Hex = QString::fromLatin1(hash.result().toHex());
+    return true;
+}
+
+FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
+    const QString& folder,
+    FlowDataKind dataKind,
+    bool coordinateCheck,
+    const ProgressCallback& progress,
+    const CancellationCallback& shouldCancel) {
+    FlowDataScanResult result;
+    result.entry.dataKind = dataKind;
+    result.entry.source = FlowDataSource::Link;
+    result.entry.dataVersion = QDate::currentDate().toString(Qt::ISODate);
+    result.entry.fileType = QStringLiteral("vtk series");
+
+    auto reject = [&](const QString& message) {
+        result.passed = false;
+        result.errorMessage = message;
+        return result;
+    };
+    auto canceled = [&]() {
+        return shouldCancel && shouldCancel();
+    };
+
+    const QFileInfo folderInfo(folder);
+    if (!folderInfo.exists() || !folderInfo.isDir() || folderInfo.isSymLink()
+        || isFileSystemReparsePoint(folderInfo.absoluteFilePath())) {
+        return reject(QStringLiteral(
+            "Converted staging must be an existing regular, non-link directory."));
+    }
+    const QString stagingFolder = sourcePathIdentity(folderInfo.absoluteFilePath());
+    result.sourceFolder = stagingFolder;
+    result.entry.dataName = QFileInfo(stagingFolder).fileName();
+    if (canceled()) {
+        return reject(QStringLiteral("Converted PVD staging validation interrupted."));
+    }
+
+    QString pvdPath;
+    int pvdCount = 0;
+    QDirIterator pvdIterator(
+        stagingFolder,
+        {QStringLiteral("*.pvd")},
+        QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Readable
+            | QDir::Hidden | QDir::System,
+        QDirIterator::NoIteratorFlags);
+    while (pvdIterator.hasNext()) {
+        if (canceled()) {
+            return reject(QStringLiteral("Converted PVD staging validation interrupted."));
+        }
+        pvdIterator.next();
+        ++pvdCount;
+        if (pvdCount > 1) {
+            return reject(QStringLiteral(
+                "Converted staging must contain exactly one PVD collection; found more than one."));
+        }
+        pvdPath = normalizedPath(pvdIterator.fileInfo().absoluteFilePath());
+    }
+    if (pvdCount != 1) {
+        return reject(QStringLiteral(
+            "Converted staging must contain exactly one PVD collection; found none."));
+    }
+
+    const QFileInfo pvdBefore(pvdPath);
+    if (!pvdBefore.exists() || !pvdBefore.isFile() || pvdBefore.isSymLink()
+        || isFileSystemReparsePoint(pvdBefore.absoluteFilePath())
+        || !pvdBefore.isReadable()
+        || !sameSourcePath(pvdBefore.absolutePath(), stagingFolder)
+        || pvdBefore.size() <= 0
+        || pvdBefore.size()
+            > Streamcenter::FlowDataProtocolLimits::MaximumCollectionMetadataBytes) {
+        return reject(QStringLiteral(
+            "Converted PVD collection is missing, linked, unreadable, escaped, empty, or exceeds the bounded metadata size."));
+    }
+    QFile pvdFile(pvdPath);
+    if (!pvdFile.open(QIODevice::ReadOnly)) {
+        return reject(QStringLiteral("Cannot read converted PVD collection: %1")
+                          .arg(pvdFile.errorString()));
+    }
+    const QByteArray pvdPayload = pvdFile.read(
+        Streamcenter::FlowDataProtocolLimits::MaximumCollectionMetadataBytes + 1);
+    if (pvdPayload.size()
+            > Streamcenter::FlowDataProtocolLimits::MaximumCollectionMetadataBytes
+        || !pvdFile.atEnd()) {
+        return reject(QStringLiteral(
+            "Converted PVD collection exceeds the bounded metadata size."));
+    }
+    pvdFile.close();
+    const QFileInfo pvdAfterRead(pvdPath);
+    if (!pvdAfterRead.exists() || !pvdAfterRead.isFile() || pvdAfterRead.isSymLink()
+        || isFileSystemReparsePoint(pvdAfterRead.absoluteFilePath())
+        || pvdAfterRead.size() != pvdBefore.size()
+        || pvdAfterRead.lastModified() != pvdBefore.lastModified()
+        || !sameSourcePath(pvdAfterRead.canonicalFilePath(),
+                           pvdBefore.canonicalFilePath())) {
+        return reject(QStringLiteral(
+            "Converted PVD collection changed while it was being read."));
+    }
+
+    QVector<double> timeValues;
+    QStringList referencedFiles;
+    QSet<QString> referencedIdentities;
+    QStringList elementStack;
+    bool rootSeen = false;
+    bool rootClosed = false;
+    bool collectionSeen = false;
+    QXmlStreamReader xml(pvdPayload);
+    while (!xml.atEnd()) {
+        if (canceled()) {
+            return reject(QStringLiteral("Converted PVD staging validation interrupted."));
+        }
+        xml.readNext();
+        if (xml.isStartElement()) {
+            const QString elementName = xml.name().toString();
+            if (!xml.namespaceUri().isEmpty()) {
+                return reject(QStringLiteral(
+                    "Converted PVD must not use namespaced structural elements."));
+            }
+            if (elementStack.isEmpty()) {
+                if (rootSeen || rootClosed || elementName != QStringLiteral("VTKFile")
+                    || xml.attributes().value(QStringLiteral("type"))
+                        != QStringLiteral("Collection")) {
+                    return reject(QStringLiteral(
+                        "Converted PVD root must be exactly one VTKFile of type Collection."));
+                }
+                rootSeen = true;
+                elementStack.append(elementName);
+                continue;
+            }
+            if (elementStack.size() == 1) {
+                if (elementStack.constLast() != QStringLiteral("VTKFile")
+                    || collectionSeen
+                    || elementName != QStringLiteral("Collection")) {
+                    return reject(QStringLiteral(
+                        "Converted PVD VTKFile must contain exactly one direct Collection element."));
+                }
+                collectionSeen = true;
+                elementStack.append(elementName);
+                continue;
+            }
+            if (elementStack.size() != 2
+                || elementStack.at(0) != QStringLiteral("VTKFile")
+                || elementStack.at(1) != QStringLiteral("Collection")
+                || elementName != QStringLiteral("DataSet")) {
+                return reject(QStringLiteral(
+                    "Converted PVD DataSet elements must be direct children of its sole Collection."));
+            }
+            if (timeValues.size()
+                >= Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
+                return reject(QStringLiteral("Converted PVD exceeds the %1-frame limit.")
+                                  .arg(Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount));
+            }
+            const QString timeText =
+                xml.attributes().value(QStringLiteral("timestep")).toString();
+            const QString relativePath =
+                xml.attributes().value(QStringLiteral("file")).toString();
+            bool timeOk = false;
+            const double timeValue = timeText.toDouble(&timeOk);
+            const QString normalizedRelativePath =
+                QDir::fromNativeSeparators(relativePath);
+            const QString cleanRelativePath = QDir::cleanPath(normalizedRelativePath);
+            if (!timeOk || !std::isfinite(timeValue) || relativePath.isEmpty()
+                || relativePath.toUtf8().size()
+                    > Streamcenter::FlowDataProtocolLimits::MaximumStringBytes
+                || QDir::isAbsolutePath(relativePath)
+                || cleanRelativePath != normalizedRelativePath
+                || QFileInfo(cleanRelativePath).path() != QStringLiteral(".")) {
+                return reject(QStringLiteral(
+                    "Converted PVD contains an invalid timestep or non-direct file reference."));
+            }
+            if (QFileInfo(cleanRelativePath).suffix().compare(
+                    QStringLiteral("vtu"), Qt::CaseInsensitive) != 0) {
+                return reject(QStringLiteral(
+                    "Converted PVD may reference only converter-produced VTU frames: %1")
+                                  .arg(relativePath));
+            }
+            const QFileInfo frameInfo(
+                QDir(stagingFolder).absoluteFilePath(cleanRelativePath));
+            if (!frameInfo.exists() || !frameInfo.isFile() || frameInfo.isSymLink()
+                || isFileSystemReparsePoint(frameInfo.absoluteFilePath())
+                || !frameInfo.isReadable()
+                || !sameSourcePath(frameInfo.absolutePath(), stagingFolder)) {
+                return reject(QStringLiteral(
+                    "Converted PVD references a missing, linked, unreadable, or escaped frame: %1")
+                                  .arg(relativePath));
+            }
+            const QString absoluteFramePath =
+                sourcePathIdentity(frameInfo.absoluteFilePath());
+            const QString frameIdentity = sourcePathIdentityKey(absoluteFramePath);
+            if (referencedIdentities.contains(frameIdentity)) {
+                return reject(QStringLiteral(
+                    "Converted PVD references a frame more than once: %1")
+                                  .arg(relativePath));
+            }
+            referencedIdentities.insert(frameIdentity);
+            timeValues.append(timeValue);
+            referencedFiles.append(absoluteFramePath);
+            elementStack.append(elementName);
+            continue;
+        }
+        if (xml.isEndElement()) {
+            const QString elementName = xml.name().toString();
+            if (elementStack.isEmpty() || elementStack.constLast() != elementName) {
+                return reject(QStringLiteral(
+                    "Converted PVD XML element nesting is inconsistent."));
+            }
+            elementStack.removeLast();
+            if (elementStack.isEmpty()) {
+                rootClosed = true;
+            }
+            continue;
+        }
+        if (xml.isCharacters() && !xml.isWhitespace()) {
+            return reject(QStringLiteral(
+                "Converted PVD structural elements may contain only whitespace text."));
+        }
+    }
+    if (xml.hasError()) {
+        return reject(QStringLiteral("Converted PVD XML is malformed: %1")
+                          .arg(xml.errorString()));
+    }
+    if (!rootSeen || !rootClosed || !collectionSeen || !elementStack.isEmpty()
+        || timeValues.isEmpty()) {
+        return reject(QStringLiteral(
+            "Converted PVD is not a complete, non-empty VTK Collection."));
+    }
+
+    const QString pvdIdentity = sourcePathIdentityKey(pvdPath);
+    QSet<QString> expectedStagingIdentities = referencedIdentities;
+    expectedStagingIdentities.insert(pvdIdentity);
+    auto validateStagingEntries = [&]() {
+        QSet<QString> seen;
+        QDirIterator iterator(
+            stagingFolder,
+            QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+            QDirIterator::NoIteratorFlags);
+        while (iterator.hasNext()) {
+            if (canceled()) {
+                result.errorMessage =
+                    QStringLiteral("Converted PVD staging validation interrupted.");
+                return false;
+            }
+            iterator.next();
+            const QFileInfo entry = iterator.fileInfo();
+            if (seen.size() >= expectedStagingIdentities.size()) {
+                result.errorMessage = QStringLiteral(
+                    "Converted staging contains more entries than its bounded PVD manifest permits.");
+                return false;
+            }
+            const QString identity = sourcePathIdentityKey(entry.absoluteFilePath());
+            if (!entry.isFile() || entry.isSymLink()
+                || isFileSystemReparsePoint(entry.absoluteFilePath())
+                || !expectedStagingIdentities.contains(identity)
+                || seen.contains(identity)) {
+                result.errorMessage = QStringLiteral(
+                    "Converted staging contains an extra, duplicate, linked, or non-file entry outside the PVD manifest: %1")
+                                          .arg(entry.absoluteFilePath());
+                return false;
+            }
+            seen.insert(identity);
+        }
+        if (seen != expectedStagingIdentities) {
+            result.errorMessage = QStringLiteral(
+                "Converted staging does not contain exactly the files declared by its PVD manifest.");
+            return false;
+        }
+        return true;
+    };
+    if (!validateStagingEntries()) {
+        return reject(result.errorMessage);
+    }
+
+    double dt = 1.0;
+    if (timeValues.size() > 1) {
+        dt = timeValues.at(1) - timeValues.at(0);
+        if (!std::isfinite(dt) || dt <= 0.0) {
+            return reject(QStringLiteral(
+                "Converted PVD timesteps must be strictly increasing."));
+        }
+        for (qsizetype index = 2; index < timeValues.size(); ++index) {
+            const double current = timeValues.at(index);
+            const double previous = timeValues.at(index - 1);
+            const double expected = std::fma(static_cast<double>(index),
+                                             dt, timeValues.first());
+            const double magnitude = std::max(std::abs(current), std::abs(expected));
+            const double tolerance = std::abs(dt)
+                    * static_cast<double>(index) * 1.0e-10
+                + std::numeric_limits<double>::epsilon() * magnitude * 8.0
+                + std::numeric_limits<double>::denorm_min() * 16.0;
+            if (!std::isfinite(current) || !(current > previous)
+                || !std::isfinite(expected)
+                || std::abs(current - expected) > tolerance) {
+                return reject(QStringLiteral(
+                    "Converted PVD uses a non-uniform time axis that cannot be represented by one dt value."));
+            }
+        }
+    }
+
+    auto effectiveDimension = [](const VtkDataSummary& summary) {
+        return summary.spatialDimension;
+    };
+    auto sameBounds = [](const VtkDataSummary& lhs,
+                         const VtkDataSummary& rhs) {
+        return lhs.hasBounds && rhs.hasBounds
+            && coordinateBoundsEquivalent(lhs.bounds, rhs.bounds);
+    };
+
+    VtkDataSummary firstFrame;
+    int firstDimension = 0;
+    QVector<QFileInfo> validatedFrameInfos;
+    validatedFrameInfos.reserve(referencedFiles.size());
+    QVector<FlowDataSourceFingerprint> preParseFrameFingerprints;
+    preParseFrameFingerprints.reserve(referencedFiles.size());
+    for (qsizetype index = 0; index < referencedFiles.size(); ++index) {
+        if (canceled()) {
+            return reject(QStringLiteral("Converted PVD staging validation interrupted."));
+        }
+        if (progress) {
+            progress(QStringLiteral("Validating converted PVD frames"),
+                     static_cast<int>(index),
+                     static_cast<int>(referencedFiles.size()));
+        }
+        const QFileInfo frameBefore(referencedFiles.at(index));
+        FlowDataSourceFingerprint preParseFingerprint;
+        QString fingerprintError;
+        if (!fingerprintStableRegularFile(referencedFiles.at(index), frameBefore,
+                                          &preParseFingerprint,
+                                          &fingerprintError,
+                                          progress, shouldCancel)) {
+            return reject(fingerprintError);
+        }
+        QString frameError;
+        VtkDataSummary frame;
+        if (!summarizeAnyVtk(referencedFiles.at(index), &frame, &frameError)) {
+            return reject(frameError);
+        }
+        const QFileInfo frameAfter(referencedFiles.at(index));
+        if (!frameAfter.exists() || !frameAfter.isFile() || frameAfter.isSymLink()
+            || isFileSystemReparsePoint(frameAfter.absoluteFilePath())
+            || frameAfter.size() != frameBefore.size()
+            || frameAfter.lastModified() != frameBefore.lastModified()
+            || !sameSourcePath(frameAfter.canonicalFilePath(),
+                               frameBefore.canonicalFilePath())) {
+            return reject(QStringLiteral(
+                "Converted VTU frame changed while it was being validated: %1")
+                              .arg(referencedFiles.at(index)));
+        }
+        const int frameDimension = effectiveDimension(frame);
+        if (dataKind == FlowDataKind::Resampled
+            && (!frame.uniformStructured || !frame.hasDims)) {
+            return reject(QStringLiteral(
+                "Every converted resampled frame must be a uniform structured VTK dataset: %1")
+                              .arg(referencedFiles.at(index)));
+        }
+        if (index == 0) {
+            firstFrame = frame;
+            firstDimension = frameDimension;
+        } else {
+            if (!sameCandidateFieldSet(firstFrame.termCandidates,
+                                       frame.termCandidates)
+                || !sameArraySchema(firstFrame.arrays, frame.arrays)) {
+                return reject(QStringLiteral(
+                    "Converted PVD field/component schema differs from the first frame: %1")
+                                  .arg(referencedFiles.at(index)));
+            }
+            if (frameDimension != firstDimension) {
+                return reject(QStringLiteral(
+                    "Converted PVD spatial dimension differs from the first frame: %1")
+                                  .arg(referencedFiles.at(index)));
+            }
+            if (dataKind == FlowDataKind::Resampled
+                && (!firstFrame.hasDims || !frame.hasDims
+                    || firstFrame.dims[0] != frame.dims[0]
+                    || firstFrame.dims[1] != frame.dims[1]
+                    || firstFrame.dims[2] != frame.dims[2])) {
+                return reject(QStringLiteral(
+                    "Converted resampled PVD grid dimensions differ from the first frame: %1")
+                                  .arg(referencedFiles.at(index)));
+            }
+            if (coordinateCheck && !sameBounds(firstFrame, frame)
+                && result.warningMessage.isEmpty()) {
+                result.warningMessage = QStringLiteral(
+                    "Converted PVD contains moving or deforming mesh coordinates; dimensions and all frame field schemas were still validated.");
+            }
+        }
+        validatedFrameInfos.append(frameAfter);
+        preParseFrameFingerprints.append(preParseFingerprint);
+        if (progress) {
+            progress(QStringLiteral("Validating converted PVD frames"),
+                     static_cast<int>(index + 1),
+                     static_cast<int>(referencedFiles.size()));
+        }
+        if (canceled()) {
+            return reject(QStringLiteral("Converted PVD staging validation interrupted."));
+        }
+    }
+    if (firstFrame.termCandidates.isEmpty()) {
+        return reject(QStringLiteral(
+            "Converted PVD frames do not contain numeric point or cell arrays."));
+    }
+
+    auto fingerprintFile = [&](const QString& filePath,
+                               const QFileInfo& expectedInfo,
+                               FlowDataSourceFingerprint* fingerprint) {
+        if (fingerprint == nullptr) {
+            result.errorMessage = QStringLiteral(
+                "Internal error: converted staging fingerprint output is null.");
+            return false;
+        }
+        const QFileInfo before(filePath);
+        if (!before.exists() || !before.isFile() || before.isSymLink()
+            || isFileSystemReparsePoint(before.absoluteFilePath())
+            || before.size() != expectedInfo.size()
+            || before.lastModified() != expectedInfo.lastModified()
+            || !sameSourcePath(before.canonicalFilePath(),
+                               expectedInfo.canonicalFilePath())) {
+            result.errorMessage = QStringLiteral(
+                "Converted staging file changed before it could be fingerprinted: %1")
+                                      .arg(filePath);
+            return false;
+        }
+        QFile file(filePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            result.errorMessage = QStringLiteral(
+                "Cannot fingerprint converted staging file %1: %2")
+                                      .arg(filePath, file.errorString());
+            return false;
+        }
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        constexpr qint64 kHashChunkBytes = 4 * 1024 * 1024;
+        qint64 hashedBytes = 0;
+        while (!file.atEnd()) {
+            if (canceled()) {
+                result.errorMessage =
+                    QStringLiteral("Converted PVD staging validation interrupted.");
+                return false;
+            }
+            const QByteArray chunk = file.read(kHashChunkBytes);
+            if (chunk.isEmpty() && file.error() != QFileDevice::NoError) {
+                result.errorMessage = QStringLiteral(
+                    "Cannot finish fingerprinting converted staging file %1: %2")
+                                          .arg(filePath, file.errorString());
+                return false;
+            }
+            hash.addData(chunk);
+            hashedBytes += chunk.size();
+            if (progress) {
+                constexpr int kProgressUnits = 1000;
+                const int completedUnits = before.size() <= 0
+                    ? kProgressUnits
+                    : std::clamp(
+                          static_cast<int>(
+                              (static_cast<long double>(hashedBytes)
+                               / static_cast<long double>(before.size()))
+                              * kProgressUnits),
+                          0,
+                          kProgressUnits);
+                // Besides user-visible progress, every bounded read emits a
+                // protocol heartbeat.  This prevents a healthy large-file
+                // SHA-256 pass from tripping the parent helper's inactivity
+                // timeout while keeping all heavy I/O outside the GUI process.
+                progress(QStringLiteral("Fingerprinting converted PVD staging"),
+                         completedUnits,
+                         kProgressUnits);
+            }
+        }
+        file.close();
+        const QFileInfo after(filePath);
+        if (!after.exists() || !after.isFile() || after.isSymLink()
+            || isFileSystemReparsePoint(after.absoluteFilePath())
+            || after.size() != before.size()
+            || after.lastModified() != before.lastModified()
+            || !sameSourcePath(after.canonicalFilePath(), before.canonicalFilePath())) {
+            result.errorMessage = QStringLiteral(
+                "Converted staging file changed while it was being fingerprinted: %1")
+                                      .arg(filePath);
+            return false;
+        }
+        fingerprint->path = sourcePathIdentity(filePath);
+        fingerprint->size = before.size();
+        fingerprint->sha256Hex = QString::fromLatin1(hash.result().toHex());
+        return true;
+    };
+
+    result.sourceInventory.clear();
+    result.sourceInventory.reserve(referencedFiles.size() + 1);
+    FlowDataSourceFingerprint pvdFingerprint;
+    if (!fingerprintFile(pvdPath, pvdAfterRead, &pvdFingerprint)) {
+        return reject(result.errorMessage);
+    }
+    const QString parsedPvdHash = QString::fromLatin1(
+        QCryptographicHash::hash(pvdPayload, QCryptographicHash::Sha256).toHex());
+    if (pvdFingerprint.sha256Hex != parsedPvdHash) {
+        return reject(QStringLiteral(
+            "Converted PVD collection changed after it was parsed."));
+    }
+    result.sourceInventory.append(pvdFingerprint);
+    for (qsizetype index = 0; index < referencedFiles.size(); ++index) {
+        FlowDataSourceFingerprint fingerprint;
+        if (!fingerprintFile(referencedFiles.at(index),
+                             validatedFrameInfos.at(index),
+                             &fingerprint)) {
+            return reject(result.errorMessage);
+        }
+        const FlowDataSourceFingerprint& beforeParse =
+            preParseFrameFingerprints.at(index);
+        if (fingerprint.path != beforeParse.path
+            || fingerprint.size != beforeParse.size
+            || fingerprint.sha256Hex != beforeParse.sha256Hex) {
+            return reject(QStringLiteral(
+                "Converted VTU frame content changed across native VTK parsing: %1")
+                              .arg(referencedFiles.at(index)));
+        }
+        result.sourceInventory.append(fingerprint);
+        if (progress) {
+            progress(QStringLiteral("Fingerprinting converted PVD staging"),
+                     static_cast<int>(index + 1),
+                     static_cast<int>(referencedFiles.size()));
+        }
+    }
+    std::sort(result.sourceInventory.begin(), result.sourceInventory.end(),
+              [](const FlowDataSourceFingerprint& lhs,
+                 const FlowDataSourceFingerprint& rhs) {
+                  return sourcePathIdentityKey(lhs.path)
+                      < sourcePathIdentityKey(rhs.path);
+              });
+    if (!validateStagingEntries()) {
+        return reject(result.errorMessage);
+    }
+
+    result.files = referencedFiles;
+    result.termCandidates = firstFrame.termCandidates;
+    result.entry.termCandidates = result.termCandidates;
+    inferTerms(firstFrame.arrays, firstDimension, &result.entry);
+    result.entry.xRange = formatRange(firstFrame.bounds[0], firstFrame.bounds[1]);
+    result.entry.yRange = formatRange(firstFrame.bounds[2], firstFrame.bounds[3]);
+    result.entry.zRange = formatRange(firstFrame.bounds[4], firstFrame.bounds[5]);
+    result.entry.dimension = QString::number(firstDimension);
+    result.entry.meshCount = dataKind == FlowDataKind::Resampled
+        ? QStringLiteral("%1 %2 %3")
+              .arg(std::max(1, firstFrame.dims[0]))
+              .arg(std::max(1, firstFrame.dims[1]))
+              .arg(std::max(1, firstFrame.dims[2]))
+        : QString::number(referencedFiles.size());
+    result.entry.dt = formatDouble(dt);
     result.entry.checkStatus = QStringLiteral("passed");
     result.passed = true;
     return result;
@@ -2456,9 +6008,8 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
     result.entry.xRange = formatRange(bounds[0], bounds[1]);
     result.entry.yRange = formatRange(bounds[2], bounds[3]);
     result.entry.zRange = formatRange(bounds[4], bounds[5]);
-    const bool reducedZ = (dims[2] > 0 && dims[2] <= 1) || std::abs(bounds[5] - bounds[4]) <= 1e-12;
-    result.entry.dimension = reducedZ ? QStringLiteral("2") : QStringLiteral("3");
-    const int dimension = result.entry.dimension == QStringLiteral("2") ? 2 : 3;
+    const int dimension = spatialDimensionForDataSet(first, dims);
+    result.entry.dimension = QString::number(dimension);
 
     if (dataKind == FlowDataKind::Resampled) {
         result.entry.meshCount = QStringLiteral("%1 %2 %3")
@@ -2470,8 +6021,10 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
     }
 
     QList<ArrayInfo> arrays;
-    collectArrays(first->GetPointData(), &arrays, &result.termCandidates);
-    collectArrays(first->GetCellData(), &arrays, &result.termCandidates);
+    collectArrays(first->GetPointData(), ArrayInfo::Association::Point,
+                  &arrays, &result.termCandidates);
+    collectArrays(first->GetCellData(), ArrayInfo::Association::Cell,
+                  &arrays, &result.termCandidates);
     result.termCandidates.sort(Qt::CaseInsensitive);
     inferTerms(arrays, dimension, &result.entry);
     result.entry.termCandidates = result.termCandidates;
@@ -2569,9 +6122,8 @@ FlowDataScanResult FlowDataInspector::scanOpenFoamCase(const QString& casePath,
     result.entry.xRange = formatRange(bounds[0], bounds[1]);
     result.entry.yRange = formatRange(bounds[2], bounds[3]);
     result.entry.zRange = formatRange(bounds[4], bounds[5]);
-    const bool reducedZ = (dims[2] > 0 && dims[2] <= 1) || std::abs(bounds[5] - bounds[4]) <= 1e-12;
-    result.entry.dimension = reducedZ ? QStringLiteral("2") : QStringLiteral("3");
-    const int dimension = result.entry.dimension == QStringLiteral("2") ? 2 : 3;
+    const int dimension = spatialDimensionForDataSet(first, dims);
+    result.entry.dimension = QString::number(dimension);
 
     if (dataKind == FlowDataKind::Resampled) {
         result.entry.meshCount = QStringLiteral("%1 %2 %3")
@@ -2583,8 +6135,10 @@ FlowDataScanResult FlowDataInspector::scanOpenFoamCase(const QString& casePath,
     }
 
     QList<ArrayInfo> arrays;
-    collectArrays(first->GetPointData(), &arrays, &result.termCandidates);
-    collectArrays(first->GetCellData(), &arrays, &result.termCandidates);
+    collectArrays(first->GetPointData(), ArrayInfo::Association::Point,
+                  &arrays, &result.termCandidates);
+    collectArrays(first->GetCellData(), ArrayInfo::Association::Cell,
+                  &arrays, &result.termCandidates);
     QStringList commonFields = actualArrayNames(first);
     if (commonFields.isEmpty()) {
         result.errorMessage = "The first OpenFOAM frame does not contain numeric point or cell arrays.";
@@ -2663,7 +6217,7 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
                                                            const ProgressCallback& progress,
                                                            const CancellationCallback& shouldCancel) {
     FlowDataScanResult result;
-    result.sourceFolder = casePaths.size() == 1 ? normalizedPath(casePaths.first()) : casePaths.join(QStringLiteral("; "));
+    result.sourceFolder = casePaths.size() == 1 ? normalizedPath(casePaths.first()) : QString();
     result.entry.dataKind = dataKind;
     result.entry.source = FlowDataSource::Link;
     result.entry.dataName = casePaths.size() == 1 ? QFileInfo(casePaths.first()).completeBaseName() : QStringLiteral("ensight_gold");
@@ -2686,9 +6240,24 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
     if (!loadEnSightGoldCaseSources(casePaths, &cases, &frames, &result.errorMessage)) {
         return result;
     }
+    if (!buildEnSightGoldInventoryFromCases(cases,
+                                            &result.sourceInventory,
+                                            &result.errorMessage,
+                                            progress,
+                                            shouldCancel)) {
+        return result;
+    }
     result.files.reserve(cases.size());
     for (const EnSightGoldCaseSource& source : std::as_const(cases)) {
         result.files.append(source.path);
+    }
+    if (cases.size() > 1) {
+        const QString commonParent = normalizedPath(QFileInfo(cases.first().path).absolutePath());
+        const bool allShareParent = std::all_of(
+            cases.cbegin(), cases.cend(), [&](const EnSightGoldCaseSource& source) {
+                return sameSourcePath(QFileInfo(source.path).absolutePath(), commonParent);
+            });
+        result.sourceFolder = allShareParent ? commonParent : QString();
     }
     if (canceled()) {
         return result;
@@ -2704,7 +6273,11 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
     for (const EnSightGoldFrameSource& frame : std::as_const(frames)) {
         timeValues.append(frame.timeValue);
     }
-    result.entry.dt = formatDouble(inferredTimeInterval(timeValues));
+    double dt = 0.0;
+    if (!uniformTimeInterval(timeValues, &dt, &result.errorMessage)) {
+        return result;
+    }
+    result.entry.dt = formatDouble(dt);
 
     const bool validateEveryFrame = coordinateCheck || commonFieldsOnly;
     if (progress) {
@@ -2729,10 +6302,16 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         }
 
         result.termCandidates = candidateListForArrays(arrays);
-        inferTerms(arrays, 3, &result.entry);
         result.entry.termCandidates = result.termCandidates;
         result.entry.meshCount = QString::number(frames.size());
-        result.entry.dimension = QStringLiteral("3");
+        // Native geometry was intentionally not opened, so dimension, ranges,
+        // and inferred vector components are unknown.  Leaving them empty
+        // prevents a metadata-only 2D source from being falsely pinned to 3D;
+        // the isolated converted-PVD scan supplies authoritative values.
+        result.entry.dimension.clear();
+        result.entry.xRange.clear();
+        result.entry.yRange.clear();
+        result.entry.zRange.clear();
         if (result.termCandidates.isEmpty()) {
             result.errorMessage = commonFieldsOnly
                 ? QStringLiteral("No numeric EnSight Gold variables are declared in every selected *.case file.")
@@ -2784,9 +6363,8 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         result.entry.xRange = formatRange(firstBounds[0], firstBounds[1]);
         result.entry.yRange = formatRange(firstBounds[2], firstBounds[3]);
         result.entry.zRange = formatRange(firstBounds[4], firstBounds[5]);
-        const bool reducedZ = (dims[2] > 0 && dims[2] <= 1) || std::abs(firstBounds[5] - firstBounds[4]) <= 1e-12;
-        result.entry.dimension = reducedZ ? QStringLiteral("2") : QStringLiteral("3");
-        dimension = result.entry.dimension == QStringLiteral("2") ? 2 : 3;
+        dimension = spatialDimensionForDataSet(first, dims);
+        result.entry.dimension = QString::number(dimension);
 
         if (dataKind == FlowDataKind::Resampled) {
             result.entry.meshCount = QStringLiteral("%1 %2 %3")
@@ -2797,8 +6375,10 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
             result.entry.meshCount = QString::number(frames.size());
         }
 
-        collectArrays(first->GetPointData(), &arrays, &result.termCandidates);
-        collectArrays(first->GetCellData(), &arrays, &result.termCandidates);
+        collectArrays(first->GetPointData(), ArrayInfo::Association::Point,
+                      &arrays, &result.termCandidates);
+        collectArrays(first->GetCellData(), ArrayInfo::Association::Cell,
+                      &arrays, &result.termCandidates);
         commonFields = actualArrayNames(first);
         if (commonFields.isEmpty()) {
             result.errorMessage = "The first EnSight Gold frame does not contain numeric point or cell arrays.";

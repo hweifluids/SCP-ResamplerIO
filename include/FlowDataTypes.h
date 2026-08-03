@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QStringList>
+#include <QVector>
 
 enum class FlowDataKind {
     Raw,
@@ -11,6 +12,16 @@ enum class FlowDataKind {
 enum class FlowDataSource {
     Link,
     Import
+};
+
+struct FlowDataSourceFingerprint {
+    QString path;
+    qint64 size = 0;
+    QString sha256Hex;
+
+    bool operator==(const FlowDataSourceFingerprint& other) const {
+        return path == other.path && size == other.size && sha256Hex == other.sha256Hex;
+    }
 };
 
 struct FlowDataEntry {

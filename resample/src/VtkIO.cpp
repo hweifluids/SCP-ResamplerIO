@@ -491,7 +491,6 @@ std::array<double, 6> ReadDataSetBounds(const FrameInfo& frame) {
         options.readAllArrays = false;
         options.attachSourceBlockIds = false;
         options.attachNek5000SpectralMetadata = false;
-        options.buildNek5000LinearizedTopology = false;
         options.attachNek5000QuadratureArrays = false;
         return BoundsFromDataObject(
             streamcenterplus::io::ReadDataSet(ToIoFrame(frame), options),
@@ -560,9 +559,8 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const FrameInfo& frame) {
         if (frame.kind == DataSetFrameKind::Nek5000TimeStep ||
             ext == ".nek5000" || ext == ".nek") {
             // Spectral resampling uses the element-local GLL coordinates and
-            // its own AABB/Newton locator.  Tens of millions of visualization
-            // subcells and three quadrature arrays are therefore unnecessary.
-            options.buildNek5000LinearizedTopology = false;
+            // its own AABB/Newton locator.  The optional quadrature arrays
+            // are therefore unnecessary for this read.
             options.attachNek5000QuadratureArrays = false;
         }
         return streamcenterplus::io::ReadDataSet(ToIoFrame(frame), options);

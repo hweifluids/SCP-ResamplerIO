@@ -20,6 +20,7 @@ set(SCP_RESAMPLER_IO_VTK_COMPONENTS
   CommonDataModel
   FiltersCore
   FiltersGeneral
+  FiltersGeometry
   FiltersPoints
   FiltersVerdict
   IOEnSight
@@ -75,7 +76,11 @@ add_library(SCP_ResamplerReaders STATIC
 )
 add_library(SCP::ResamplerReaders ALIAS SCP_ResamplerReaders)
 set_target_properties(SCP_ResamplerReaders PROPERTIES EXPORT_NAME ResamplerReaders)
-target_compile_features(SCP_ResamplerReaders PUBLIC cxx_std_17)
+set_target_properties(SCP_ResamplerReaders PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
 target_include_directories(SCP_ResamplerReaders PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -143,7 +148,11 @@ add_library(SCP_ResamplerIO STATIC
 add_library(SCP::ResamplerIO ALIAS SCP_ResamplerIO)
 set_target_properties(SCP_ResamplerIO PROPERTIES EXPORT_NAME ResamplerIO)
 
-target_compile_features(SCP_ResamplerIO PUBLIC cxx_std_17)
+set_target_properties(SCP_ResamplerIO PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
 target_include_directories(SCP_ResamplerIO PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/resample/include>
@@ -234,6 +243,21 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
     COMMAND scp_resampler_io_native_readers
   )
 
+  add_executable(scp_resampler_io_flowdata_nek
+    tests/flowdata-nek/main.cpp
+  )
+  target_link_libraries(scp_resampler_io_flowdata_nek PRIVATE SCP::ResamplerIO)
+  target_compile_definitions(scp_resampler_io_flowdata_nek PRIVATE
+    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+  )
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_flowdata_nek
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.FlowDataNek5000
+    COMMAND scp_resampler_io_flowdata_nek
+  )
+
   add_executable(scp_resampler_io_nek_resample
     tests/nek-resample/main.cpp
   )
@@ -263,6 +287,7 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
   set_tests_properties(SCPResamplerIO.TecplotResample PROPERTIES TIMEOUT 120)
 
   set_tests_properties(SCPResamplerIO.NativeReaders PROPERTIES TIMEOUT 120)
+  set_tests_properties(SCPResamplerIO.FlowDataNek5000 PROPERTIES TIMEOUT 120)
 
   add_executable(scp_resampler_io_multizone
     tests/multizone/main.cpp

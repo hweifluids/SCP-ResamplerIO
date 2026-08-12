@@ -2,6 +2,7 @@
 #include "FlowDataProtocolLimits.h"
 #include "streamcenterplus_resample/Core.h"
 
+#include <streamcenterplus/io/DataSetReader.h>
 #include <streamcenterplus/VtkHdfIO.h>
 
 #include <vtkAbstractArray.h>
@@ -20,6 +21,8 @@
 #include <vtkInformation.h>
 #include <vtkOpenFOAMReader.h>
 #include <vtkPointData.h>
+#include <vtkPointSet.h>
+#include <vtkPoints.h>
 #include <vtkPolyData.h>
 #include <vtkPOpenFOAMReader.h>
 #include <vtkRectilinearGrid.h>
@@ -199,6 +202,11 @@ bool supportedVtkExtension(const QString& suffix, bool includeNek5000) {
 bool isTecplotExtension(const QString& suffix) {
     const QString ext = suffix.toLower();
     return ext == QStringLiteral("dat") || ext == QStringLiteral("plt");
+}
+
+bool isNek5000DescriptorExtension(const QString& suffix) {
+    const QString ext = suffix.toLower();
+    return ext == QStringLiteral("nek5000") || ext == QStringLiteral("nek");
 }
 
 QString normalizedOpenFoamCaseType(QString caseType) {
@@ -772,94 +780,105 @@ bool writePvdFile(const QString& pvdPath,
     return true;
 }
 
-bool validateNek5000Descriptor(const QString& path, QString* errorMessage) {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+streamcenterplus::io::ReadOptions canonicalNek5000ReadOptions() {
+    streamcenterplus::io::ReadOptions options;
+    // FlowData inspects the same canonical element-local GLL source that the
+    // SEM evaluator and GUI use; no VTK cell topology is constructed while
+    // metadata or fields are being probed.
+    options.attachNek5000SpectralMetadata = true;
+    return options;
+}
+
+bool enumerateNek5000Frames(const QString& filePath,
+                            std::vector<streamcenterplus::io::DataSetFrame>* frames,
+                            QString* errorMessage) {
+    if (frames == nullptr) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("Cannot open Nek5000 descriptor: %1").arg(file.errorString());
+            *errorMessage = QStringLiteral("Internal error: Nek5000 frame storage was not provided.");
         }
         return false;
     }
-
-    bool hasFileTemplate = false;
-    bool hasFirstTimeStep = false;
-    bool hasNumberOfTimeSteps = false;
-    const QStringList lines = QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'));
-    for (QString line : lines) {
-        line = line.trimmed();
-        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
-            continue;
-        }
-
-        int tokenEnd = 0;
-        while (tokenEnd < line.size() && !line.at(tokenEnd).isSpace()) {
-            ++tokenEnd;
-        }
-        const QString token = line.left(tokenEnd).toLower();
-        if (token == QStringLiteral("nek5000")
-            || token == QStringLiteral("endian:")
-            || token == QStringLiteral("version:")) {
-            continue;
-        }
-        if (token == QStringLiteral("filetemplate:")) {
-            hasFileTemplate = true;
-            continue;
-        }
-        if (token == QStringLiteral("firsttimestep:")) {
-            hasFirstTimeStep = true;
-            continue;
-        }
-        if (token == QStringLiteral("numtimesteps:")) {
-            hasNumberOfTimeSteps = true;
-            continue;
-        }
-
+    frames->clear();
+    try {
+        *frames = streamcenterplus::io::EnumerateDataSetFrames(fsPathFromQString(filePath));
+    } catch (const std::exception& ex) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("Unsupported Nek5000 descriptor tag \"%1\" in %2.").arg(token, path);
+            *errorMessage = QString("Cannot enumerate Nek5000 time steps from %1:\n%2")
+                                .arg(filePath, QString::fromLocal8Bit(ex.what()));
         }
         return false;
     }
-
-    if (!hasFileTemplate || !hasFirstTimeStep || !hasNumberOfTimeSteps) {
+    if (frames->empty()) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("Nek5000 descriptor must define filetemplate:, firsttimestep:, and numtimesteps:: %1").arg(path);
+            *errorMessage = QString("Nek5000 descriptor does not advertise any readable frames: %1")
+                                .arg(filePath);
         }
         return false;
     }
     return true;
 }
 
-QVector<double> nek5000TimeValues(const QString& filePath, QString* errorMessage) {
-    if (!validateNek5000Descriptor(filePath, errorMessage)) {
-        return {};
-    }
-
-    QVector<double> values;
+vtkSmartPointer<vtkDataSet> readCanonicalNek5000Frame(
+    const streamcenterplus::io::DataSetFrame& frame,
+    QString* errorMessage) {
     try {
-        const std::vector<streamcenterplus::resample::FrameInfo> frames =
-            streamcenterplus::resample::EnumerateDataSetFrames(fsPathFromQString(filePath));
-        values.reserve(static_cast<int>(std::min<std::size_t>(
-            frames.size(), static_cast<std::size_t>(std::numeric_limits<int>::max()))));
-        for (const streamcenterplus::resample::FrameInfo& frame : frames) {
-            values.push_back(frame.time);
+        vtkSmartPointer<vtkDataSet> data = streamcenterplus::io::ReadDataSet(
+            frame, canonicalNek5000ReadOptions());
+        if (data == nullptr || !streamcenterplus::io::HasNek5000SpectralMetadata(data)) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QString("Nek5000 frame did not produce canonical spectral metadata: %1")
+                                    .arg(qStringFromFsPath(frame.path));
+            }
+            return nullptr;
         }
+        return data;
     } catch (const std::exception& ex) {
         if (errorMessage != nullptr) {
-            *errorMessage = QString("Cannot enumerate Nek5000 time steps from %1:\n%2")
-                                .arg(filePath, QString::fromLocal8Bit(ex.what()));
+            *errorMessage = QString("Cannot read canonical Nek5000 frame from %1:\n%2")
+                                .arg(qStringFromFsPath(frame.path),
+                                     QString::fromLocal8Bit(ex.what()));
         }
-        return {};
+        return nullptr;
     }
+}
 
-    std::sort(values.begin(), values.end());
-    QVector<double> uniqueValues;
-    uniqueValues.reserve(values.size());
-    for (const double value : std::as_const(values)) {
-        if (uniqueValues.isEmpty() || std::abs(uniqueValues.back() - value) > 1.0e-10) {
-            uniqueValues.push_back(value);
+bool canonicalNek5000Bounds(vtkDataSet* dataSet,
+                            double bounds[6],
+                            QString* errorMessage) {
+    auto* pointSet = vtkPointSet::SafeDownCast(dataSet);
+    vtkPoints* points = pointSet != nullptr ? pointSet->GetPoints() : nullptr;
+    vtkDataArray* coordinates = points != nullptr ? points->GetData() : nullptr;
+    if (coordinates == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral(
+                "Canonical Nek5000 data does not expose a point-coordinate array.");
         }
+        return false;
     }
-    return uniqueValues;
+    try {
+        const streamcenterplus::io::Nek5000SpectralPointEvaluator geometry(
+            dataSet, coordinates);
+        // The evaluator publishes a conservative enclosure of the complete
+        // high-order map.  It is intentionally safer than a raw GLL-node AABB
+        // when a curved element reaches beyond its nodal coordinate extrema.
+        const std::array<double, 6> spectralBounds = geometry.bounds();
+        if (!std::all_of(spectralBounds.cbegin(), spectralBounds.cend(),
+                         [](double value) { return std::isfinite(value); })) {
+            if (errorMessage != nullptr) {
+                *errorMessage = QStringLiteral(
+                    "Canonical Nek5000 spectral geometry produced non-finite bounds.");
+            }
+            return false;
+        }
+        std::copy(spectralBounds.cbegin(), spectralBounds.cend(), bounds);
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QString("Cannot evaluate canonical Nek5000 spectral bounds:\n%1")
+                                .arg(QString::fromLocal8Bit(ex.what()));
+        }
+        return false;
+    }
 }
 
 vtkSmartPointer<vtkDataSet> readAnyVtk(const QString& filePath, QString* errorMessage) {
@@ -899,27 +918,17 @@ vtkSmartPointer<vtkDataSet> readAnyVtk(const QString& filePath, QString* errorMe
         return nullptr;
     }
 
+    if (isNek5000DescriptorExtension(ext)) {
+        std::vector<streamcenterplus::io::DataSetFrame> frames;
+        if (!enumerateNek5000Frames(filePath, &frames, errorMessage)) {
+            return nullptr;
+        }
+        return readCanonicalNek5000Frame(frames.front(), errorMessage);
+    }
+
     const QString realPath = realVtkPath(filePath);
     const QByteArray realPathBytes = QFile::encodeName(realPath);
-
-    if (ext == QStringLiteral("nek5000") || ext == QStringLiteral("nek")) {
-        if (!validateNek5000Descriptor(filePath, errorMessage)) {
-            return nullptr;
-        }
-        try {
-            const std::vector<streamcenterplus::resample::FrameInfo> frames =
-                streamcenterplus::resample::EnumerateDataSetFrames(fsPathFromQString(filePath));
-            if (!frames.empty()) {
-                return streamcenterplus::resample::ReadDataSet(frames.front());
-            }
-        } catch (const std::exception& ex) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QString("Cannot read Nek5000 dataset %1:\n%2")
-                                    .arg(filePath, QString::fromLocal8Bit(ex.what()));
-            }
-            return nullptr;
-        }
-    } else if (ext == QStringLiteral("vtk")) {
+    if (ext == QStringLiteral("vtk")) {
         auto reader = vtkSmartPointer<vtkGenericDataObjectReader>::New();
         reader->SetFileName(realPathBytes.constData());
         reader->Update();
@@ -1444,9 +1453,15 @@ void mergeBounds(VtkDataSummary* summary, const double* bounds) {
 }
 
 bool summarizeDataSet(vtkDataSet* dataSet, VtkDataSummary* summary) {
+    const bool canonicalNek5000 = dataSet != nullptr
+        && streamcenterplus::io::HasNek5000SpectralMetadata(dataSet);
     if (dataSet == nullptr || summary == nullptr
         || dataSet->GetNumberOfPoints() <= 0
-        || dataSet->GetNumberOfCells() <= 0) {
+        // Canonical Native Nek5000 represents each spectral element as a
+        // local GLL point block.  It intentionally has no linear VTK cells;
+        // rejecting it here would force FlowData probing onto an invalid
+        // linearized representation.
+        || (dataSet->GetNumberOfCells() <= 0 && !canonicalNek5000)) {
         return false;
     }
 
@@ -5140,6 +5155,12 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
     FlowDataScanResult result;
     const QFileInfo sourceInfo(folder);
     const bool singleFile = sourceInfo.exists() && sourceInfo.isFile();
+    if (singleFile && isNek5000DescriptorExtension(sourceInfo.suffix())) {
+        // Keep the generic FlowData entry point on the same canonical native
+        // reader path as the dedicated Nek5000 import flow.
+        return scanNek5000File(sourceInfo.absoluteFilePath(), dataKind,
+                               coordinateCheck, progress, shouldCancel);
+    }
     result.sourceFolder = normalizedPath(singleFile ? sourceInfo.absoluteFilePath() : folder);
     result.entry.dataKind = dataKind;
     result.entry.source = FlowDataSource::Link;
@@ -5175,6 +5196,59 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
             ? QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.dat, *.plt, *.nek5000, *.nek")
             : QStringLiteral("*.vtk, *.vti, *.vtr, *.vts, *.vtu, *.vtm, *.vtkhdf, *.dat, *.plt");
         result.errorMessage = QString("No supported data files (%1) were found in %2.").arg(extensions, folder);
+        return result;
+    }
+    const bool onlyNek5000Descriptors = std::all_of(
+        result.files.cbegin(), result.files.cend(), [](const QString& file) {
+            return isNek5000DescriptorExtension(vtkExtensionSuffix(file));
+        });
+    const bool containsNek5000Descriptor = std::any_of(
+        result.files.cbegin(), result.files.cend(), [](const QString& file) {
+            return isNek5000DescriptorExtension(vtkExtensionSuffix(file));
+        });
+    if (onlyNek5000Descriptors) {
+        // .nek and .nek5000 are aliases for the same descriptor.  A folder
+        // with a single native series should behave exactly like direct
+        // import, while several independent descriptors require the caller to
+        // choose one rather than silently treating descriptors as time steps.
+        QStringList descriptors;
+        const auto sameDescriptorSeries = [](const QFileInfo& lhs,
+                                             const QFileInfo& rhs) {
+            return sameSourcePath(lhs.absolutePath(), rhs.absolutePath())
+                && lhs.completeBaseName().compare(rhs.completeBaseName(),
+                                                   fileSystemPathCaseSensitivity()) == 0;
+        };
+        for (const QString& file : std::as_const(result.files)) {
+            const QFileInfo info(file);
+            int existingIndex = -1;
+            for (int index = 0; index < descriptors.size(); ++index) {
+                const QFileInfo existing(descriptors.at(index));
+                if (sameDescriptorSeries(existing, info)) {
+                    existingIndex = index;
+                    break;
+                }
+            }
+            if (existingIndex < 0) {
+                descriptors.append(info.absoluteFilePath());
+            } else if (info.suffix().compare(QStringLiteral("nek5000"),
+                                              Qt::CaseInsensitive) == 0) {
+                // Prefer the canonical extension when both aliases exist.
+                descriptors[existingIndex] = info.absoluteFilePath();
+            }
+        }
+        if (descriptors.size() != 1) {
+            result.errorMessage = QStringLiteral(
+                "A FlowData folder contains multiple Nek5000 descriptors. "
+                "Select one *.nek5000 or *.nek descriptor explicitly.");
+            return result;
+        }
+        return scanNek5000File(descriptors.front(), dataKind,
+                               coordinateCheck, progress, shouldCancel);
+    }
+    if (containsNek5000Descriptor) {
+        result.errorMessage = QStringLiteral(
+            "A FlowData source cannot mix a Native Nek5000 descriptor with generic VTK files. "
+            "Select the Nek5000 descriptor explicitly.");
         return result;
     }
     if (std::all_of(result.files.cbegin(), result.files.cend(), [](const QString& file) {
@@ -5924,7 +5998,7 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
 
 FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
                                                       FlowDataKind dataKind,
-                                                      bool /*coordinateCheck*/,
+                                                      bool coordinateCheck,
                                                       const ProgressCallback& progress,
                                                       const CancellationCallback& shouldCancel) {
     FlowDataScanResult result;
@@ -5961,19 +6035,31 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
         return result;
     }
 
+    QString readError;
+    std::vector<streamcenterplus::io::DataSetFrame> frames;
+    if (!enumerateNek5000Frames(normalizedFilePath, &frames, &readError)) {
+        result.errorMessage = readError;
+        return result;
+    }
+    QVector<double> timeValues;
+    timeValues.reserve(static_cast<qsizetype>(frames.size()));
+    // Do not sort or deduplicate: source index is part of a Native Nek5000
+    // frame's identity, even when two snapshots advertise the same time.
+    for (const streamcenterplus::io::DataSetFrame& frame : frames) {
+        timeValues.append(frame.time);
+    }
+
+    const int progressTotal = coordinateCheck
+        ? static_cast<int>(std::min<std::size_t>(
+              frames.size() + 1, static_cast<std::size_t>(std::numeric_limits<int>::max())))
+        : 2;
     if (progress) {
-        progress(QStringLiteral("Validating Nek5000 flow data"), 1, 2);
+        progress(QStringLiteral("Validating Nek5000 flow data"), 1, progressTotal);
     }
     if (canceled()) {
         return result;
     }
 
-    QString readError;
-    const QVector<double> timeValues = nek5000TimeValues(normalizedFilePath, &readError);
-    if (!readError.trimmed().isEmpty() && timeValues.isEmpty()) {
-        result.errorMessage = readError;
-        return result;
-    }
     if (timeValues.size() >= 2) {
         const double dt = timeValues.at(1) - timeValues.at(0);
         bool uniform = std::isfinite(dt) && dt > 0.0;
@@ -5988,7 +6074,7 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
         }
     }
 
-    vtkSmartPointer<vtkDataSet> first = readAnyVtk(normalizedFilePath, &readError);
+    vtkSmartPointer<vtkDataSet> first = readCanonicalNek5000Frame(frames.front(), &readError);
     if (first == nullptr) {
         result.errorMessage = readError;
         return result;
@@ -6004,7 +6090,17 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
     }
 
     double bounds[6] = {};
-    first->GetBounds(bounds);
+    if (!canonicalNek5000Bounds(first, bounds, &readError)) {
+        result.errorMessage = readError;
+        return result;
+    }
+    double nodalBounds[6] = {};
+    first->GetBounds(nodalBounds);
+    if (!coordinateBoundsEquivalent(bounds, nodalBounds)) {
+        result.warningMessage = QStringLiteral(
+            "Native Nek5000 coordinate ranges conservatively enclose the complete "
+            "high-order spectral mapping; they are not limited to the raw GLL-node bounds.");
+    }
     result.entry.xRange = formatRange(bounds[0], bounds[1]);
     result.entry.yRange = formatRange(bounds[2], bounds[3]);
     result.entry.zRange = formatRange(bounds[4], bounds[5]);
@@ -6017,7 +6113,7 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
                                      .arg(std::max(1, dims[1]))
                                      .arg(std::max(1, dims[2]));
     } else {
-        result.entry.meshCount = QString::number(static_cast<qlonglong>(std::max<qsizetype>(1, timeValues.size())));
+        result.entry.meshCount = QString::number(static_cast<qlonglong>(frames.size()));
     }
 
     QList<ArrayInfo> arrays;
@@ -6034,8 +6130,35 @@ FlowDataScanResult FlowDataInspector::scanNek5000File(const QString& filePath,
         return result;
     }
 
+    if (coordinateCheck) {
+        for (std::size_t index = 1; index < frames.size(); ++index) {
+            if (canceled()) {
+                return result;
+            }
+            vtkSmartPointer<vtkDataSet> frame = readCanonicalNek5000Frame(
+                frames[index], &readError);
+            if (frame == nullptr) {
+                result.errorMessage = readError;
+                return result;
+            }
+            if (!streamcenterplus::io::HasSameNek5000SpectralGeometry(first, frame)) {
+                result.errorMessage = QString(
+                    "Nek5000 canonical element-local GLL geometry differs from the first frame: %1")
+                                          .arg(qStringFromFsPath(frames[index].path));
+                return result;
+            }
+            if (progress) {
+                progress(QStringLiteral("Validating Nek5000 flow data"),
+                         static_cast<int>(index + 2), progressTotal);
+            }
+            if (canceled()) {
+                return result;
+            }
+        }
+    }
+
     if (progress) {
-        progress(QStringLiteral("Validating Nek5000 flow data"), 2, 2);
+        progress(QStringLiteral("Validating Nek5000 flow data"), progressTotal, progressTotal);
     }
     if (canceled()) {
         return result;

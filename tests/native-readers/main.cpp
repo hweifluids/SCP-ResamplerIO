@@ -8,7 +8,10 @@
 #include <vtkIntArray.h>
 #include <vtkNew.h>
 #include <vtkPointData.h>
+#include <vtkPointSet.h>
+#include <vtkPolyData.h>
 #include <vtkPoints.h>
+#include <vtkStringArray.h>
 #include <vtkUnstructuredGrid.h>
 
 #include <algorithm>
@@ -20,9 +23,11 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -209,6 +214,290 @@ fs::path CreateNekFixture(const fs::path& root) {
     return directory / "tiny.nek5000";
 }
 
+void ValidateNekSpectralDisplayProxy(vtkDataSet* canonical,
+                                     vtkDataArray* canonicalVelocity) {
+    Require(canonical != nullptr && canonicalVelocity != nullptr,
+            "Cannot validate a spectral display proxy without canonical data.");
+    const vtkIdType canonicalPointCount = canonical->GetNumberOfPoints();
+    const vtkIdType canonicalCellCount = canonical->GetNumberOfCells();
+
+    const io::Nek5000SpectralDisplayProxy proxy =
+        io::CreateNek5000SpectralDisplayProxy(canonical);
+    Require(proxy.volume != nullptr && proxy.exteriorSurface != nullptr &&
+                proxy.elementGrid != nullptr && proxy.gllNodes != nullptr,
+            "The SEM-aware Nek display adapter did not create every requested proxy.");
+    Require(canonical->GetNumberOfPoints() == canonicalPointCount &&
+                canonical->GetNumberOfCells() == canonicalCellCount &&
+                io::HasNek5000SpectralMetadata(canonical) &&
+                !io::IsNek5000SpectralDisplayProxy(canonical),
+            "Creating a Nek display proxy mutated or relabelled canonical GLL data.");
+
+    for (vtkDataSet* displayData : {
+             static_cast<vtkDataSet*>(proxy.volume.GetPointer()),
+             static_cast<vtkDataSet*>(proxy.exteriorSurface.GetPointer()),
+             static_cast<vtkDataSet*>(proxy.elementGrid.GetPointer()),
+             static_cast<vtkDataSet*>(proxy.gllNodes.GetPointer())}) {
+        Require(displayData != nullptr && io::IsNek5000SpectralDisplayProxy(displayData) &&
+                    !io::HasNek5000SpectralMetadata(displayData),
+                "A derived Nek display representation was not clearly separated from "
+                "canonical SEM data.");
+    }
+    Require(proxy.volume->GetNumberOfPoints() > canonicalPointCount &&
+                proxy.volume->GetNumberOfCells() > 27,
+            "The default SEM-aware volume proxy was not sampled more finely than "
+            "the legacy GLL-to-GLL subcells.");
+    Require(proxy.exteriorSurface->GetNumberOfCells() > 0 &&
+                proxy.elementGrid->GetNumberOfCells() > 0 &&
+                proxy.gllNodes->GetNumberOfPoints() == canonicalPointCount,
+            "The spectral display adapter omitted exterior, grid, or GLL-node data.");
+
+    vtkDataArray* volumeElementIndices = proxy.volume->GetPointData()->GetArray(
+        io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* volumeLocalGllIndices = proxy.volume->GetPointData()->GetArray(
+        io::kNek5000DisplayLocalGllIndexArray);
+    vtkDataArray* volumeReferences = proxy.volume->GetPointData()->GetArray(
+        io::kNek5000DisplayReferenceCoordinatesArray);
+    vtkDataArray* volumeVelocity = proxy.volume->GetPointData()->GetArray("Velocity");
+    Require(volumeElementIndices != nullptr && volumeLocalGllIndices != nullptr &&
+                volumeReferences != nullptr &&
+                volumeReferences->GetNumberOfComponents() == 3 &&
+                volumeVelocity != nullptr &&
+                volumeVelocity->GetNumberOfComponents() == 3,
+            "The SEM-aware volume proxy lost point provenance or sampled fields.");
+
+    vtkPointSet* canonicalPointSet = vtkPointSet::SafeDownCast(canonical);
+    Require(canonicalPointSet != nullptr && canonicalPointSet->GetPoints() != nullptr,
+            "Canonical Nek geometry must be available as a point set.");
+    io::Nek5000SpectralPointEvaluator velocityEvaluator(canonical, canonicalVelocity);
+    io::Nek5000SpectralPointEvaluator geometryEvaluator(
+        canonical, canonicalPointSet->GetPoints()->GetData());
+    bool foundNonGllSample = false;
+    for (vtkIdType pointId = 0; pointId < proxy.volume->GetNumberOfPoints(); ++pointId) {
+        const int elementIndex = static_cast<int>(
+            volumeElementIndices->GetComponent(pointId, 0));
+        const double* reference = volumeReferences->GetTuple(pointId);
+        double expected[3] = {};
+        double expectedPoint[3] = {};
+        double proxyPoint[3] = {};
+        Require(elementIndex == 0 &&
+                    velocityEvaluator.EvaluateReference(
+                        static_cast<std::size_t>(elementIndex), reference, expected) &&
+                    geometryEvaluator.EvaluateReference(
+                        static_cast<std::size_t>(elementIndex), reference,
+                        expectedPoint),
+                "The display proxy carried invalid canonical element/reference provenance.");
+        proxy.volume->GetPoint(pointId, proxyPoint);
+        Require(NearlyEqual(proxyPoint[0], expectedPoint[0], 3.0e-11) &&
+                    NearlyEqual(proxyPoint[1], expectedPoint[1], 3.0e-11) &&
+                    NearlyEqual(proxyPoint[2], expectedPoint[2], 3.0e-11),
+                "The SEM-aware display proxy did not evaluate spectral geometry at "
+                "its recorded reference coordinate.");
+        for (int component = 0; component < 3; ++component) {
+            Require(NearlyEqual(volumeVelocity->GetComponent(pointId, component),
+                                expected[component], 3.0e-11),
+                    "The SEM-aware display proxy did not evaluate a GLL field at "
+                    "its recorded reference coordinate.");
+        }
+        foundNonGllSample = foundNonGllSample ||
+                            volumeLocalGllIndices->GetComponent(pointId, 0) < 0;
+    }
+    Require(foundNonGllSample,
+            "The SEM-aware display proxy did not distinguish resampled points from "
+            "canonical GLL nodes.");
+
+    vtkDataArray* surfaceElementIndices =
+        proxy.exteriorSurface->GetCellData()->GetArray(
+            io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* surfaceFaceIds = proxy.exteriorSurface->GetCellData()->GetArray(
+        io::kNek5000DisplayFaceIdArray);
+    Require(surfaceElementIndices != nullptr && surfaceFaceIds != nullptr,
+            "The exterior SEM proxy lost cell-level element/face provenance.");
+    std::set<int> exteriorFaces;
+    for (vtkIdType cellId = 0; cellId < proxy.exteriorSurface->GetNumberOfCells(); ++cellId) {
+        Require(static_cast<int>(surfaceElementIndices->GetComponent(cellId, 0)) == 0,
+                "The one-element exterior display proxy reported an invalid element.");
+        exteriorFaces.insert(static_cast<int>(surfaceFaceIds->GetComponent(cellId, 0)));
+    }
+    Require(exteriorFaces.size() == 6,
+            "The one-element 3-D SEM exterior proxy did not retain all six faces.");
+
+    vtkDataArray* gllElementIndices = proxy.gllNodes->GetPointData()->GetArray(
+        io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* gllLocalIndices = proxy.gllNodes->GetPointData()->GetArray(
+        io::kNek5000DisplayLocalGllIndexArray);
+    Require(gllElementIndices != nullptr && gllLocalIndices != nullptr,
+            "The GLL-node overlay lost canonical local-node provenance.");
+    std::set<int> localGllIndices;
+    for (vtkIdType pointId = 0; pointId < proxy.gllNodes->GetNumberOfPoints(); ++pointId) {
+        const int localIndex = static_cast<int>(gllLocalIndices->GetComponent(pointId, 0));
+        Require(static_cast<int>(gllElementIndices->GetComponent(pointId, 0)) == 0 &&
+                    localIndex >= 0 && localIndex < canonicalPointCount,
+                "The GLL-node overlay contains invalid local provenance.");
+        localGllIndices.insert(localIndex);
+        double canonicalPoint[3] = {};
+        double proxyPoint[3] = {};
+        canonical->GetPoint(localIndex, canonicalPoint);
+        proxy.gllNodes->GetPoint(pointId, proxyPoint);
+        Require(NearlyEqual(canonicalPoint[0], proxyPoint[0]) &&
+                    NearlyEqual(canonicalPoint[1], proxyPoint[1]) &&
+                    NearlyEqual(canonicalPoint[2], proxyPoint[2]),
+                "The GLL-node overlay no longer references canonical node coordinates.");
+    }
+    Require(localGllIndices.size() == static_cast<std::size_t>(canonicalPointCount),
+            "The GLL-node overlay merged or omitted canonical local DOFs.");
+
+}
+
+void RequireNekSpectralOperationContract(
+    vtkDataSet* output,
+    const std::string& expectedOperation,
+    int expectedElementId) {
+    Require(output != nullptr && output->GetNumberOfPoints() > 0 &&
+                io::IsNek5000SpectralDisplayProxy(output) &&
+                !io::HasNek5000SpectralMetadata(output),
+            "Native Nek5000 operation output was not isolated from canonical GLL data.");
+    vtkDataArray* elements = output->GetPointData()->GetArray(
+        io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* references = output->GetPointData()->GetArray(
+        io::kNek5000DisplayReferenceCoordinatesArray);
+    vtkDataArray* spacing = output->GetFieldData()->GetArray(
+        io::kNek5000DisplayReferenceSpacingField);
+    vtkDataArray* sourceElementIds = output->GetFieldData()->GetArray(
+        io::kNek5000DisplaySourceElementIdsField);
+    vtkStringArray* operation = vtkStringArray::SafeDownCast(
+        output->GetFieldData()->GetAbstractArray(io::kNek5000DisplayOperationField));
+    Require(elements != nullptr && references != nullptr && spacing != nullptr &&
+                sourceElementIds != nullptr && operation != nullptr &&
+                elements->GetNumberOfTuples() == output->GetNumberOfPoints() &&
+                references->GetNumberOfComponents() == 3 &&
+                references->GetNumberOfTuples() == output->GetNumberOfPoints() &&
+                spacing->GetNumberOfTuples() == 1 &&
+                spacing->GetComponent(0, 0) > 0.0 &&
+                sourceElementIds->GetNumberOfTuples() == 1 &&
+                static_cast<int>(sourceElementIds->GetComponent(0, 0)) ==
+                    expectedElementId &&
+                operation->GetNumberOfValues() == 1 &&
+                operation->GetValue(0) == expectedOperation,
+            "Native Nek5000 operation did not retain its sampled SEM provenance contract.");
+}
+
+void ValidateNekSpectralOperations(vtkDataSet* canonical,
+                                   vtkDataArray* velocity,
+                                   vtkDataArray* pressure) {
+    Require(canonical != nullptr && velocity != nullptr && pressure != nullptr,
+            "Cannot validate Native Nek5000 operations without canonical fields.");
+    const vtkIdType canonicalPointCount = canonical->GetNumberOfPoints();
+    const vtkIdType canonicalCellCount = canonical->GetNumberOfCells();
+    const int canonicalArrayCount = canonical->GetPointData()->GetNumberOfArrays();
+    const double canonicalVelocity0 = velocity->GetComponent(0, 0);
+
+    const double probePoint[3] = {0.37, 1.72, 2.44};
+    io::Nek5000SpectralProbeResult probe;
+    Require(io::ProbeNek5000SpectralField(canonical, velocity, probePoint, &probe) &&
+                probe.elementIndex == 0 && probe.elementId == 42 &&
+                probe.values.size() == 3 &&
+                NearlyEqual(probe.referenceCoordinates[0], -0.63, 2.0e-11) &&
+                NearlyEqual(probe.referenceCoordinates[1], -0.28, 2.0e-11) &&
+                NearlyEqual(probe.referenceCoordinates[2], -0.56, 2.0e-11) &&
+                NearlyEqual(probe.values[0],
+                            probePoint[0] * probePoint[0] + 2.0 * probePoint[1] +
+                                3.0 * probePoint[2] + 1.0,
+                            2.0e-11),
+            "Native Nek5000 probe did not use the canonical spectral evaluator.");
+
+    io::Nek5000SpectralOperationOptions pbrOptions;
+    pbrOptions.preparePbrSurface = true;
+    const io::Nek5000SpectralOperationResult exterior =
+        io::CreateNek5000SpectralOperationPipeline(canonical, {}, pbrOptions);
+    Require(exterior.data != nullptr && exterior.pbrSurface != nullptr &&
+                exterior.pbrSurface->GetPointData()->GetNormals() != nullptr,
+            "Native Nek5000 exterior PBR preparation did not retain spectral normals.");
+    vtkDataArray* exteriorNormals = exterior.pbrSurface->GetPointData()->GetNormals();
+    for (vtkIdType pointId = 0;
+         pointId < exteriorNormals->GetNumberOfTuples(); ++pointId) {
+        double normal[3] = {};
+        exteriorNormals->GetTuple(pointId, normal);
+        Require(NearlyEqual(std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
+                                      normal[2] * normal[2]),
+                            1.0, 2.0e-12),
+                "Native Nek5000 exterior PBR normal is not unit length.");
+    }
+
+    io::Nek5000SpectralOperationRequest crop;
+    crop.kind = io::Nek5000SpectralOperationKind::Crop;
+    crop.cropBounds = {0.15, 1.85, 1.15, 2.85, 2.15, 3.85};
+    const io::Nek5000SpectralOperationResult cropped =
+        io::CreateNek5000SpectralOperation(canonical, crop, pbrOptions);
+    RequireNekSpectralOperationContract(cropped.data, "crop", 42);
+    Require(cropped.pbrSurface != nullptr &&
+                cropped.pbrSurface->GetPointData()->GetNormals() != nullptr,
+            "Native Nek5000 crop did not prepare a labelled sampled PBR surface.");
+    for (vtkIdType pointId = 0; pointId < cropped.data->GetNumberOfPoints(); ++pointId) {
+        double point[3] = {};
+        cropped.data->GetPoint(pointId, point);
+        Require(point[0] >= crop.cropBounds[0] - 2.0e-12 &&
+                    point[0] <= crop.cropBounds[1] + 2.0e-12 &&
+                    point[1] >= crop.cropBounds[2] - 2.0e-12 &&
+                    point[1] <= crop.cropBounds[3] + 2.0e-12 &&
+                    point[2] >= crop.cropBounds[4] - 2.0e-12 &&
+                    point[2] <= crop.cropBounds[5] + 2.0e-12,
+                "Native Nek5000 crop escaped the requested physical bounds.");
+    }
+
+    io::Nek5000SpectralOperationRequest clip;
+    clip.kind = io::Nek5000SpectralOperationKind::Clip;
+    clip.planeOrigin = {1.0, 0.0, 0.0};
+    clip.planeNormal = {1.0, 0.0, 0.0};
+    const io::Nek5000SpectralOperationResult clipped =
+        io::CreateNek5000SpectralOperation(canonical, clip);
+    RequireNekSpectralOperationContract(clipped.data, "clip", 42);
+    for (vtkIdType pointId = 0; pointId < clipped.data->GetNumberOfPoints(); ++pointId) {
+        double point[3] = {};
+        clipped.data->GetPoint(pointId, point);
+        Require(point[0] <= 1.0 + 2.0e-12,
+                "Native Nek5000 clip retained data on the rejected plane side.");
+    }
+
+    io::Nek5000SpectralOperationRequest slice;
+    slice.kind = io::Nek5000SpectralOperationKind::Slice;
+    slice.planeOrigin = {1.0, 0.0, 0.0};
+    slice.planeNormal = {1.0, 0.0, 0.0};
+    const io::Nek5000SpectralOperationResult sliced =
+        io::CreateNek5000SpectralOperation(canonical, slice);
+    RequireNekSpectralOperationContract(sliced.data, "slice", 42);
+    for (vtkIdType pointId = 0; pointId < sliced.data->GetNumberOfPoints(); ++pointId) {
+        double point[3] = {};
+        sliced.data->GetPoint(pointId, point);
+        Require(NearlyEqual(point[0], 1.0, 2.0e-12),
+                "Native Nek5000 slice did not remain on its requested plane.");
+    }
+
+    io::Nek5000SpectralOperationRequest contour;
+    contour.kind = io::Nek5000SpectralOperationKind::Contour;
+    contour.contourArrayName = "Pressure";
+    contour.contourComponent = 0;
+    contour.contourValues = {7.0};
+    const io::Nek5000SpectralOperationResult contoured =
+        io::CreateNek5000SpectralOperation(canonical, contour);
+    RequireNekSpectralOperationContract(contoured.data, "contour", 42);
+    vtkDataArray* contourPressure = contoured.data->GetPointData()->GetArray("Pressure");
+    Require(contourPressure != nullptr,
+            "Native Nek5000 contour lost its evaluator-sampled source field.");
+    for (vtkIdType pointId = 0;
+         pointId < contourPressure->GetNumberOfTuples(); ++pointId) {
+        Require(NearlyEqual(contourPressure->GetComponent(pointId, 0), 7.0, 2.0e-12),
+                "Native Nek5000 contour did not follow the spectral scalar level.");
+    }
+
+    Require(canonical->GetNumberOfPoints() == canonicalPointCount &&
+                canonical->GetNumberOfCells() == canonicalCellCount &&
+                canonical->GetPointData()->GetNumberOfArrays() == canonicalArrayCount &&
+                NearlyEqual(velocity->GetComponent(0, 0), canonicalVelocity0) &&
+                io::HasNek5000SpectralMetadata(canonical) &&
+                !io::IsNek5000SpectralDisplayProxy(canonical),
+            "Native Nek5000 operations mutated or relabelled canonical GLL data.");
+}
+
 void ValidateNek(const fs::path& descriptor) {
     const std::vector<io::DataSetFrame> frames =
         io::EnumerateDataSetFrames(descriptor);
@@ -232,8 +521,9 @@ void ValidateNek(const fs::path& descriptor) {
 
     vtkSmartPointer<vtkDataSet> data = io::ReadDataSet(frames[1]);
     Require(data != nullptr && data->GetNumberOfPoints() == 64 &&
-                data->GetNumberOfCells() == 27,
-            "Synthetic Nek topology has unexpected point/cell counts.");
+                data->GetNumberOfCells() == 0,
+            "Native Nek5000 must default to canonical element-local GLL data "
+            "without linearized VTK cells.");
     Require(io::HasNek5000SpectralMetadata(data),
             "Synthetic Nek dataset is missing spectral metadata.");
     const io::Nek5000SpectralMetadata metadata =
@@ -309,44 +599,55 @@ void ValidateNek(const fs::path& descriptor) {
                             2.0e-11),
             "A Nek evaluator rebound to another GLL field did not reuse the "
             "spectral geometry correctly.");
+    const double referenceQuery[3] = {0.23, -0.31, 0.17};
+    double referencePressure = 0.0;
+    Require(pressureEvaluator.EvaluateReference(0, referenceQuery,
+                                                &referencePressure) &&
+                NearlyEqual(referencePressure,
+                            7.0 + referenceQuery[0] + referenceQuery[1] +
+                                referenceQuery[2],
+                            2.0e-11),
+            "Cell-free Nek evaluation at a known reference coordinate is incorrect.");
     const double outside[3] = {3.0, 1.72, 2.44};
     Require(!evaluator.Evaluate(outside, interpolated, &elementHint),
             "Nek spectral point evaluator accepted a point outside the mesh.");
 
-    io::ReadOptions noTopologyOptions;
-    noTopologyOptions.buildNek5000LinearizedTopology = false;
-    vtkSmartPointer<vtkDataSet> noTopology =
-        io::ReadDataSet(frames[1], noTopologyOptions);
-    Require(noTopology->GetNumberOfPoints() == 64 &&
-                noTopology->GetNumberOfCells() == 0 &&
-                io::HasNek5000SpectralMetadata(noTopology) &&
-                noTopology->GetFieldData()->GetArray(
+    io::ReadOptions canonicalOptions;
+    vtkSmartPointer<vtkDataSet> canonicalRepeat =
+        io::ReadDataSet(frames[1], canonicalOptions);
+    Require(canonicalRepeat->GetNumberOfPoints() == 64 &&
+                canonicalRepeat->GetNumberOfCells() == 0 &&
+                io::HasNek5000SpectralMetadata(canonicalRepeat) &&
+                canonicalRepeat->GetFieldData()->GetArray(
                     io::kNek5000ElementIdsField) != nullptr &&
-                noTopology->GetFieldData()->GetAbstractArray(
+                canonicalRepeat->GetFieldData()->GetAbstractArray(
                     io::kNek5000RepresentationField) != nullptr &&
-                noTopology->GetPointData()->GetArray(
+                canonicalRepeat->GetPointData()->GetArray(
                     io::kNek5000QuadratureWeightArray) != nullptr,
-            "Disabling Nek linearized topology did not preserve points, basic "
+            "Repeated Native Nek5000 reads did not preserve canonical points, basic "
             "spectral metadata and optional quadrature arrays.");
-    vtkDataArray* noTopologyVelocity =
-        noTopology->GetPointData()->GetArray("Velocity");
-    io::Nek5000SpectralPointEvaluator noTopologyEvaluator(
-        noTopology, noTopologyVelocity);
+    vtkDataArray* canonicalRepeatVelocity =
+        canonicalRepeat->GetPointData()->GetArray("Velocity");
+    io::Nek5000SpectralPointEvaluator canonicalRepeatEvaluator(
+        canonicalRepeat, canonicalRepeatVelocity);
     elementHint = -1;
-    Require(noTopologyEvaluator.Evaluate(query, interpolated, &elementHint) &&
+    Require(canonicalRepeatEvaluator.Evaluate(query, interpolated, &elementHint) &&
                 NearlyEqual(interpolated[0],
                             query[0] * query[0] + 2.0 * query[1] +
                                 3.0 * query[2] + 1.0,
                             2.0e-11) &&
-                !noTopologyEvaluator.Evaluate(outside, interpolated,
-                                              &elementHint),
-            "The element-AABB locator failed without linearized Nek cells.");
+                !canonicalRepeatEvaluator.Evaluate(outside, interpolated,
+                                                    &elementHint),
+            "The canonical element-AABB locator failed without VTK cells.");
+
+    ValidateNekSpectralDisplayProxy(canonicalRepeat, canonicalRepeatVelocity);
+    ValidateNekSpectralOperations(data, velocity, pressure);
 
     io::ReadOptions noQuadratureOptions;
     noQuadratureOptions.attachNek5000QuadratureArrays = false;
     vtkSmartPointer<vtkDataSet> noQuadrature =
         io::ReadDataSet(frames[1], noQuadratureOptions);
-    Require(noQuadrature->GetNumberOfCells() == 27 &&
+    Require(noQuadrature->GetNumberOfCells() == 0 &&
                 io::HasNek5000SpectralMetadata(noQuadrature) &&
                 noQuadrature->GetFieldData()->GetArray(
                     io::kNek5000ElementIdsField) != nullptr &&
@@ -360,7 +661,6 @@ void ValidateNek(const fs::path& descriptor) {
             "a per-point quadrature array.");
 
     io::ReadOptions physicalWeightOnlyOptions;
-    physicalWeightOnlyOptions.buildNek5000LinearizedTopology = false;
     physicalWeightOnlyOptions.attachNek5000ReferenceWeightArray = false;
     physicalWeightOnlyOptions.attachNek5000JacobianDeterminantArray = false;
     vtkSmartPointer<vtkDataSet> physicalWeightOnly =
@@ -427,7 +727,7 @@ void ValidateMultiFileNek(const fs::path& descriptor) {
         Require(metadata.elementCount == 2 &&
                     metadata.elementIds == std::vector<int>({100, 200}) &&
                     data->GetNumberOfPoints() == 128 &&
-                    data->GetNumberOfCells() == 54,
+                    data->GetNumberOfCells() == 0,
                 "Multi-file Nek element maps were not canonicalized by global id.");
         vtkDataArray* weights = data->GetPointData()->GetArray(
             io::kNek5000QuadratureWeightArray);
@@ -444,6 +744,23 @@ void ValidateMultiFileNek(const fs::path& descriptor) {
         data->GetPoint(64, point);
         Require(NearlyEqual(point[0], 2.0),
                 "Canonical Nek element 200 was not placed second.");
+        for (int k = 0; k < 4; ++k) {
+            for (int j = 0; j < 4; ++j) {
+                const vtkIdType leftInterfacePoint = static_cast<vtkIdType>(
+                    Index(3, j, k, 4, 4));
+                const vtkIdType rightInterfacePoint = static_cast<vtkIdType>(
+                    64 + Index(0, j, k, 4, 4));
+                double leftCoordinate[3] = {};
+                double rightCoordinate[3] = {};
+                data->GetPoint(leftInterfacePoint, leftCoordinate);
+                data->GetPoint(rightInterfacePoint, rightCoordinate);
+                Require(leftInterfacePoint != rightInterfacePoint &&
+                            NearlyEqual(leftCoordinate[0], rightCoordinate[0]) &&
+                            NearlyEqual(leftCoordinate[1], rightCoordinate[1]) &&
+                            NearlyEqual(leftCoordinate[2], rightCoordinate[2]),
+                        "Canonical Nek data merged interface GLL degrees of freedom.");
+            }
+        }
     }
     Require(io::HasSameNek5000SpectralGeometry(first, second),
             "Repartitioned multi-file Nek frames lost canonical spectral geometry.");
@@ -452,6 +769,135 @@ void ValidateMultiFileNek(const fs::path& descriptor) {
                 NearlyEqual(secondPressure->GetComponent(0, 0), 4.0) &&
                 NearlyEqual(secondPressure->GetComponent(64, 0), 6.0),
             "Repartitioned multi-file Nek fields were not scattered by global id.");
+
+    const io::Nek5000SpectralDisplayProxy proxy =
+        io::CreateNek5000SpectralDisplayProxy(first);
+    Require(proxy.exteriorSurface != nullptr && proxy.gllNodes != nullptr &&
+                proxy.gllNodes->GetNumberOfPoints() == first->GetNumberOfPoints(),
+            "The multi-element SEM display proxy lost unmerged local GLL nodes.");
+    vtkDataArray* exteriorElements = proxy.exteriorSurface->GetCellData()->GetArray(
+        io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* exteriorFaces = proxy.exteriorSurface->GetCellData()->GetArray(
+        io::kNek5000DisplayFaceIdArray);
+    Require(exteriorElements != nullptr && exteriorFaces != nullptr,
+            "The multi-element exterior proxy lost element-face provenance.");
+    std::set<std::pair<int, int>> exteriorFacePairs;
+    for (vtkIdType cellId = 0; cellId < proxy.exteriorSurface->GetNumberOfCells(); ++cellId) {
+        exteriorFacePairs.emplace(
+            static_cast<int>(exteriorElements->GetComponent(cellId, 0)),
+            static_cast<int>(exteriorFaces->GetComponent(cellId, 0)));
+    }
+    Require(exteriorFacePairs.size() == 10,
+            "The SEM exterior proxy did not remove exactly the paired internal face.");
+}
+
+fs::path CreateThreeConversionNekFixture(const fs::path& root) {
+    const fs::path directory = root / "nek5000-three-conversion";
+    fs::create_directories(directory / "A0");
+    fs::create_directories(directory / "A1");
+    {
+        std::ofstream descriptor(directory / "three.nek5000");
+        descriptor << "filetemplate: A%01d/three%01d.f%05d\n"
+                   << "firsttimestep: 7\n"
+                   << "numtimesteps: 2\n";
+    }
+    WriteNekField(directory / "A0" / "three0.f00007", 7, true, true,
+                  200, 0, 2, 2, 2.0);
+    WriteNekField(directory / "A1" / "three1.f00007", 7, true, true,
+                  100, 1, 2, 2, 0.0);
+    WriteNekField(directory / "A0" / "three0.f00008", 8, false, true,
+                  100, 0, 2, 2, 0.0);
+    WriteNekField(directory / "A1" / "three1.f00008", 8, false, true,
+                  200, 1, 2, 2, 2.0);
+    return directory / "three.nek5000";
+}
+
+void ValidateThreeConversionNek(const fs::path& descriptor) {
+    const std::vector<io::DataSetFrame> frames =
+        io::EnumerateDataSetFrames(descriptor);
+    Require(frames.size() == 2 && frames[0].sourceIndex == 0 &&
+                frames[1].sourceIndex == 1 && frames[0].readerTime.has_value() &&
+                frames[1].readerTime.has_value() &&
+                NearlyEqual(frames[0].readerTime.value(), 1.75) &&
+                NearlyEqual(frames[1].readerTime.value(), 2.0),
+            "Three-conversion Nek enumeration lost non-zero firsttimestep or frame identity.");
+    Require(frames[0].coordinateSourceIndex == 0 &&
+                frames[1].coordinateSourceIndex == 0 &&
+                frames[1].coordinatePath.filename() == "three0.f00007" &&
+                frames[1].coordinatePath.parent_path().filename() == "A0",
+            "Three-conversion Nek enumeration did not retain its external coordinate field.");
+
+    vtkSmartPointer<vtkDataSet> first = io::ReadDataSet(frames[0]);
+    vtkSmartPointer<vtkDataSet> second = io::ReadDataSet(frames[1]);
+    vtkDataArray* pressure = second->GetPointData()->GetArray("Pressure");
+    Require(io::HasSameNek5000SpectralGeometry(first, second) &&
+                io::GetNek5000SpectralMetadata(second).elementIds ==
+                    std::vector<int>({100, 200}) &&
+                pressure != nullptr && NearlyEqual(pressure->GetComponent(0, 0), 11.0) &&
+                NearlyEqual(pressure->GetComponent(64, 0), 13.0),
+            "Three-conversion Nek fields or reused coordinates were not assembled by global id.");
+}
+
+void ValidateAmbiguousOverlappingFacesStayVisible() {
+    constexpr int elements = 2;
+    constexpr int pointsPerElement = 8;
+    vtkNew<vtkPoints> points;
+    points->SetDataTypeToDouble();
+    points->SetNumberOfPoints(elements * pointsPerElement);
+    vtkNew<vtkDoubleArray> scalar;
+    scalar->SetName("OverlappingField");
+    scalar->SetNumberOfTuples(elements * pointsPerElement);
+    for (int element = 0; element < elements; ++element) {
+        for (int k = 0; k < 2; ++k) {
+            for (int j = 0; j < 2; ++j) {
+                for (int i = 0; i < 2; ++i) {
+                    const vtkIdType pointId = static_cast<vtkIdType>(
+                        element * pointsPerElement + Index(i, j, k, 2, 2));
+                    points->SetPoint(pointId, i, j, k);
+                    scalar->SetValue(pointId, i + 2.0 * j + 3.0 * k);
+                }
+            }
+        }
+    }
+    vtkSmartPointer<vtkUnstructuredGrid> canonical =
+        vtkSmartPointer<vtkUnstructuredGrid>::New();
+    canonical->SetPoints(points);
+    canonical->GetPointData()->AddArray(scalar);
+    vtkNew<vtkIntArray> dimensions;
+    dimensions->SetName(io::kNek5000GllDimensionsField);
+    dimensions->SetNumberOfComponents(3);
+    dimensions->InsertNextTuple3(2, 2, 2);
+    canonical->GetFieldData()->AddArray(dimensions);
+    vtkNew<vtkIntArray> count;
+    count->SetName(io::kNek5000ElementCountField);
+    count->InsertNextValue(elements);
+    canonical->GetFieldData()->AddArray(count);
+    vtkNew<vtkIntArray> elementIds;
+    elementIds->SetName(io::kNek5000ElementIdsField);
+    elementIds->InsertNextValue(10);
+    elementIds->InsertNextValue(11);
+    canonical->GetFieldData()->AddArray(elementIds);
+
+    const io::Nek5000SpectralDisplayProxy proxy =
+        io::CreateNek5000SpectralDisplayProxy(canonical);
+    Require(proxy.exteriorSurface != nullptr,
+            "The overlapping-face fixture did not create an exterior proxy.");
+    vtkDataArray* exteriorElements = proxy.exteriorSurface->GetCellData()->GetArray(
+        io::kNek5000DisplayElementIndexArray);
+    vtkDataArray* exteriorFaces = proxy.exteriorSurface->GetCellData()->GetArray(
+        io::kNek5000DisplayFaceIdArray);
+    Require(exteriorElements != nullptr && exteriorFaces != nullptr,
+            "The overlapping-face exterior proxy lost provenance.");
+    std::set<std::pair<int, int>> exteriorFacePairs;
+    for (vtkIdType cellId = 0; cellId < proxy.exteriorSurface->GetNumberOfCells();
+         ++cellId) {
+        exteriorFacePairs.emplace(
+            static_cast<int>(exteriorElements->GetComponent(cellId, 0)),
+            static_cast<int>(exteriorFaces->GetComponent(cellId, 0)));
+    }
+    Require(exteriorFacePairs.size() == 12,
+            "Coincident overlapping SEM faces were incorrectly hidden as an "
+            "ordinary interior interface.");
 }
 
 fs::path CreateNek2DFixture(const fs::path& root) {
@@ -505,8 +951,8 @@ void ValidateNek2D(const fs::path& descriptor) {
     const io::Nek5000SpectralMetadata metadata =
         io::GetNek5000SpectralMetadata(data);
     Require(metadata.nx == 4 && metadata.ny == 3 && metadata.nz == 1 &&
-                data->GetNumberOfPoints() == 12 && data->GetNumberOfCells() == 6,
-            "Synthetic 2-D Nek topology or tensor dimensions are incorrect.");
+                data->GetNumberOfPoints() == 12 && data->GetNumberOfCells() == 0,
+            "Synthetic 2-D Nek canonical topology or tensor dimensions are incorrect.");
     vtkDataArray* velocity = data->GetPointData()->GetArray("Velocity");
     vtkDataArray* pressure = data->GetPointData()->GetArray("Pressure");
     vtkDataArray* weights =
@@ -907,6 +1353,8 @@ int main() {
         ValidateNek(CreateNekFixture(root));
         ValidateNekFloat(CreateNekFloatFixture(root));
         ValidateMultiFileNek(CreateMultiFileNekFixture(root));
+        ValidateThreeConversionNek(CreateThreeConversionNekFixture(root));
+        ValidateAmbiguousOverlappingFacesStayVisible();
         ValidateNek2D(CreateNek2DFixture(root));
         ValidateCurvedNekMetrics();
         ValidateConservativeCurvedNekBounds();

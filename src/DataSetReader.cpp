@@ -4,12 +4,18 @@
 #include <streamcenterplus/VtkHdfIO.h>
 
 #include <vtkAppendFilter.h>
+#include <vtkBox.h>
 #include <vtkCell.h>
 #include <vtkCellData.h>
+#include <vtkCellArray.h>
 #include <vtkCellSizeFilter.h>
 #include <vtkCellType.h>
 #include <vtkCallbackCommand.h>
+#include <vtkClipDataSet.h>
+#include <vtkContourFilter.h>
+#include <vtkCutter.h>
 #include <vtkDataSetAttributes.h>
+#include <vtkDataSetSurfaceFilter.h>
 #include <vtkCompositeDataIterator.h>
 #include <vtkCompositeDataSet.h>
 #include <vtkDataArray.h>
@@ -26,11 +32,16 @@
 #include <vtkIdList.h>
 #include <vtkIntArray.h>
 #include <vtkNew.h>
+#include <vtkNonMergingPointLocator.h>
 #include <vtkOpenFOAMReader.h>
 #include <vtkPOpenFOAMReader.h>
+#include <vtkPlane.h>
 #include <vtkPointData.h>
 #include <vtkPoints.h>
 #include <vtkPointSet.h>
+#include <vtkPolyData.h>
+#include <vtkPolyDataNormals.h>
+#include <vtkRemoveUnusedPoints.h>
 #include <vtkSmartPointer.h>
 #include <vtkSMPTools.h>
 #include <vtkStreamingDemandDrivenPipeline.h>
@@ -582,14 +593,13 @@ int ResolveMultiZoneBackground(const MultiZoneManifest& manifest,
         ReadOptions geometryOnly;
         geometryOnly.readAllArrays = false;
         geometryOnly.attachSourceBlockIds = false;
-        geometryOnly.attachNek5000SpectralMetadata = false;
-        // Nek5000 normally skips its linearized cells for this lightweight
-        // geometry read.  Automatic reference selection needs physical cell
-        // measures, however, so build them only when either source is Nek.
-        geometryOnly.buildNek5000LinearizedTopology =
+        const bool nativeNekSource =
             first.front().kind == DataSetFrameKind::Nek5000TimeStep ||
             second.front().kind == DataSetFrameKind::Nek5000TimeStep;
-        geometryOnly.attachNek5000QuadratureArrays = false;
+        // Native Nek5000 reference measures come from the canonical spectral
+        // quadrature arrays, never from invented GLL-to-GLL VTK cells.
+        geometryOnly.attachNek5000SpectralMetadata = nativeNekSource;
+        geometryOnly.attachNek5000QuadratureArrays = nativeNekSource;
         geometryOnly.failOnVtkXmlReadErrors = true;
         vtkSmartPointer<vtkDataSet> firstReference =
             ReadDataSet(first.front(), geometryOnly);
@@ -1302,7 +1312,36 @@ void RequireSameReferenceGeometry(vtkDataSet* reference,
 }
 
 std::optional<MeshReferenceMeasure> ComputeMeshReferenceMeasure(vtkDataSet* dataSet) {
-    if (dataSet == nullptr || dataSet->GetNumberOfCells() <= 0) {
+    if (dataSet == nullptr) {
+        return std::nullopt;
+    }
+
+    if (HasNek5000SpectralMetadata(dataSet) &&
+        !IsNek5000SpectralDisplayProxy(dataSet)) {
+        const Nek5000SpectralMetadata metadata =
+            GetNek5000SpectralMetadata(dataSet);
+        vtkDataArray* weights = dataSet->GetPointData() == nullptr
+            ? nullptr
+            : dataSet->GetPointData()->GetArray(kNek5000QuadratureWeightArray);
+        if (weights == nullptr || weights->GetNumberOfComponents() != 1 ||
+            weights->GetNumberOfTuples() != dataSet->GetNumberOfPoints()) {
+            return std::nullopt;
+        }
+        double measure = 0.0;
+        for (vtkIdType pointId = 0; pointId < weights->GetNumberOfTuples(); ++pointId) {
+            const double weight = weights->GetComponent(pointId, 0);
+            if (!std::isfinite(weight) || weight < 0.0) {
+                return std::nullopt;
+            }
+            measure += weight;
+        }
+        if (!std::isfinite(measure) || measure <= 0.0) {
+            return std::nullopt;
+        }
+        return MeshReferenceMeasure{metadata.is3D() ? 3 : 2, measure};
+    }
+
+    if (dataSet->GetNumberOfCells() <= 0) {
         return std::nullopt;
     }
 
@@ -2302,9 +2341,10 @@ int ValidateNekPrintfTemplate(const std::string& format) {
         }
         ++conversions;
     }
-    if (conversions < 1 || conversions > 2) {
+    if (conversions < 1 || conversions > 3) {
         throw std::runtime_error(
-            "Nek5000 filetemplate must contain one timestep conversion or file/timestep conversions.");
+            "Nek5000 filetemplate must contain one timestep conversion, "
+            "file/timestep conversions, or directory/file/timestep conversions.");
     }
     return conversions;
 }
@@ -2361,11 +2401,18 @@ std::filesystem::path FormatNekFieldPath(const NekDescriptor& descriptor,
                                          int fileIndex) {
     const int timeStep = descriptor.firstTimeStep + relativeFrameIndex;
     std::array<char, 4096> buffer{};
-    const int written = descriptor.integerConversions == 2
-                            ? std::snprintf(buffer.data(), buffer.size(),
-                                            descriptor.fileTemplate.c_str(), fileIndex, timeStep)
-                            : std::snprintf(buffer.data(), buffer.size(),
-                                            descriptor.fileTemplate.c_str(), timeStep);
+    int written = 0;
+    if (descriptor.integerConversions == 3) {
+        written = std::snprintf(buffer.data(), buffer.size(),
+                                descriptor.fileTemplate.c_str(),
+                                fileIndex, fileIndex, timeStep);
+    } else if (descriptor.integerConversions == 2) {
+        written = std::snprintf(buffer.data(), buffer.size(),
+                                descriptor.fileTemplate.c_str(), fileIndex, timeStep);
+    } else {
+        written = std::snprintf(buffer.data(), buffer.size(),
+                                descriptor.fileTemplate.c_str(), timeStep);
+    }
     if (written < 0 || static_cast<std::size_t>(written) >= buffer.size()) {
         throw std::runtime_error("Nek5000 filetemplate produced an invalid path.");
     }
@@ -2519,7 +2566,7 @@ std::vector<NekFieldMeta> ReadNekPieceSet(const NekDescriptor& descriptor,
                                           int relativeFrameIndex) {
     NekFieldMeta first =
         ReadNekHeader(FormatNekFieldPath(descriptor, relativeFrameIndex, 0));
-    if (first.fileCount > 1 && descriptor.integerConversions != 2) {
+    if (first.fileCount > 1 && descriptor.integerConversions < 2) {
         throw std::runtime_error(
             "Multi-file Nek5000 output requires filetemplate to contain file and timestep conversions.");
     }
@@ -3437,64 +3484,6 @@ vtkSmartPointer<vtkDataSet> ReadNek5000(const DataSetFrame& frame,
     vtkSmartPointer<vtkUnstructuredGrid> grid =
         vtkSmartPointer<vtkUnstructuredGrid>::New();
     grid->SetPoints(points);
-
-    if (options.buildNek5000LinearizedTopology) {
-        const std::size_t cellsPerElement =
-            static_cast<std::size_t>(metadata.nx - 1) *
-            static_cast<std::size_t>(metadata.ny - 1) *
-            static_cast<std::size_t>(metadata.is3D() ? metadata.nz - 1 : 1);
-        const std::size_t cellCount = metadata.elementCount * cellsPerElement;
-        if (cellCount >
-            static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max())) {
-            throw std::runtime_error(
-                "Nek5000 linearized cell count exceeds VTK limits.");
-        }
-        grid->Allocate(static_cast<vtkIdType>(cellCount));
-        vtkNew<vtkIntArray> spectralIds;
-        spectralIds->SetName(kNek5000SpectralElementIdArray);
-        spectralIds->SetNumberOfTuples(static_cast<vtkIdType>(cellCount));
-        vtkIdType cellIndex = 0;
-        const std::size_t nxyz = metadata.pointsPerElement();
-        for (std::size_t element = 0; element < metadata.elementCount; ++element) {
-            const vtkIdType base = static_cast<vtkIdType>(element * nxyz);
-            if (metadata.is3D()) {
-                for (int k = 0; k < metadata.nz - 1; ++k) {
-                    for (int j = 0; j < metadata.ny - 1; ++j) {
-                        for (int i = 0; i < metadata.nx - 1; ++i) {
-                            vtkIdType ids[8] = {
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j, k)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j, k)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j + 1, k)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j + 1, k)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j, k + 1)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j, k + 1)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j + 1, k + 1)),
-                                base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j + 1, k + 1)),
-                            };
-                            grid->InsertNextCell(VTK_HEXAHEDRON, 8, ids);
-                            spectralIds->SetValue(cellIndex++,
-                                                  metadata.elementIds[element]);
-                        }
-                    }
-                }
-            } else {
-                for (int j = 0; j < metadata.ny - 1; ++j) {
-                    for (int i = 0; i < metadata.nx - 1; ++i) {
-                        vtkIdType ids[4] = {
-                            base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j, 0)),
-                            base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j, 0)),
-                            base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i + 1, j + 1, 0)),
-                            base + static_cast<vtkIdType>(NekLocalIndex(metadata.nx, metadata.ny, i, j + 1, 0)),
-                        };
-                        grid->InsertNextCell(VTK_QUAD, 4, ids);
-                        spectralIds->SetValue(cellIndex++,
-                                              metadata.elementIds[element]);
-                    }
-                }
-            }
-        }
-        grid->GetCellData()->AddArray(spectralIds);
-    }
 
     if (options.readAllArrays) {
         const std::string code = dataPieces.front().code;
@@ -4491,7 +4480,10 @@ struct Nek5000SpectralPointEvaluator::Impl {
         return found;
     }
 
-    bool Evaluate(const double point[3], double* tuple, int* elementHint) const {
+    bool Evaluate(const double point[3],
+                  double* tuple,
+                  int* elementHint,
+                  std::array<double, 3>* referencePoint) const {
         if (point == nullptr || tuple == nullptr || !std::isfinite(point[0]) ||
             !std::isfinite(point[1]) || !std::isfinite(point[2])) {
             return false;
@@ -4507,6 +4499,9 @@ struct Nek5000SpectralPointEvaluator::Impl {
                            tuple);
             if (elementHint != nullptr) {
                 *elementHint = static_cast<int>(element);
+            }
+            if (referencePoint != nullptr) {
+                *referencePoint = reference;
             }
             return true;
         };
@@ -4553,6 +4548,9 @@ struct Nek5000SpectralPointEvaluator::Impl {
         }
         if (elementHint != nullptr) {
             *elementHint = -1;
+        }
+        if (referencePoint != nullptr) {
+            referencePoint->fill(0.0);
         }
         return false;
     }
@@ -4606,10 +4604,81 @@ Nek5000SpectralPointEvaluator::WithPointArray(vtkDataArray* pointArray) const {
         std::make_shared<Impl>(std::move(geometry), pointArray));
 }
 
+bool Nek5000SpectralPointEvaluator::EvaluateReference(
+    std::size_t elementIndex,
+    const double referencePoint[3],
+    double* tuple) const {
+    if (impl_ == nullptr || referencePoint == nullptr || tuple == nullptr) {
+        return false;
+    }
+    const Impl& geometry = impl_->Geometry();
+    if (elementIndex >= geometry.metadata.elementCount) {
+        return false;
+    }
+    const double tolerance = geometry.options.referenceTolerance;
+    std::array<double, 3> reference = {
+        referencePoint[0], referencePoint[1],
+        geometry.metadata.is3D() ? referencePoint[2] : 0.0};
+    for (int axis = 0; axis < (geometry.metadata.is3D() ? 3 : 2); ++axis) {
+        if (!std::isfinite(reference[static_cast<std::size_t>(axis)]) ||
+            reference[static_cast<std::size_t>(axis)] < -1.0 - tolerance ||
+            reference[static_cast<std::size_t>(axis)] > 1.0 + tolerance) {
+            return false;
+        }
+        reference[static_cast<std::size_t>(axis)] = std::clamp(
+            reference[static_cast<std::size_t>(axis)], -1.0, 1.0);
+    }
+    impl_->EvaluateTensor(elementIndex, reference, nullptr, nullptr, nullptr,
+                          nullptr, tuple);
+    return true;
+}
+
 bool Nek5000SpectralPointEvaluator::Evaluate(const double physicalPoint[3],
                                              double* tuple,
                                              int* elementHint) const {
-    return impl_ != nullptr && impl_->Evaluate(physicalPoint, tuple, elementHint);
+    return impl_ != nullptr &&
+           impl_->Evaluate(physicalPoint, tuple, elementHint, nullptr);
+}
+
+bool Nek5000SpectralPointEvaluator::EvaluateWithReference(
+    const double physicalPoint[3],
+    double* tuple,
+    int* elementHint,
+    std::array<double, 3>* referencePoint) const {
+    return impl_ != nullptr && impl_->Evaluate(physicalPoint, tuple, elementHint,
+                                                referencePoint);
+}
+
+bool Nek5000SpectralPointEvaluator::EvaluateGeometryReference(
+    std::size_t elementIndex,
+    const double referencePoint[3],
+    std::array<double, 3>* physicalPoint,
+    std::array<double, 3>* derivativeR,
+    std::array<double, 3>* derivativeS,
+    std::array<double, 3>* derivativeT) const {
+    if (impl_ == nullptr || referencePoint == nullptr || physicalPoint == nullptr) {
+        return false;
+    }
+    const Impl& geometry = impl_->Geometry();
+    if (elementIndex >= geometry.metadata.elementCount) {
+        return false;
+    }
+    std::array<double, 3> reference = {
+        referencePoint[0], referencePoint[1],
+        geometry.metadata.is3D() ? referencePoint[2] : 0.0};
+    const double tolerance = geometry.options.referenceTolerance;
+    for (int axis = 0; axis < (geometry.metadata.is3D() ? 3 : 2); ++axis) {
+        if (!std::isfinite(reference[static_cast<std::size_t>(axis)]) ||
+            reference[static_cast<std::size_t>(axis)] < -1.0 - tolerance ||
+            reference[static_cast<std::size_t>(axis)] > 1.0 + tolerance) {
+            return false;
+        }
+        reference[static_cast<std::size_t>(axis)] = std::clamp(
+            reference[static_cast<std::size_t>(axis)], -1.0, 1.0);
+    }
+    impl_->EvaluateTensor(elementIndex, reference, physicalPoint, derivativeR,
+                          derivativeS, derivativeT, nullptr);
+    return true;
 }
 
 std::string ToString(DataSetFrameKind kind) {
@@ -4887,6 +4956,1562 @@ Nek5000SpectralMetadata GetNek5000SpectralMetadata(vtkDataSet* dataSet) {
         throw std::runtime_error("Dataset has inconsistent Nek5000 spectral metadata.");
     }
     return metadata;
+}
+
+namespace {
+
+constexpr const char* kSemAwareDisplayRepresentation =
+    "SEM-aware uniform-reference sampled display proxy; approximate VTK "
+    "visualization/interoperability only";
+constexpr const char* kSemAwareOperationDisplayRepresentation =
+    "SEM-aware evaluator-sampled operation display approximation; canonical "
+    "Nek5000 GLL source remains immutable and unmerged";
+
+vtkSmartPointer<vtkPoints> NewDoublePoints() {
+    vtkSmartPointer<vtkDoubleArray> coordinates =
+        vtkSmartPointer<vtkDoubleArray>::New();
+    coordinates->SetNumberOfComponents(3);
+    vtkSmartPointer<vtkPoints> points = vtkSmartPointer<vtkPoints>::New();
+    points->SetData(coordinates);
+    return points;
+}
+
+void MarkNek5000DisplayProxy(vtkDataSet* dataSet,
+                             const char* representation,
+                             const char* operation = nullptr,
+                             double maximumReferenceSpacing = 0.0,
+                             const Nek5000SpectralMetadata* metadata = nullptr) {
+    if (dataSet == nullptr) {
+        throw std::runtime_error("Cannot mark a null Nek5000 display proxy.");
+    }
+    if (dataSet->GetFieldData() == nullptr) {
+        vtkNew<vtkFieldData> createdFieldData;
+        dataSet->SetFieldData(createdFieldData);
+    }
+    vtkFieldData* fieldData = dataSet->GetFieldData();
+    fieldData->RemoveArray(kNek5000DisplayProxyField);
+    fieldData->RemoveArray(kNek5000DisplayRepresentationField);
+    fieldData->RemoveArray(kNek5000DisplayOperationField);
+    fieldData->RemoveArray(kNek5000DisplayReferenceSpacingField);
+    fieldData->RemoveArray(kNek5000DisplaySourceElementIdsField);
+    vtkNew<vtkStringArray> marker;
+    marker->SetName(kNek5000DisplayProxyField);
+    marker->InsertNextValue("1");
+    fieldData->AddArray(marker);
+
+    vtkNew<vtkStringArray> description;
+    description->SetName(kNek5000DisplayRepresentationField);
+    description->InsertNextValue(representation);
+    fieldData->AddArray(description);
+
+    if (operation != nullptr) {
+        vtkNew<vtkStringArray> operationName;
+        operationName->SetName(kNek5000DisplayOperationField);
+        operationName->InsertNextValue(operation);
+        fieldData->AddArray(operationName);
+    }
+    if (maximumReferenceSpacing > 0.0 &&
+        std::isfinite(maximumReferenceSpacing)) {
+        vtkNew<vtkDoubleArray> spacing;
+        spacing->SetName(kNek5000DisplayReferenceSpacingField);
+        spacing->SetNumberOfComponents(1);
+        spacing->InsertNextValue(maximumReferenceSpacing);
+        fieldData->AddArray(spacing);
+    }
+    if (metadata != nullptr) {
+        vtkNew<vtkIntArray> sourceElements;
+        sourceElements->SetName(kNek5000DisplaySourceElementIdsField);
+        sourceElements->SetNumberOfComponents(1);
+        sourceElements->SetNumberOfTuples(
+            static_cast<vtkIdType>(metadata->elementIds.size()));
+        for (std::size_t index = 0; index < metadata->elementIds.size(); ++index) {
+            sourceElements->SetValue(static_cast<vtkIdType>(index),
+                                     metadata->elementIds[index]);
+        }
+        fieldData->AddArray(sourceElements);
+    }
+}
+
+bool IsNek5000DisplayDiagnosticArray(const char* name) {
+    if (name == nullptr) {
+        return true;
+    }
+    return std::strcmp(name, kNek5000ReferenceWeightArray) == 0 ||
+           std::strcmp(name, kNek5000JacobianDeterminantArray) == 0 ||
+           std::strcmp(name, kNek5000QuadratureWeightArray) == 0 ||
+           std::strcmp(name, kNek5000SpectralElementIdArray) == 0 ||
+           std::strcmp(name, kNek5000DisplayElementIdArray) == 0 ||
+           std::strcmp(name, kNek5000DisplayElementIndexArray) == 0 ||
+           std::strcmp(name, kNek5000DisplayLocalGllIndexArray) == 0 ||
+           std::strcmp(name, kNek5000DisplayReferenceCoordinatesArray) == 0 ||
+           std::strcmp(name, kNek5000DisplayFaceIdArray) == 0;
+}
+
+int SampleCountForGllAxis(int gllCount,
+                           const Nek5000SpectralDisplayOptions& options) {
+    if (gllCount < 1 || options.samplesPerGllInterval < 1 ||
+        options.maxSamplesPerAxis < 2) {
+        throw std::runtime_error(
+            "Invalid Nek5000 spectral display sampling options.");
+    }
+    if (gllCount == 1) {
+        return 1;
+    }
+    const long long desired =
+        static_cast<long long>(gllCount - 1) *
+            static_cast<long long>(options.samplesPerGllInterval) +
+        1LL;
+    return static_cast<int>(std::min<long long>(
+        desired, static_cast<long long>(options.maxSamplesPerAxis)));
+}
+
+double UniformReferenceCoordinate(int index, int count) {
+    if (count <= 1) {
+        return 0.0;
+    }
+    if (index == 0) {
+        return -1.0;
+    }
+    if (index == count - 1) {
+        return 1.0;
+    }
+    return -1.0 + 2.0 * static_cast<double>(index) /
+                      static_cast<double>(count - 1);
+}
+
+std::size_t SampleLocalIndex(int nx, int ny, int i, int j, int k) {
+    return NekLocalIndex(nx, ny, i, j, k);
+}
+
+struct NekDisplayCellProvenance {
+    vtkSmartPointer<vtkIntArray> elementIds = vtkSmartPointer<vtkIntArray>::New();
+    vtkSmartPointer<vtkIntArray> elementIndices =
+        vtkSmartPointer<vtkIntArray>::New();
+    vtkSmartPointer<vtkIntArray> faceIds = vtkSmartPointer<vtkIntArray>::New();
+
+    NekDisplayCellProvenance() {
+        elementIds->SetName(kNek5000DisplayElementIdArray);
+        elementIndices->SetName(kNek5000DisplayElementIndexArray);
+        faceIds->SetName(kNek5000DisplayFaceIdArray);
+    }
+
+    void Add(const Nek5000SpectralMetadata& metadata,
+             std::size_t elementIndex,
+             int faceId) {
+        elementIds->InsertNextValue(metadata.elementIds.at(elementIndex));
+        elementIndices->InsertNextValue(static_cast<int>(elementIndex));
+        faceIds->InsertNextValue(faceId);
+    }
+
+    void Attach(vtkDataSet* dataSet) const {
+        dataSet->GetCellData()->AddArray(elementIds);
+        dataSet->GetCellData()->AddArray(elementIndices);
+        dataSet->GetCellData()->AddArray(faceIds);
+    }
+};
+
+class NekDisplayPointWriter {
+public:
+    NekDisplayPointWriter(vtkPointSet* output,
+                          vtkDataSet* canonicalDataSet,
+                          const Nek5000SpectralMetadata& metadata,
+                          const Nek5000SpectralPointEvaluator& geometryEvaluator,
+                          bool interpolateFields)
+        : output_(output),
+          metadata_(metadata),
+          geometryEvaluator_(geometryEvaluator),
+          gllNodes_{GllNodes(metadata.nx), GllNodes(metadata.ny),
+                    metadata.is3D() ? GllNodes(metadata.nz)
+                                    : std::vector<double>{0.0}} {
+        if (output_ == nullptr || output_->GetPoints() == nullptr ||
+            canonicalDataSet == nullptr) {
+            throw std::runtime_error(
+                "Cannot create a Nek5000 display proxy without points.");
+        }
+        elementIds_ = vtkSmartPointer<vtkIntArray>::New();
+        elementIds_->SetName(kNek5000DisplayElementIdArray);
+        elementIndices_ = vtkSmartPointer<vtkIntArray>::New();
+        elementIndices_->SetName(kNek5000DisplayElementIndexArray);
+        localGllIndices_ = vtkSmartPointer<vtkIntArray>::New();
+        localGllIndices_->SetName(kNek5000DisplayLocalGllIndexArray);
+        referenceCoordinates_ = vtkSmartPointer<vtkDoubleArray>::New();
+        referenceCoordinates_->SetName(kNek5000DisplayReferenceCoordinatesArray);
+        referenceCoordinates_->SetNumberOfComponents(3);
+        faceIds_ = vtkSmartPointer<vtkIntArray>::New();
+        faceIds_->SetName(kNek5000DisplayFaceIdArray);
+
+        if (interpolateFields) {
+            vtkPointData* pointData = canonicalDataSet->GetPointData();
+            for (int index = 0; pointData != nullptr &&
+                                index < pointData->GetNumberOfArrays();
+                 ++index) {
+                vtkDataArray* input = pointData->GetArray(index);
+                const char* name = input == nullptr ? nullptr : input->GetName();
+                if (input == nullptr || name == nullptr ||
+                    input->GetNumberOfComponents() < 1 ||
+                    input->GetNumberOfTuples() !=
+                        canonicalDataSet->GetNumberOfPoints() ||
+                    IsNek5000DisplayDiagnosticArray(name)) {
+                    continue;
+                }
+                vtkSmartPointer<vtkDoubleArray> values =
+                    vtkSmartPointer<vtkDoubleArray>::New();
+                values->SetName(name);
+                values->SetNumberOfComponents(input->GetNumberOfComponents());
+                output_->GetPointData()->AddArray(values);
+                fields_.emplace_back(geometryEvaluator_.WithPointArray(input),
+                                     std::move(values));
+            }
+        }
+        output_->GetPointData()->AddArray(elementIds_);
+        output_->GetPointData()->AddArray(elementIndices_);
+        output_->GetPointData()->AddArray(localGllIndices_);
+        output_->GetPointData()->AddArray(referenceCoordinates_);
+        output_->GetPointData()->AddArray(faceIds_);
+    }
+
+    vtkIdType Add(std::size_t elementIndex,
+                  const std::array<double, 3>& referencePoint,
+                  int knownLocalGllIndex = -1,
+                  int faceId = -1) {
+        std::array<double, 3> physicalPoint{};
+        if (!geometryEvaluator_.EvaluateReference(elementIndex,
+                                                  referencePoint.data(),
+                                                  physicalPoint.data())) {
+            throw std::runtime_error(
+                "Failed to evaluate a Nek5000 display-proxy coordinate.");
+        }
+        const vtkIdType id = output_->GetPoints()->InsertNextPoint(
+            physicalPoint.data());
+        for (Field& field : fields_) {
+            std::vector<double> tuple(
+                static_cast<std::size_t>(field.evaluator.numberOfComponents()));
+            if (!field.evaluator.EvaluateReference(elementIndex,
+                                                    referencePoint.data(),
+                                                    tuple.data())) {
+                throw std::runtime_error(
+                    "Failed to evaluate a Nek5000 display-proxy field.");
+            }
+            field.values->InsertNextTuple(tuple.data());
+        }
+        elementIds_->InsertNextValue(metadata_.elementIds.at(elementIndex));
+        elementIndices_->InsertNextValue(static_cast<int>(elementIndex));
+        localGllIndices_->InsertNextValue(
+            knownLocalGllIndex >= 0 ? knownLocalGllIndex
+                                    : LocalGllIndex(referencePoint));
+        referenceCoordinates_->InsertNextTuple(referencePoint.data());
+        faceIds_->InsertNextValue(faceId);
+        return id;
+    }
+
+private:
+    struct Field {
+        Field(Nek5000SpectralPointEvaluator inputEvaluator,
+              vtkSmartPointer<vtkDoubleArray> inputValues)
+            : evaluator(std::move(inputEvaluator)),
+              values(std::move(inputValues)) {}
+
+        Nek5000SpectralPointEvaluator evaluator;
+        vtkSmartPointer<vtkDoubleArray> values;
+    };
+
+    int NodeIndex(int axis, double coordinate) const {
+        const std::vector<double>& nodes = gllNodes_.at(
+            static_cast<std::size_t>(axis));
+        for (std::size_t index = 0; index < nodes.size(); ++index) {
+            if (std::abs(nodes[index] - coordinate) <=
+                64.0 * std::numeric_limits<double>::epsilon()) {
+                return static_cast<int>(index);
+            }
+        }
+        return -1;
+    }
+
+    int LocalGllIndex(const std::array<double, 3>& referencePoint) const {
+        const int i = NodeIndex(0, referencePoint[0]);
+        const int j = NodeIndex(1, referencePoint[1]);
+        const int k = metadata_.is3D() ? NodeIndex(2, referencePoint[2]) : 0;
+        if (i < 0 || j < 0 || k < 0) {
+            return -1;
+        }
+        return static_cast<int>(NekLocalIndex(metadata_.nx, metadata_.ny, i, j, k));
+    }
+
+    vtkPointSet* output_ = nullptr;
+    const Nek5000SpectralMetadata& metadata_;
+    Nek5000SpectralPointEvaluator geometryEvaluator_;
+    std::array<std::vector<double>, 3> gllNodes_;
+    std::vector<Field> fields_;
+    vtkSmartPointer<vtkIntArray> elementIds_;
+    vtkSmartPointer<vtkIntArray> elementIndices_;
+    vtkSmartPointer<vtkIntArray> localGllIndices_;
+    vtkSmartPointer<vtkDoubleArray> referenceCoordinates_;
+    vtkSmartPointer<vtkIntArray> faceIds_;
+};
+
+int NekFaceCount(const Nek5000SpectralMetadata& metadata) {
+    return metadata.is3D() ? 6 : 4;
+}
+
+std::array<double, 3> FaceReference(const Nek5000SpectralMetadata& metadata,
+                                    int faceId,
+                                    double first,
+                                    double second = 0.0) {
+    if (!metadata.is3D()) {
+        switch (faceId) {
+        case 0:
+            return {-1.0, first, 0.0};
+        case 1:
+            return {1.0, first, 0.0};
+        case 2:
+            return {first, -1.0, 0.0};
+        case 3:
+            return {first, 1.0, 0.0};
+        default:
+            throw std::runtime_error("Invalid 2D Nek5000 face id.");
+        }
+    }
+    switch (faceId) {
+    case 0:
+        return {-1.0, first, second};
+    case 1:
+        return {1.0, first, second};
+    case 2:
+        return {first, -1.0, second};
+    case 3:
+        return {first, 1.0, second};
+    case 4:
+        return {first, second, -1.0};
+    case 5:
+        return {first, second, 1.0};
+    default:
+        throw std::runtime_error("Invalid 3D Nek5000 face id.");
+    }
+}
+
+std::array<int, 2> FaceSampleDimensions(const Nek5000SpectralMetadata& metadata,
+                                        int faceId,
+                                        int samplesX,
+                                        int samplesY,
+                                        int samplesZ) {
+    if (!metadata.is3D()) {
+        return (faceId == 0 || faceId == 1)
+                   ? std::array<int, 2>{samplesY, 1}
+                   : std::array<int, 2>{samplesX, 1};
+    }
+    switch (faceId) {
+    case 0:
+    case 1:
+        return {samplesY, samplesZ};
+    case 2:
+    case 3:
+        return {samplesX, samplesZ};
+    case 4:
+    case 5:
+        return {samplesX, samplesY};
+    default:
+        throw std::runtime_error("Invalid Nek5000 face id.");
+    }
+}
+
+std::vector<std::size_t> FaceLocalIndices(
+    const Nek5000SpectralMetadata& metadata,
+    int faceId) {
+    std::vector<std::size_t> indices;
+    const auto add = [&](int i, int j, int k) {
+        indices.push_back(NekLocalIndex(metadata.nx, metadata.ny, i, j, k));
+    };
+    if (!metadata.is3D()) {
+        if (faceId == 0 || faceId == 1) {
+            const int i = faceId == 0 ? 0 : metadata.nx - 1;
+            for (int j = 0; j < metadata.ny; ++j) {
+                add(i, j, 0);
+            }
+        } else {
+            const int j = faceId == 2 ? 0 : metadata.ny - 1;
+            for (int i = 0; i < metadata.nx; ++i) {
+                add(i, j, 0);
+            }
+        }
+        return indices;
+    }
+    if (faceId == 0 || faceId == 1) {
+        const int i = faceId == 0 ? 0 : metadata.nx - 1;
+        for (int k = 0; k < metadata.nz; ++k) {
+            for (int j = 0; j < metadata.ny; ++j) {
+                add(i, j, k);
+            }
+        }
+    } else if (faceId == 2 || faceId == 3) {
+        const int j = faceId == 2 ? 0 : metadata.ny - 1;
+        for (int k = 0; k < metadata.nz; ++k) {
+            for (int i = 0; i < metadata.nx; ++i) {
+                add(i, j, k);
+            }
+        }
+    } else {
+        const int k = faceId == 4 ? 0 : metadata.nz - 1;
+        for (int j = 0; j < metadata.ny; ++j) {
+            for (int i = 0; i < metadata.nx; ++i) {
+                add(i, j, k);
+            }
+        }
+    }
+    return indices;
+}
+
+struct NekDisplayFace {
+    std::size_t elementIndex = 0;
+    int faceId = -1;
+    std::vector<std::array<double, 3>> sortedCoordinates;
+    // Coordinates alone cannot distinguish an ordinary shared face from an
+    // overlapping or periodic copy.  This outward direction makes the
+    // display-only exterior decision conservative.
+    std::array<double, 3> outwardNormal{};
+    bool hasOutwardNormal = false;
+};
+
+std::array<double, 3> SubtractCoordinates(
+    const std::array<double, 3>& lhs,
+    const std::array<double, 3>& rhs) {
+    return {lhs[0] - rhs[0], lhs[1] - rhs[1], lhs[2] - rhs[2]};
+}
+
+std::array<double, 3> CrossCoordinates(const std::array<double, 3>& lhs,
+                                        const std::array<double, 3>& rhs) {
+    return {lhs[1] * rhs[2] - lhs[2] * rhs[1],
+            lhs[2] * rhs[0] - lhs[0] * rhs[2],
+            lhs[0] * rhs[1] - lhs[1] * rhs[0]};
+}
+
+double DotCoordinates(const std::array<double, 3>& lhs,
+                      const std::array<double, 3>& rhs) {
+    return lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2];
+}
+
+double CoordinateNorm(const std::array<double, 3>& value) {
+    return std::sqrt(DotCoordinates(value, value));
+}
+
+bool CoordinateLess(const std::array<double, 3>& lhs,
+                    const std::array<double, 3>& rhs) {
+    for (int component = 0; component < 3; ++component) {
+        if (lhs[static_cast<std::size_t>(component)] !=
+            rhs[static_cast<std::size_t>(component)]) {
+            return lhs[static_cast<std::size_t>(component)] <
+                   rhs[static_cast<std::size_t>(component)];
+        }
+    }
+    return false;
+}
+
+std::string FaceSignature(const NekDisplayFace& face, double tolerance) {
+    std::ostringstream stream;
+    stream << face.sortedCoordinates.size() << ':';
+    for (const std::array<double, 3>& point : face.sortedCoordinates) {
+        for (const double coordinate : point) {
+            if (!std::isfinite(coordinate)) {
+                throw std::runtime_error(
+                    "Nek5000 face matching requires finite coordinates.");
+            }
+            const long double scaled =
+                static_cast<long double>(coordinate) /
+                static_cast<long double>(tolerance);
+            if (std::abs(scaled) >
+                static_cast<long double>(std::numeric_limits<long long>::max() / 4)) {
+                stream << std::setprecision(17) << coordinate << ',';
+            } else {
+                stream << std::llround(scaled) << ',';
+            }
+        }
+    }
+    return stream.str();
+}
+
+bool FacesCoincide(const NekDisplayFace& lhs,
+                   const NekDisplayFace& rhs,
+                   double tolerance) {
+    if (lhs.sortedCoordinates.size() != rhs.sortedCoordinates.size()) {
+        return false;
+    }
+    for (std::size_t point = 0; point < lhs.sortedCoordinates.size(); ++point) {
+        for (int component = 0; component < 3; ++component) {
+            if (std::abs(lhs.sortedCoordinates[point][static_cast<std::size_t>(component)] -
+                         rhs.sortedCoordinates[point][static_cast<std::size_t>(component)]) >
+                tolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool FacesHaveOpposedOutwardNormals(const NekDisplayFace& lhs,
+                                    const NekDisplayFace& rhs) {
+    // A true element interface has opposing outward normals.  If the normals
+    // are unavailable or ambiguous, keep the faces visible rather than
+    // silently erasing a possible periodic or overlapping boundary.
+    return lhs.hasOutwardNormal && rhs.hasOutwardNormal &&
+           DotCoordinates(lhs.outwardNormal, rhs.outwardNormal) < -0.95;
+}
+
+std::vector<NekDisplayFace> BuildNekDisplayFaces(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata) {
+    vtkPointSet* pointSet = vtkPointSet::SafeDownCast(canonicalDataSet);
+    if (pointSet == nullptr || pointSet->GetPoints() == nullptr) {
+        throw std::runtime_error(
+            "Nek5000 display proxy requires explicit canonical point coordinates.");
+    }
+    const std::size_t pointsPerElement = metadata.pointsPerElement();
+    std::vector<NekDisplayFace> faces;
+    faces.reserve(metadata.elementCount *
+                  static_cast<std::size_t>(NekFaceCount(metadata)));
+    for (std::size_t element = 0; element < metadata.elementCount; ++element) {
+        std::array<double, 3> elementCenter{};
+        for (std::size_t localIndex = 0; localIndex < pointsPerElement;
+             ++localIndex) {
+            std::array<double, 3> point{};
+            pointSet->GetPoint(static_cast<vtkIdType>(
+                                   element * pointsPerElement + localIndex),
+                               point.data());
+            for (int axis = 0; axis < 3; ++axis) {
+                elementCenter[static_cast<std::size_t>(axis)] +=
+                    point[static_cast<std::size_t>(axis)];
+            }
+        }
+        for (double& coordinate : elementCenter) {
+            coordinate /= static_cast<double>(pointsPerElement);
+        }
+        for (int faceId = 0; faceId < NekFaceCount(metadata); ++faceId) {
+            NekDisplayFace face;
+            face.elementIndex = element;
+            face.faceId = faceId;
+            const std::vector<std::size_t> localIndices =
+                FaceLocalIndices(metadata, faceId);
+            std::vector<std::array<double, 3>> faceCoordinates;
+            faceCoordinates.reserve(localIndices.size());
+            for (const std::size_t localIndex : localIndices) {
+                std::array<double, 3> point{};
+                pointSet->GetPoint(static_cast<vtkIdType>(
+                                       element * pointsPerElement + localIndex),
+                                   point.data());
+                faceCoordinates.push_back(point);
+            }
+            if (metadata.is3D()) {
+                const std::array<int, 2> dimensions = FaceSampleDimensions(
+                    metadata, faceId, metadata.nx, metadata.ny, metadata.nz);
+                if (dimensions[0] >= 2 && dimensions[1] >= 2) {
+                    const std::array<double, 3>& origin = faceCoordinates.front();
+                    const std::array<double, 3>& firstAxis = faceCoordinates.at(
+                        static_cast<std::size_t>(dimensions[0] - 1));
+                    const std::array<double, 3>& secondAxis = faceCoordinates.at(
+                        static_cast<std::size_t>((dimensions[1] - 1) * dimensions[0]));
+                    std::array<double, 3> normal = CrossCoordinates(
+                        SubtractCoordinates(firstAxis, origin),
+                        SubtractCoordinates(secondAxis, origin));
+                    std::array<double, 3> faceCenter{};
+                    for (const std::array<double, 3>& point : faceCoordinates) {
+                        for (int axis = 0; axis < 3; ++axis) {
+                            faceCenter[static_cast<std::size_t>(axis)] +=
+                                point[static_cast<std::size_t>(axis)];
+                        }
+                    }
+                    for (double& coordinate : faceCenter) {
+                        coordinate /= static_cast<double>(faceCoordinates.size());
+                    }
+                    const std::array<double, 3> towardFace =
+                        SubtractCoordinates(faceCenter, elementCenter);
+                    const double normalLength = CoordinateNorm(normal);
+                    const double towardFaceLength = CoordinateNorm(towardFace);
+                    const double orientation = DotCoordinates(normal, towardFace);
+                    if (std::isfinite(normalLength) &&
+                        std::isfinite(towardFaceLength) &&
+                        std::isfinite(orientation) &&
+                        normalLength > 0.0 && towardFaceLength > 0.0 &&
+                        std::abs(orientation) >
+                            1.0e-10 * normalLength * towardFaceLength) {
+                        if (orientation < 0.0) {
+                            for (double& component : normal) {
+                                component = -component;
+                            }
+                        }
+                        for (int axis = 0; axis < 3; ++axis) {
+                            face.outwardNormal[static_cast<std::size_t>(axis)] =
+                                normal[static_cast<std::size_t>(axis)] / normalLength;
+                        }
+                        face.hasOutwardNormal = true;
+                    }
+                }
+            }
+            face.sortedCoordinates = std::move(faceCoordinates);
+            std::sort(face.sortedCoordinates.begin(), face.sortedCoordinates.end(),
+                      CoordinateLess);
+            faces.push_back(std::move(face));
+        }
+    }
+    return faces;
+}
+
+std::vector<NekDisplayFace> ExteriorNekDisplayFaces(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata,
+    const std::vector<NekDisplayFace>& faces) {
+    double bounds[6] = {};
+    canonicalDataSet->GetBounds(bounds);
+    const double scale = std::max(
+        {1.0, std::abs(bounds[1] - bounds[0]), std::abs(bounds[3] - bounds[2]),
+         std::abs(bounds[5] - bounds[4])});
+    // Matching is only an exterior-face visibility decision.  It never changes
+    // canonical point IDs, and an uncertain match remains visible rather than
+    // being silently collapsed.
+    const double tolerance = 1.0e-11 * scale;
+    std::unordered_map<std::string, std::vector<std::size_t>> buckets;
+    buckets.reserve(faces.size());
+    for (std::size_t index = 0; index < faces.size(); ++index) {
+        buckets[FaceSignature(faces[index], tolerance)].push_back(index);
+    }
+    std::vector<bool> interior(faces.size(), false);
+    for (const auto& [unused, candidates] : buckets) {
+        (void)unused;
+        // Non-manifold or duplicate-coordinate buckets are ambiguous.  Hide a
+        // face only for exactly one mutually opposed pair; retain periodic or
+        // overlapping candidates rather than treating them as interior by
+        // coordinate coincidence alone.
+        if (candidates.size() != 2) {
+            continue;
+        }
+        const NekDisplayFace& first = faces[candidates[0]];
+        const NekDisplayFace& second = faces[candidates[1]];
+        if (first.elementIndex != second.elementIndex &&
+            FacesCoincide(first, second, tolerance) &&
+            FacesHaveOpposedOutwardNormals(first, second)) {
+            interior[candidates[0]] = true;
+            interior[candidates[1]] = true;
+        }
+    }
+    std::vector<NekDisplayFace> exterior;
+    exterior.reserve(faces.size());
+    for (std::size_t index = 0; index < faces.size(); ++index) {
+        if (!interior[index]) {
+            exterior.push_back(faces[index]);
+        }
+    }
+    return exterior;
+}
+
+void AttachNekSpectralSurfaceNormals(
+    vtkPolyData* surface,
+    const Nek5000SpectralMetadata& metadata,
+    const Nek5000SpectralPointEvaluator& geometryEvaluator) {
+    if (surface == nullptr || surface->GetPointData() == nullptr) {
+        throw std::runtime_error(
+            "Cannot prepare Nek5000 PBR normals without a surface point-data table.");
+    }
+    vtkDataArray* elementIndices = surface->GetPointData()->GetArray(
+        kNek5000DisplayElementIndexArray);
+    vtkDataArray* references = surface->GetPointData()->GetArray(
+        kNek5000DisplayReferenceCoordinatesArray);
+    vtkDataArray* faceIds = surface->GetPointData()->GetArray(
+        kNek5000DisplayFaceIdArray);
+    if (elementIndices == nullptr || references == nullptr ||
+        references->GetNumberOfComponents() != 3 ||
+        elementIndices->GetNumberOfTuples() != surface->GetNumberOfPoints() ||
+        references->GetNumberOfTuples() != surface->GetNumberOfPoints()) {
+        throw std::runtime_error(
+            "Nek5000 PBR surface lost element/reference provenance.");
+    }
+
+    vtkNew<vtkDoubleArray> normals;
+    normals->SetName(kNek5000SpectralSurfaceNormalArray);
+    normals->SetNumberOfComponents(3);
+    normals->SetNumberOfTuples(surface->GetNumberOfPoints());
+    std::vector<std::array<double, 3>> elementCenters(metadata.elementCount);
+    std::vector<bool> haveCenter(metadata.elementCount, false);
+
+    for (vtkIdType pointId = 0; pointId < surface->GetNumberOfPoints(); ++pointId) {
+        const int elementIndex = static_cast<int>(std::lround(
+            elementIndices->GetComponent(pointId, 0)));
+        if (elementIndex < 0 ||
+            static_cast<std::size_t>(elementIndex) >= metadata.elementCount) {
+            throw std::runtime_error(
+                "Nek5000 PBR surface contains an invalid source element index.");
+        }
+        std::array<double, 3> reference{};
+        references->GetTuple(pointId, reference.data());
+        std::array<double, 3> physical{};
+        std::array<double, 3> derivativeR{};
+        std::array<double, 3> derivativeS{};
+        std::array<double, 3> derivativeT{};
+        if (!geometryEvaluator.EvaluateGeometryReference(
+                static_cast<std::size_t>(elementIndex), reference.data(),
+                &physical, &derivativeR, &derivativeS, &derivativeT)) {
+            throw std::runtime_error(
+                "Failed to evaluate a Nek5000 spectral PBR surface normal.");
+        }
+
+        std::array<double, 3> normal{};
+        const int faceId = faceIds == nullptr ? -1 : static_cast<int>(std::lround(
+            faceIds->GetComponent(pointId, 0)));
+        if (!metadata.is3D()) {
+            normal = CrossCoordinates(derivativeR, derivativeS);
+        } else {
+            switch (faceId) {
+            case 0:
+                normal = CrossCoordinates(derivativeS, derivativeT);
+                for (double& component : normal) {
+                    component = -component;
+                }
+                break;
+            case 1:
+                normal = CrossCoordinates(derivativeS, derivativeT);
+                break;
+            case 2:
+                normal = CrossCoordinates(derivativeT, derivativeR);
+                for (double& component : normal) {
+                    component = -component;
+                }
+                break;
+            case 3:
+                normal = CrossCoordinates(derivativeT, derivativeR);
+                break;
+            case 4:
+                normal = CrossCoordinates(derivativeR, derivativeS);
+                for (double& component : normal) {
+                    component = -component;
+                }
+                break;
+            case 5:
+                normal = CrossCoordinates(derivativeR, derivativeS);
+                break;
+            default:
+                throw std::runtime_error(
+                    "Nek5000 PBR surface contains no exterior-face provenance.");
+            }
+            const std::size_t element = static_cast<std::size_t>(elementIndex);
+            if (!haveCenter[element]) {
+                constexpr double centerReference[3] = {0.0, 0.0, 0.0};
+                std::array<double, 3> ignoredR{};
+                std::array<double, 3> ignoredS{};
+                std::array<double, 3> ignoredT{};
+                if (!geometryEvaluator.EvaluateGeometryReference(
+                        element, centerReference, &elementCenters[element],
+                        &ignoredR, &ignoredS, &ignoredT)) {
+                    throw std::runtime_error(
+                        "Failed to evaluate a Nek5000 spectral element centre.");
+                }
+                haveCenter[element] = true;
+            }
+            const std::array<double, 3> outward = SubtractCoordinates(
+                physical, elementCenters[element]);
+            if (DotCoordinates(normal, outward) < 0.0) {
+                for (double& component : normal) {
+                    component = -component;
+                }
+            }
+        }
+        const double magnitude = CoordinateNorm(normal);
+        if (!std::isfinite(magnitude) || magnitude <= 1.0e-30) {
+            throw std::runtime_error(
+                "Nek5000 PBR surface has a degenerate spectral mapping normal.");
+        }
+        for (double& component : normal) {
+            component /= magnitude;
+        }
+        normals->SetTuple(pointId, normal.data());
+    }
+    surface->GetPointData()->SetNormals(normals);
+}
+
+vtkSmartPointer<vtkDataSet> BuildNekDisplayVolume(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata,
+    const Nek5000SpectralPointEvaluator& geometryEvaluator,
+    int samplesX,
+    int samplesY,
+    int samplesZ) {
+    vtkSmartPointer<vtkUnstructuredGrid> volume =
+        vtkSmartPointer<vtkUnstructuredGrid>::New();
+    volume->SetPoints(NewDoublePoints());
+    NekDisplayPointWriter points(volume, canonicalDataSet, metadata,
+                                 geometryEvaluator, true);
+    NekDisplayCellProvenance cells;
+    const std::size_t pointsPerElement =
+        static_cast<std::size_t>(samplesX) * static_cast<std::size_t>(samplesY) *
+        static_cast<std::size_t>(samplesZ);
+    for (std::size_t element = 0; element < metadata.elementCount; ++element) {
+        const vtkIdType base = volume->GetNumberOfPoints();
+        for (int k = 0; k < samplesZ; ++k) {
+            for (int j = 0; j < samplesY; ++j) {
+                for (int i = 0; i < samplesX; ++i) {
+                    points.Add(element,
+                               {UniformReferenceCoordinate(i, samplesX),
+                                UniformReferenceCoordinate(j, samplesY),
+                                metadata.is3D()
+                                    ? UniformReferenceCoordinate(k, samplesZ)
+                                    : 0.0});
+                }
+            }
+        }
+        (void)pointsPerElement;
+        if (metadata.is3D()) {
+            for (int k = 0; k < samplesZ - 1; ++k) {
+                for (int j = 0; j < samplesY - 1; ++j) {
+                    for (int i = 0; i < samplesX - 1; ++i) {
+                        vtkIdType ids[8] = {
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j, k)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j, k)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j + 1, k)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j + 1, k)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j, k + 1)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j, k + 1)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j + 1, k + 1)),
+                            base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j + 1, k + 1))};
+                        volume->InsertNextCell(VTK_HEXAHEDRON, 8, ids);
+                        cells.Add(metadata, element, -1);
+                    }
+                }
+            }
+        } else {
+            for (int j = 0; j < samplesY - 1; ++j) {
+                for (int i = 0; i < samplesX - 1; ++i) {
+                    vtkIdType ids[4] = {
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j + 1, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j + 1, 0))};
+                    volume->InsertNextCell(VTK_QUAD, 4, ids);
+                    cells.Add(metadata, element, -1);
+                }
+            }
+        }
+    }
+    cells.Attach(volume);
+    MarkNek5000DisplayProxy(volume, kSemAwareDisplayRepresentation, nullptr,
+                            0.0, &metadata);
+    return volume;
+}
+
+vtkSmartPointer<vtkPolyData> BuildNekDisplaySurface(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata,
+    const Nek5000SpectralPointEvaluator& geometryEvaluator,
+    const std::vector<NekDisplayFace>& exteriorFaces,
+    int samplesX,
+    int samplesY,
+    int samplesZ) {
+    vtkSmartPointer<vtkPolyData> surface = vtkSmartPointer<vtkPolyData>::New();
+    surface->SetPoints(NewDoublePoints());
+    NekDisplayPointWriter points(surface, canonicalDataSet, metadata,
+                                 geometryEvaluator, true);
+    NekDisplayCellProvenance cells;
+
+    if (!metadata.is3D()) {
+        // A two-dimensional SEM domain is itself the visible surface. Its
+        // element boundaries have no area, so retain sampled element quads.
+        vtkNew<vtkCellArray> polygons;
+        for (std::size_t element = 0; element < metadata.elementCount; ++element) {
+            const vtkIdType base = surface->GetNumberOfPoints();
+            for (int j = 0; j < samplesY; ++j) {
+                for (int i = 0; i < samplesX; ++i) {
+                    points.Add(element,
+                               {UniformReferenceCoordinate(i, samplesX),
+                                UniformReferenceCoordinate(j, samplesY), 0.0});
+                }
+            }
+            for (int j = 0; j < samplesY - 1; ++j) {
+                for (int i = 0; i < samplesX - 1; ++i) {
+                    vtkIdType ids[4] = {
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i + 1, j + 1, 0)),
+                        base + static_cast<vtkIdType>(SampleLocalIndex(samplesX, samplesY, i, j + 1, 0))};
+                    polygons->InsertNextCell(4, ids);
+                    cells.Add(metadata, element, -1);
+                }
+            }
+        }
+        surface->SetPolys(polygons);
+    } else {
+        vtkNew<vtkCellArray> polygons;
+        for (const NekDisplayFace& face : exteriorFaces) {
+            const std::array<int, 2> dimensions = FaceSampleDimensions(
+                metadata, face.faceId, samplesX, samplesY, samplesZ);
+            const vtkIdType base = surface->GetNumberOfPoints();
+            for (int second = 0; second < dimensions[1]; ++second) {
+                for (int first = 0; first < dimensions[0]; ++first) {
+                    points.Add(face.elementIndex,
+                               FaceReference(
+                                   metadata, face.faceId,
+                                   UniformReferenceCoordinate(first, dimensions[0]),
+                                   UniformReferenceCoordinate(second, dimensions[1])),
+                               -1,
+                               face.faceId);
+                }
+            }
+            for (int second = 0; second < dimensions[1] - 1; ++second) {
+                for (int first = 0; first < dimensions[0] - 1; ++first) {
+                    const vtkIdType lower =
+                        base + static_cast<vtkIdType>(second * dimensions[0] + first);
+                    vtkIdType ids[4] = {lower, lower + 1,
+                                         lower + dimensions[0] + 1,
+                                         lower + dimensions[0]};
+                    polygons->InsertNextCell(4, ids);
+                    cells.Add(metadata, face.elementIndex, face.faceId);
+                }
+            }
+        }
+        surface->SetPolys(polygons);
+    }
+    cells.Attach(surface);
+    // Exterior PBR normals use the exact spectral mapping derivatives at the
+    // evaluator-sampled surface points, not normals inferred from GLL
+    // subcells or from the raw nodal cloud.
+    AttachNekSpectralSurfaceNormals(surface, metadata, geometryEvaluator);
+    MarkNek5000DisplayProxy(surface, kSemAwareDisplayRepresentation, nullptr,
+                            0.0, &metadata);
+    return surface;
+}
+
+vtkSmartPointer<vtkPolyData> BuildNekElementGrid(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata,
+    const Nek5000SpectralPointEvaluator& geometryEvaluator,
+    const std::vector<NekDisplayFace>& allFaces,
+    int samplesX,
+    int samplesY,
+    int samplesZ) {
+    vtkSmartPointer<vtkPolyData> grid = vtkSmartPointer<vtkPolyData>::New();
+    grid->SetPoints(NewDoublePoints());
+    NekDisplayPointWriter points(grid, canonicalDataSet, metadata,
+                                 geometryEvaluator, false);
+    vtkNew<vtkCellArray> lines;
+    NekDisplayCellProvenance cells;
+    const std::vector<double> nodesX = GllNodes(metadata.nx);
+    const std::vector<double> nodesY = GllNodes(metadata.ny);
+    const std::vector<double> nodesZ = metadata.is3D() ? GllNodes(metadata.nz)
+                                                        : std::vector<double>{0.0};
+
+    const auto addLine = [&](std::size_t elementIndex,
+                             int faceId,
+                             const std::vector<std::array<double, 3>>& references) {
+        std::vector<vtkIdType> ids;
+        ids.reserve(references.size());
+        for (const std::array<double, 3>& reference : references) {
+            ids.push_back(points.Add(elementIndex, reference, -1, faceId));
+        }
+        lines->InsertNextCell(static_cast<vtkIdType>(ids.size()), ids.data());
+        cells.Add(metadata, elementIndex, faceId);
+    };
+
+    for (const NekDisplayFace& face : allFaces) {
+        const std::array<int, 2> dimensions = FaceSampleDimensions(
+            metadata, face.faceId, samplesX, samplesY, samplesZ);
+        const std::vector<double>* firstNodes = nullptr;
+        const std::vector<double>* secondNodes = nullptr;
+        if (!metadata.is3D()) {
+            firstNodes = (face.faceId == 0 || face.faceId == 1) ? &nodesY : &nodesX;
+        } else if (face.faceId == 0 || face.faceId == 1) {
+            firstNodes = &nodesY;
+            secondNodes = &nodesZ;
+        } else if (face.faceId == 2 || face.faceId == 3) {
+            firstNodes = &nodesX;
+            secondNodes = &nodesZ;
+        } else {
+            firstNodes = &nodesX;
+            secondNodes = &nodesY;
+        }
+        if (!metadata.is3D()) {
+            std::vector<std::array<double, 3>> reference;
+            reference.reserve(static_cast<std::size_t>(dimensions[0]));
+            for (int first = 0; first < dimensions[0]; ++first) {
+                reference.push_back(FaceReference(
+                    metadata, face.faceId,
+                    UniformReferenceCoordinate(first, dimensions[0])));
+            }
+            addLine(face.elementIndex, face.faceId, reference);
+            continue;
+        }
+        for (const double fixedFirst : *firstNodes) {
+            std::vector<std::array<double, 3>> reference;
+            reference.reserve(static_cast<std::size_t>(dimensions[1]));
+            for (int second = 0; second < dimensions[1]; ++second) {
+                reference.push_back(FaceReference(
+                    metadata, face.faceId, fixedFirst,
+                    UniformReferenceCoordinate(second, dimensions[1])));
+            }
+            addLine(face.elementIndex, face.faceId, reference);
+        }
+        for (const double fixedSecond : *secondNodes) {
+            std::vector<std::array<double, 3>> reference;
+            reference.reserve(static_cast<std::size_t>(dimensions[0]));
+            for (int first = 0; first < dimensions[0]; ++first) {
+                reference.push_back(FaceReference(
+                    metadata, face.faceId,
+                    UniformReferenceCoordinate(first, dimensions[0]), fixedSecond));
+            }
+            addLine(face.elementIndex, face.faceId, reference);
+        }
+    }
+    grid->SetLines(lines);
+    cells.Attach(grid);
+    MarkNek5000DisplayProxy(grid, kSemAwareDisplayRepresentation, nullptr,
+                            0.0, &metadata);
+    return grid;
+}
+
+vtkSmartPointer<vtkPolyData> BuildNekGllNodes(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralMetadata& metadata) {
+    vtkPointSet* canonicalPoints = vtkPointSet::SafeDownCast(canonicalDataSet);
+    if (canonicalPoints == nullptr || canonicalPoints->GetPoints() == nullptr) {
+        throw std::runtime_error("Nek5000 GLL overlay requires explicit points.");
+    }
+    vtkSmartPointer<vtkPolyData> nodes = vtkSmartPointer<vtkPolyData>::New();
+    nodes->SetPoints(NewDoublePoints());
+    vtkNew<vtkCellArray> vertices;
+    vtkNew<vtkIntArray> elementIds;
+    vtkNew<vtkIntArray> elementIndices;
+    vtkNew<vtkIntArray> localIndices;
+    vtkNew<vtkDoubleArray> referenceCoordinates;
+    elementIds->SetName(kNek5000DisplayElementIdArray);
+    elementIndices->SetName(kNek5000DisplayElementIndexArray);
+    localIndices->SetName(kNek5000DisplayLocalGllIndexArray);
+    referenceCoordinates->SetName(kNek5000DisplayReferenceCoordinatesArray);
+    referenceCoordinates->SetNumberOfComponents(3);
+    const std::vector<double> nodesX = GllNodes(metadata.nx);
+    const std::vector<double> nodesY = GllNodes(metadata.ny);
+    const std::vector<double> nodesZ = metadata.is3D() ? GllNodes(metadata.nz)
+                                                        : std::vector<double>{0.0};
+    const std::size_t pointsPerElement = metadata.pointsPerElement();
+    for (std::size_t element = 0; element < metadata.elementCount; ++element) {
+        for (int k = 0; k < metadata.nz; ++k) {
+            for (int j = 0; j < metadata.ny; ++j) {
+                for (int i = 0; i < metadata.nx; ++i) {
+                    const std::size_t local = NekLocalIndex(metadata.nx, metadata.ny,
+                                                            i, j, k);
+                    std::array<double, 3> coordinate{};
+                    canonicalPoints->GetPoint(static_cast<vtkIdType>(
+                                                  element * pointsPerElement + local),
+                                              coordinate.data());
+                    const vtkIdType id = nodes->GetPoints()->InsertNextPoint(
+                        coordinate.data());
+                    vertices->InsertNextCell(1, &id);
+                    elementIds->InsertNextValue(metadata.elementIds[element]);
+                    elementIndices->InsertNextValue(static_cast<int>(element));
+                    localIndices->InsertNextValue(static_cast<int>(local));
+                    const double reference[3] = {
+                        nodesX[static_cast<std::size_t>(i)],
+                        nodesY[static_cast<std::size_t>(j)],
+                        nodesZ[static_cast<std::size_t>(k)]};
+                    referenceCoordinates->InsertNextTuple(reference);
+                }
+            }
+        }
+    }
+    nodes->SetVerts(vertices);
+    nodes->GetPointData()->AddArray(elementIds);
+    nodes->GetPointData()->AddArray(elementIndices);
+    nodes->GetPointData()->AddArray(localIndices);
+    nodes->GetPointData()->AddArray(referenceCoordinates);
+    MarkNek5000DisplayProxy(nodes, kSemAwareDisplayRepresentation, nullptr,
+                            0.0, &metadata);
+    return nodes;
+}
+
+}  // namespace
+
+bool IsNek5000SpectralDisplayProxy(vtkDataSet* dataSet) {
+    if (dataSet == nullptr || dataSet->GetFieldData() == nullptr) {
+        return false;
+    }
+    vtkStringArray* marker = vtkStringArray::SafeDownCast(
+        dataSet->GetFieldData()->GetAbstractArray(kNek5000DisplayProxyField));
+    return marker != nullptr && marker->GetNumberOfTuples() == 1 &&
+           marker->GetValue(0) == "1";
+}
+
+Nek5000SpectralDisplayProxy CreateNek5000SpectralDisplayProxy(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralDisplayOptions& options) {
+    if (canonicalDataSet == nullptr ||
+        !HasNek5000SpectralMetadata(canonicalDataSet) ||
+        IsNek5000SpectralDisplayProxy(canonicalDataSet)) {
+        throw std::runtime_error(
+            "Nek5000 display proxies require canonical element-local GLL data.");
+    }
+    const Nek5000SpectralMetadata metadata =
+        GetNek5000SpectralMetadata(canonicalDataSet);
+    vtkPointSet* pointSet = vtkPointSet::SafeDownCast(canonicalDataSet);
+    vtkDataArray* coordinates =
+        pointSet == nullptr || pointSet->GetPoints() == nullptr
+            ? nullptr
+            : pointSet->GetPoints()->GetData();
+    if (coordinates == nullptr) {
+        throw std::runtime_error(
+            "Nek5000 display proxies require a canonical coordinate array.");
+    }
+    const int samplesX = SampleCountForGllAxis(metadata.nx, options);
+    const int samplesY = SampleCountForGllAxis(metadata.ny, options);
+    const int samplesZ = metadata.is3D()
+                             ? SampleCountForGllAxis(metadata.nz, options)
+                             : 1;
+    Nek5000SpectralPointEvaluator geometryEvaluator(canonicalDataSet, coordinates);
+    Nek5000SpectralDisplayProxy proxy;
+    if (options.buildVolumeProxy) {
+        proxy.volume = BuildNekDisplayVolume(canonicalDataSet, metadata,
+                                             geometryEvaluator, samplesX, samplesY,
+                                             samplesZ);
+    }
+    std::vector<NekDisplayFace> allFaces;
+    if (options.buildExteriorSurface || options.buildElementGrid) {
+        allFaces = BuildNekDisplayFaces(canonicalDataSet, metadata);
+    }
+    if (options.buildExteriorSurface) {
+        proxy.exteriorSurface = BuildNekDisplaySurface(
+            canonicalDataSet, metadata, geometryEvaluator,
+            metadata.is3D()
+                ? ExteriorNekDisplayFaces(canonicalDataSet, metadata, allFaces)
+                : allFaces,
+            samplesX, samplesY, samplesZ);
+    }
+    if (options.buildElementGrid) {
+        proxy.elementGrid = BuildNekElementGrid(canonicalDataSet, metadata,
+                                                geometryEvaluator, allFaces,
+                                                samplesX, samplesY, samplesZ);
+    }
+    if (options.buildGllNodes) {
+        proxy.gllNodes = BuildNekGllNodes(canonicalDataSet, metadata);
+    }
+    return proxy;
+}
+
+namespace {
+
+const char* NekSpectralOperationName(Nek5000SpectralOperationKind kind) {
+    switch (kind) {
+    case Nek5000SpectralOperationKind::Crop:
+        return "crop";
+    case Nek5000SpectralOperationKind::Clip:
+        return "clip";
+    case Nek5000SpectralOperationKind::Slice:
+        return "slice";
+    case Nek5000SpectralOperationKind::Contour:
+        return "contour";
+    }
+    throw std::runtime_error("Unknown Native Nek5000 spectral operation.");
+}
+
+vtkSmartPointer<vtkDataSet> DeepCopyNekOperationOutput(vtkDataSet* source) {
+    if (source == nullptr) {
+        return nullptr;
+    }
+    vtkDataSet* rawCopy = vtkDataSet::SafeDownCast(source->NewInstance());
+    if (rawCopy == nullptr) {
+        return nullptr;
+    }
+    vtkSmartPointer<vtkDataSet> copy;
+    copy.TakeReference(rawCopy);
+    copy->DeepCopy(source);
+    return copy;
+}
+
+vtkSmartPointer<vtkPolyData> DeepCopyNekOperationSurface(vtkPolyData* source) {
+    if (source == nullptr) {
+        return nullptr;
+    }
+    vtkSmartPointer<vtkPolyData> copy = vtkSmartPointer<vtkPolyData>::New();
+    copy->DeepCopy(source);
+    return copy;
+}
+
+vtkSmartPointer<vtkDataSet> RemoveUnusedNekOperationPoints(
+    vtkDataSet* source) {
+    vtkUnstructuredGrid* grid = vtkUnstructuredGrid::SafeDownCast(source);
+    if (grid == nullptr) {
+        return DeepCopyNekOperationOutput(source);
+    }
+    // vtkClipDataSet may leave rejected input points in its output point
+    // table.  Removing only unused points preserves the non-merging contract
+    // while ensuring bounds and downstream display filters describe the
+    // actual evaluator-sampled operation geometry.
+    vtkNew<vtkRemoveUnusedPoints> removeUnused;
+    removeUnused->SetInputData(grid);
+    removeUnused->Update();
+    return DeepCopyNekOperationOutput(removeUnused->GetOutput());
+}
+
+std::array<double, 6> NormalizedNekCropBounds(
+    const std::array<double, 6>& input) {
+    std::array<double, 6> bounds = input;
+    for (int axis = 0; axis < 3; ++axis) {
+        const std::size_t lower = static_cast<std::size_t>(axis * 2);
+        const std::size_t upper = lower + 1;
+        if (!std::isfinite(bounds[lower]) || !std::isfinite(bounds[upper])) {
+            throw std::runtime_error(
+                "Native Nek5000 crop bounds must be finite.");
+        }
+        if (bounds[upper] < bounds[lower]) {
+            std::swap(bounds[lower], bounds[upper]);
+        }
+        if (!(bounds[upper] > bounds[lower])) {
+            const double scale = std::max(
+                {1.0, std::abs(bounds[lower]), std::abs(bounds[upper])});
+            const double padding = scale * 1.0e-9;
+            bounds[lower] -= padding;
+            bounds[upper] += padding;
+        }
+    }
+    return bounds;
+}
+
+void ValidateNekPlane(const std::array<double, 3>& origin,
+                      const std::array<double, 3>& normal) {
+    double lengthSquared = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(origin[static_cast<std::size_t>(axis)]) ||
+            !std::isfinite(normal[static_cast<std::size_t>(axis)])) {
+            throw std::runtime_error(
+                "Native Nek5000 operation plane must be finite.");
+        }
+        lengthSquared += normal[static_cast<std::size_t>(axis)] *
+                         normal[static_cast<std::size_t>(axis)];
+    }
+    if (!std::isfinite(lengthSquared) ||
+        lengthSquared <= std::numeric_limits<double>::epsilon()) {
+        throw std::runtime_error(
+            "Native Nek5000 operation plane normal must be non-zero.");
+    }
+}
+
+void RequireNekOperationPointProvenance(vtkDataSet* dataSet) {
+    if (dataSet == nullptr || dataSet->GetPointData() == nullptr) {
+        throw std::runtime_error(
+            "Native Nek5000 operation produced no point-data provenance.");
+    }
+    vtkDataArray* elementIndices = dataSet->GetPointData()->GetArray(
+        kNek5000DisplayElementIndexArray);
+    vtkDataArray* references = dataSet->GetPointData()->GetArray(
+        kNek5000DisplayReferenceCoordinatesArray);
+    if (elementIndices == nullptr || references == nullptr ||
+        elementIndices->GetNumberOfTuples() != dataSet->GetNumberOfPoints() ||
+        references->GetNumberOfComponents() != 3 ||
+        references->GetNumberOfTuples() != dataSet->GetNumberOfPoints()) {
+        throw std::runtime_error(
+            "Native Nek5000 operation lost unmerged element/reference provenance.");
+    }
+}
+
+vtkDataArray* PrepareNekContourScalar(
+    vtkDataSet* sampledData,
+    const Nek5000SpectralOperationRequest& request) {
+    if (sampledData == nullptr || sampledData->GetPointData() == nullptr ||
+        request.contourArrayName.empty()) {
+        throw std::runtime_error(
+            "Native Nek5000 contour requires a canonical point-data field.");
+    }
+    vtkPointData* pointData = sampledData->GetPointData();
+    vtkDataArray* input = pointData->GetArray(request.contourArrayName.c_str());
+    if (input == nullptr || input->GetNumberOfComponents() < 1 ||
+        input->GetNumberOfTuples() != sampledData->GetNumberOfPoints()) {
+        throw std::runtime_error(
+            "Native Nek5000 contour field is not available on evaluator samples: " +
+            request.contourArrayName);
+    }
+    if (request.contourComponent == 0 && input->GetNumberOfComponents() == 1) {
+        return input;
+    }
+    if (request.contourComponent < -1 ||
+        request.contourComponent >= input->GetNumberOfComponents()) {
+        throw std::runtime_error(
+            "Native Nek5000 contour component is outside the source field range.");
+    }
+
+    constexpr const char* kContourScalarName =
+        "SCP_Nek5000SpectralOperationContourScalar";
+    pointData->RemoveArray(kContourScalarName);
+    vtkNew<vtkDoubleArray> scalar;
+    scalar->SetName(kContourScalarName);
+    scalar->SetNumberOfComponents(1);
+    scalar->SetNumberOfTuples(input->GetNumberOfTuples());
+    for (vtkIdType tuple = 0; tuple < input->GetNumberOfTuples(); ++tuple) {
+        double value = 0.0;
+        if (request.contourComponent >= 0) {
+            value = input->GetComponent(tuple, request.contourComponent);
+        } else {
+            for (int component = 0;
+                 component < input->GetNumberOfComponents(); ++component) {
+                const double componentValue = input->GetComponent(tuple, component);
+                value += componentValue * componentValue;
+            }
+            value = std::sqrt(value);
+        }
+        if (!std::isfinite(value)) {
+            throw std::runtime_error(
+                "Native Nek5000 contour field contains a non-finite evaluator sample.");
+        }
+        scalar->SetValue(tuple, value);
+    }
+    pointData->AddArray(scalar);
+    return pointData->GetArray(kContourScalarName);
+}
+
+vtkSmartPointer<vtkDataSet> ApplyNekSpectralOperation(
+    vtkDataSet* sampledInput,
+    const Nek5000SpectralOperationRequest& request) {
+    if (sampledInput == nullptr || sampledInput->GetNumberOfPoints() <= 0) {
+        throw std::runtime_error(
+            "Native Nek5000 operation has no evaluator-sampled input.");
+    }
+    vtkSmartPointer<vtkDataSet> output;
+    if (request.kind == Nek5000SpectralOperationKind::Crop) {
+        const std::array<double, 6> bounds =
+            NormalizedNekCropBounds(request.cropBounds);
+        vtkNew<vtkBox> box;
+        box->SetBounds(bounds.data());
+        vtkNew<vtkClipDataSet> crop;
+        vtkNew<vtkNonMergingPointLocator> locator;
+        crop->SetLocator(locator);
+        crop->SetInputData(sampledInput);
+        crop->SetClipFunction(box);
+        crop->SetValue(0.0);
+        crop->InsideOutOn();
+        crop->Update();
+        output = DeepCopyNekOperationOutput(
+            vtkDataSet::SafeDownCast(crop->GetOutputDataObject(0)));
+    } else if (request.kind == Nek5000SpectralOperationKind::Clip) {
+        ValidateNekPlane(request.planeOrigin, request.planeNormal);
+        vtkNew<vtkPlane> plane;
+        plane->SetOrigin(request.planeOrigin.data());
+        plane->SetNormal(request.planeNormal.data());
+        vtkNew<vtkClipDataSet> clip;
+        vtkNew<vtkNonMergingPointLocator> locator;
+        clip->SetLocator(locator);
+        clip->SetInputData(sampledInput);
+        clip->SetClipFunction(plane);
+        clip->SetValue(0.0);
+        clip->InsideOutOn();
+        clip->Update();
+        output = DeepCopyNekOperationOutput(
+            vtkDataSet::SafeDownCast(clip->GetOutputDataObject(0)));
+    } else if (request.kind == Nek5000SpectralOperationKind::Slice) {
+        ValidateNekPlane(request.planeOrigin, request.planeNormal);
+        vtkNew<vtkPlane> plane;
+        plane->SetOrigin(request.planeOrigin.data());
+        plane->SetNormal(request.planeNormal.data());
+        vtkNew<vtkCutter> cutter;
+        vtkNew<vtkNonMergingPointLocator> locator;
+        cutter->SetLocator(locator);
+        cutter->SetInputData(sampledInput);
+        cutter->SetCutFunction(plane);
+        cutter->Update();
+        output = DeepCopyNekOperationOutput(
+            vtkDataSet::SafeDownCast(cutter->GetOutputDataObject(0)));
+    } else if (request.kind == Nek5000SpectralOperationKind::Contour) {
+        if (request.contourValues.empty()) {
+            throw std::runtime_error(
+                "Native Nek5000 contour requires at least one finite isovalue.");
+        }
+        vtkDataArray* scalar = PrepareNekContourScalar(sampledInput, request);
+        if (scalar == nullptr || scalar->GetName() == nullptr) {
+            throw std::runtime_error(
+                "Native Nek5000 contour could not prepare an evaluator-sampled scalar.");
+        }
+        vtkNew<vtkContourFilter> contour;
+        vtkNew<vtkNonMergingPointLocator> locator;
+        contour->SetLocator(locator);
+        contour->SetInputData(sampledInput);
+        contour->SetInputArrayToProcess(0, 0, 0,
+                                        vtkDataObject::FIELD_ASSOCIATION_POINTS,
+                                        scalar->GetName());
+        contour->SetNumberOfContours(
+            static_cast<int>(request.contourValues.size()));
+        for (std::size_t index = 0; index < request.contourValues.size(); ++index) {
+            const double value = request.contourValues[index];
+            if (!std::isfinite(value)) {
+                throw std::runtime_error(
+                    "Native Nek5000 contour isovalue must be finite.");
+            }
+            contour->SetValue(static_cast<int>(index), value);
+        }
+        contour->Update();
+        output = DeepCopyNekOperationOutput(
+            vtkDataSet::SafeDownCast(contour->GetOutputDataObject(0)));
+    }
+    if (output == nullptr || output->GetNumberOfPoints() <= 0) {
+        throw std::runtime_error(
+            std::string("Native Nek5000 ") + NekSpectralOperationName(request.kind) +
+            " produced no visible evaluator-sampled data.");
+    }
+    output = RemoveUnusedNekOperationPoints(output);
+    if (output == nullptr || output->GetNumberOfPoints() <= 0) {
+        throw std::runtime_error(
+            std::string("Native Nek5000 ") + NekSpectralOperationName(request.kind) +
+            " lost all evaluator-sampled points while removing unused VTK points.");
+    }
+    RequireNekOperationPointProvenance(output);
+    return output;
+}
+
+vtkSmartPointer<vtkPolyData> PrepareNekSampledPbrSurface(
+    vtkDataSet* sampledData) {
+    vtkSmartPointer<vtkPolyData> surface;
+    if (vtkPolyData* direct = vtkPolyData::SafeDownCast(sampledData)) {
+        surface = DeepCopyNekOperationSurface(direct);
+    } else {
+        vtkNew<vtkDataSetSurfaceFilter> extract;
+        extract->SetInputData(sampledData);
+        extract->Update();
+        surface = DeepCopyNekOperationSurface(extract->GetOutput());
+    }
+    if (surface == nullptr || surface->GetNumberOfPoints() <= 0) {
+        throw std::runtime_error(
+            "Native Nek5000 PBR preparation produced no sampled surface.");
+    }
+    vtkNew<vtkPolyDataNormals> normals;
+    normals->SetInputData(surface);
+    normals->ComputePointNormalsOn();
+    normals->ComputeCellNormalsOff();
+    normals->SplittingOff();
+    normals->ConsistencyOff();
+    normals->AutoOrientNormalsOff();
+    normals->FlipNormalsOff();
+    normals->NonManifoldTraversalOff();
+    normals->Update();
+    vtkSmartPointer<vtkPolyData> pbrSurface =
+        DeepCopyNekOperationSurface(normals->GetOutput());
+    if (pbrSurface == nullptr || pbrSurface->GetPointData() == nullptr ||
+        pbrSurface->GetPointData()->GetNormals() == nullptr) {
+        throw std::runtime_error(
+            "Native Nek5000 PBR preparation did not produce sampled normals.");
+    }
+    RequireNekOperationPointProvenance(pbrSurface);
+    return pbrSurface;
+}
+
+}  // namespace
+
+Nek5000SpectralOperationResult CreateNek5000SpectralOperation(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralOperationRequest& request,
+    const Nek5000SpectralOperationOptions& options) {
+    return CreateNek5000SpectralOperationPipeline(canonicalDataSet,
+                                                    {request}, options);
+}
+
+Nek5000SpectralOperationResult CreateNek5000SpectralOperationPipeline(
+    vtkDataSet* canonicalDataSet,
+    const std::vector<Nek5000SpectralOperationRequest>& requests,
+    const Nek5000SpectralOperationOptions& options) {
+    if (canonicalDataSet == nullptr ||
+        !HasNek5000SpectralMetadata(canonicalDataSet) ||
+        IsNek5000SpectralDisplayProxy(canonicalDataSet)) {
+        throw std::runtime_error(
+            "Native Nek5000 operations require canonical element-local GLL data.");
+    }
+    if (options.samplesPerGllInterval < 1 || options.maxSamplesPerAxis < 2) {
+        throw std::runtime_error(
+            "Native Nek5000 operation sampling options are invalid.");
+    }
+    const Nek5000SpectralMetadata metadata =
+        GetNek5000SpectralMetadata(canonicalDataSet);
+    Nek5000SpectralDisplayOptions sampling;
+    sampling.samplesPerGllInterval = options.samplesPerGllInterval;
+    sampling.maxSamplesPerAxis = options.maxSamplesPerAxis;
+    sampling.buildVolumeProxy = true;
+    sampling.buildExteriorSurface = options.preparePbrSurface && requests.empty();
+    sampling.buildElementGrid = false;
+    sampling.buildGllNodes = false;
+    const int samplesX = SampleCountForGllAxis(metadata.nx, sampling);
+    const int samplesY = SampleCountForGllAxis(metadata.ny, sampling);
+    const int samplesZ = metadata.is3D()
+        ? SampleCountForGllAxis(metadata.nz, sampling)
+        : 1;
+    const double maximumReferenceEdgeLength = std::max(
+        2.0 / static_cast<double>(std::max(1, samplesX - 1)),
+        std::max(2.0 / static_cast<double>(std::max(1, samplesY - 1)),
+                 metadata.is3D()
+                     ? 2.0 / static_cast<double>(std::max(1, samplesZ - 1))
+                     : 0.0));
+    Nek5000SpectralDisplayProxy proxy =
+        CreateNek5000SpectralDisplayProxy(canonicalDataSet, sampling);
+    vtkSmartPointer<vtkDataSet> current = proxy.volume;
+    if (current == nullptr) {
+        throw std::runtime_error(
+            "Native Nek5000 operation sampling produced no volume proxy.");
+    }
+
+    std::ostringstream operationLabel;
+    if (requests.empty()) {
+        operationLabel << "surface";
+    }
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        if (index != 0) {
+            operationLabel << '>';
+        }
+        operationLabel << NekSpectralOperationName(requests[index].kind);
+        current = ApplyNekSpectralOperation(current, requests[index]);
+    }
+    MarkNek5000DisplayProxy(current, kSemAwareOperationDisplayRepresentation,
+                            operationLabel.str().c_str(),
+                            maximumReferenceEdgeLength, &metadata);
+
+    Nek5000SpectralOperationResult result;
+    result.data = current;
+    result.maximumReferenceEdgeLength = maximumReferenceEdgeLength;
+    if (options.preparePbrSurface) {
+        if (requests.empty()) {
+            result.pbrSurface = proxy.exteriorSurface;
+            if (result.pbrSurface == nullptr) {
+                throw std::runtime_error(
+                    "Native Nek5000 PBR preparation produced no exterior surface.");
+            }
+            MarkNek5000DisplayProxy(result.pbrSurface,
+                                    kSemAwareOperationDisplayRepresentation,
+                                    "pbr_surface",
+                                    maximumReferenceEdgeLength, &metadata);
+        } else {
+            result.pbrSurface = PrepareNekSampledPbrSurface(current);
+            MarkNek5000DisplayProxy(result.pbrSurface,
+                                    kSemAwareOperationDisplayRepresentation,
+                                    (operationLabel.str() + ">pbr_surface").c_str(),
+                                    maximumReferenceEdgeLength, &metadata);
+        }
+    }
+    return result;
+}
+
+bool ProbeNek5000SpectralField(
+    vtkDataSet* canonicalDataSet,
+    vtkDataArray* pointArray,
+    const double physicalPoint[3],
+    Nek5000SpectralProbeResult* result,
+    const Nek5000PointEvaluationOptions& options) {
+    if (result == nullptr || canonicalDataSet == nullptr || pointArray == nullptr ||
+        !HasNek5000SpectralMetadata(canonicalDataSet) ||
+        IsNek5000SpectralDisplayProxy(canonicalDataSet) || physicalPoint == nullptr) {
+        return false;
+    }
+    Nek5000SpectralPointEvaluator evaluator(canonicalDataSet, pointArray, options);
+    std::vector<double> values(static_cast<std::size_t>(
+        evaluator.numberOfComponents()));
+    int elementIndex = -1;
+    std::array<double, 3> reference{};
+    if (!evaluator.EvaluateWithReference(physicalPoint, values.data(), &elementIndex,
+                                         &reference)) {
+        return false;
+    }
+    const Nek5000SpectralMetadata metadata =
+        GetNek5000SpectralMetadata(canonicalDataSet);
+    if (elementIndex < 0 ||
+        static_cast<std::size_t>(elementIndex) >= metadata.elementIds.size()) {
+        return false;
+    }
+    result->elementIndex = elementIndex;
+    result->elementId = metadata.elementIds[static_cast<std::size_t>(elementIndex)];
+    result->referenceCoordinates = reference;
+    result->values = std::move(values);
+    return true;
 }
 
 bool HasSameNek5000SpectralGeometry(vtkDataSet* lhs,

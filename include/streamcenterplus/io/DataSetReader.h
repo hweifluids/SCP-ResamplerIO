@@ -12,6 +12,7 @@
 class vtkDataArray;
 class vtkDataSet;
 class vtkDoubleArray;
+class vtkPolyData;
 
 namespace streamcenterplus::io {
 
@@ -31,6 +32,35 @@ inline constexpr const char* kNek5000ElementIdsField =
     "SCP_Nek5000ElementIds";
 inline constexpr const char* kNek5000RepresentationField =
     "SCP_Nek5000Representation";
+// Metadata and provenance on a display-only proxy created from canonical
+// element-local GLL data.  These markers deliberately distinguish a sampled
+// VTK representation from the canonical spectral source.
+inline constexpr const char* kNek5000DisplayProxyField =
+    "SCP_Nek5000DisplayProxy";
+inline constexpr const char* kNek5000DisplayRepresentationField =
+    "SCP_Nek5000DisplayRepresentation";
+inline constexpr const char* kNek5000DisplayElementIdArray =
+    "SCP_Nek5000DisplayElementId";
+inline constexpr const char* kNek5000DisplayElementIndexArray =
+    "SCP_Nek5000DisplayElementIndex";
+inline constexpr const char* kNek5000DisplayLocalGllIndexArray =
+    "SCP_Nek5000DisplayLocalGllIndex";
+inline constexpr const char* kNek5000DisplayReferenceCoordinatesArray =
+    "SCP_Nek5000DisplayReferenceCoordinates";
+inline constexpr const char* kNek5000DisplayFaceIdArray =
+    "SCP_Nek5000DisplayFaceId";
+// Every display-only result produced from canonical Nek5000 data records the
+// evaluator-driven operation and the largest uniform reference-space edge in
+// the sampled representation.  The spacing is an approximation contract, not
+// a claim of a global physical-space error bound for an arbitrary curved map.
+inline constexpr const char* kNek5000DisplayOperationField =
+    "SCP_Nek5000DisplayOperation";
+inline constexpr const char* kNek5000DisplayReferenceSpacingField =
+    "SCP_Nek5000DisplayReferenceSpacing";
+inline constexpr const char* kNek5000DisplaySourceElementIdsField =
+    "SCP_Nek5000DisplaySourceElementIds";
+inline constexpr const char* kNek5000SpectralSurfaceNormalArray =
+    "Normals";
 
 // Point-data provenance emitted when a two-zone .scpm manifest is read.  The
 // returned data set always uses the larger zone as a fixed world-reference
@@ -90,10 +120,9 @@ struct ReadOptions {
     bool preserveCompositeBlockBoundaries = true;
     bool attachSourceBlockIds = true;
     bool attachNek5000SpectralMetadata = true;
-    // The linear GLL-to-GLL subcells are useful for ordinary VTK consumers,
-    // but are prohibitively large for high-order production meshes. Spectral
-    // metadata and point arrays do not depend on these cells.
-    bool buildNek5000LinearizedTopology = true;
+    // Native Nek5000 output is always canonical element-local GLL data with
+    // no VTK linear subcells.  Consumers that need renderable topology must
+    // use CreateNek5000SpectralDisplayProxy or the operation API below.
     // Controls the three per-point reference/Jacobian/physical quadrature
     // arrays. Basic GLL dimensions, element ids and representation metadata
     // remain attached when spectral metadata is enabled.
@@ -126,6 +155,90 @@ struct Nek5000SpectralMetadata {
     std::size_t pointCount() const noexcept {
         return elementCount * pointsPerElement();
     }
+};
+
+// Controls a derived VTK representation for visualization/interoperability.
+// It evaluates the original tensor-product GLL polynomial at uniformly spaced
+// reference samples; it does not label non-uniform GLL nodes as VTK Lagrange
+// or Bezier cells.  Every derived point keeps element/local provenance and
+// interfaces are intentionally left unmerged.
+struct Nek5000SpectralDisplayOptions {
+    // Zero chooses a high-fidelity default: two sampled segments per GLL
+    // interval, bounded by maxSamplesPerAxis.  One gives a lower-memory,
+    // one-segment-per-interval proxy while still sampling at uniform reference
+    // locations rather than treating raw GLL points as linear topology.
+    int samplesPerGllInterval = 2;
+    int maxSamplesPerAxis = 33;
+    bool buildVolumeProxy = true;
+    bool buildExteriorSurface = true;
+    bool buildElementGrid = true;
+    bool buildGllNodes = true;
+};
+
+struct Nek5000SpectralDisplayProxy {
+    // Piecewise-linear, uniformly sampled visualization/interoperability
+    // volume.  Generic VTK clip/cutter/contour operations performed on this
+    // object are approximate display operations, never strict SEM operations.
+    vtkSmartPointer<vtkDataSet> volume;
+    // Only exterior spectral-element faces are emitted.  Shared faces are
+    // discovered through face provenance and coordinate comparison but no
+    // canonical point IDs are ever merged or modified.
+    vtkSmartPointer<vtkPolyData> exteriorSurface;
+    // Curved exterior-face GLL grid lines and all element-local GLL nodes for
+    // optional visual overlays.
+    vtkSmartPointer<vtkPolyData> elementGrid;
+    vtkSmartPointer<vtkPolyData> gllNodes;
+};
+
+// Native Nek5000 visualization operations are always evaluated from the
+// canonical element-local GLL source.  Their VTK output is an explicitly
+// labelled, unmerged, uniform-reference sampled approximation; no operation
+// uses raw GLL points as VTK Lagrange nodes or as linear GLL-to-GLL subcells.
+enum class Nek5000SpectralOperationKind {
+    Crop,
+    Clip,
+    Slice,
+    Contour,
+};
+
+struct Nek5000SpectralOperationRequest {
+    Nek5000SpectralOperationKind kind = Nek5000SpectralOperationKind::Crop;
+    std::array<double, 6> cropBounds = {0.0, 1.0, 0.0, 1.0, 0.0, 1.0};
+    std::array<double, 3> planeOrigin = {0.0, 0.0, 0.0};
+    std::array<double, 3> planeNormal = {1.0, 0.0, 0.0};
+    // The scalar is looked up in canonical point data, evaluated at every
+    // display sample, and then contoured.  contourComponent >= 0 selects a
+    // vector component; -1 requests the Euclidean magnitude.
+    std::string contourArrayName;
+    int contourComponent = 0;
+    std::vector<double> contourValues;
+};
+
+struct Nek5000SpectralOperationOptions {
+    // Reuses the same evaluator-backed reference sampling used by the display
+    // proxy.  The actual maximum reference edge is returned in the result and
+    // stored in field data for provenance.
+    int samplesPerGllInterval = 2;
+    int maxSamplesPerAxis = 33;
+    // Builds a PBR-ready surface.  For original exterior faces its normals
+    // are calculated from spectral mapping derivatives.  Normals on a
+    // clipped/sliced/contoured result are explicitly marked sampled-display
+    // normals because the operation surface is an approximation.
+    bool preparePbrSurface = false;
+};
+
+struct Nek5000SpectralOperationResult {
+    vtkSmartPointer<vtkDataSet> data;
+    vtkSmartPointer<vtkPolyData> pbrSurface;
+    double maximumReferenceEdgeLength = 0.0;
+    bool isApproximation = true;
+};
+
+struct Nek5000SpectralProbeResult {
+    int elementIndex = -1;
+    int elementId = -1;
+    std::array<double, 3> referenceCoordinates = {0.0, 0.0, 0.0};
+    std::vector<double> values;
 };
 
 struct Nek5000PointEvaluationOptions {
@@ -172,9 +285,32 @@ public:
     // ordering. This avoids duplicating large spectral meshes for time series.
     Nek5000SpectralPointEvaluator WithPointArray(
         vtkDataArray* pointArray) const;
+    // Evaluates the element-local GLL tensor polynomial directly at a known
+    // reference coordinate.  This is intended for SEM-aware derived display
+    // adapters and diagnostics; it never performs a VTK-cell interpolation.
+    // elementIndex is the canonical local element ordinal, not a VTK cell id.
+    bool EvaluateReference(std::size_t elementIndex,
+                           const double referencePoint[3],
+                           double* tuple) const;
     bool Evaluate(const double physicalPoint[3],
                   double* tuple,
                   int* elementHint = nullptr) const;
+    // Like Evaluate(), while also returning the element-local reference
+    // position selected by the high-order inverse mapping.  This is the
+    // native probe/picking path; it never interpolates a display proxy.
+    bool EvaluateWithReference(const double physicalPoint[3],
+                               double* tuple,
+                               int* elementHint,
+                               std::array<double, 3>* referencePoint) const;
+    // Evaluates the spectral geometry mapping and its reference derivatives.
+    // The derivative vectors are useful for evaluator-derived exterior PBR
+    // normals and never rely on VTK's linear-cell derivatives.
+    bool EvaluateGeometryReference(std::size_t elementIndex,
+                                   const double referencePoint[3],
+                                   std::array<double, 3>* physicalPoint,
+                                   std::array<double, 3>* derivativeR,
+                                   std::array<double, 3>* derivativeS,
+                                   std::array<double, 3>* derivativeT) const;
 
 private:
     struct Impl;
@@ -208,6 +344,41 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(
 
 bool HasNek5000SpectralMetadata(vtkDataSet* dataSet);
 Nek5000SpectralMetadata GetNek5000SpectralMetadata(vtkDataSet* dataSet);
+
+// Returns true for one of the explicit derived display representations below,
+// rather than for the canonical element-local GLL source data.
+bool IsNek5000SpectralDisplayProxy(vtkDataSet* dataSet);
+
+// Creates a traceable display proxy from canonical Nek5000 data.  The
+// canonical input is read only and remains the sole source for strict SEM
+// operations.  The default proxy uses high-fidelity uniform-reference
+// sampling; it never treats raw GLL nodes as VTK cells.
+Nek5000SpectralDisplayProxy CreateNek5000SpectralDisplayProxy(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralDisplayOptions& options = {});
+
+// Applies one evaluator-sampled Native Nek5000 operation.  For a chain of
+// filters use CreateNek5000SpectralOperationPipeline so all stages share one
+// unmerged SEM-derived sampling representation and provenance contract.
+Nek5000SpectralOperationResult CreateNek5000SpectralOperation(
+    vtkDataSet* canonicalDataSet,
+    const Nek5000SpectralOperationRequest& request,
+    const Nek5000SpectralOperationOptions& options = {});
+
+Nek5000SpectralOperationResult CreateNek5000SpectralOperationPipeline(
+    vtkDataSet* canonicalDataSet,
+    const std::vector<Nek5000SpectralOperationRequest>& requests,
+    const Nek5000SpectralOperationOptions& options = {});
+
+// Evaluates a Native Nek5000 point field directly at a physical point.  The
+// output preserves the selected element-local degree-of-freedom provenance;
+// on a shared interface either valid adjacent element may be reported.
+bool ProbeNek5000SpectralField(
+    vtkDataSet* canonicalDataSet,
+    vtkDataArray* pointArray,
+    const double physicalPoint[3],
+    Nek5000SpectralProbeResult* result,
+    const Nek5000PointEvaluationOptions& options = {});
 
 // Returns true when two spectral datasets use the same tensor dimensions,
 // canonical global-element ordering and point coordinates. tolerance is an

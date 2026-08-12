@@ -37,6 +37,9 @@ public:
                                                      bool coordinateCheck,
                                                      const ProgressCallback& progress = {},
                                                      const CancellationCallback& shouldCancel = {});
+    // Reads Native Nek5000 through the shared canonical element-local GLL
+    // reader.  It deliberately does not construct legacy linear GLL subcells
+    // while probing frames, coordinates, or fields.
     static FlowDataScanResult scanNek5000File(const QString& filePath,
                                               FlowDataKind dataKind,
                                               bool coordinateCheck,

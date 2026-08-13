@@ -34,6 +34,7 @@ function Resolve-ComponentSuperprojectRoot {
 }
 
 $moduleRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
+. (Join-Path $moduleRoot "cmake\TransactionalPublish.ps1")
 $vcpkgCommit = "42f37e46d37baf7b218966434b91116bddf73461"
 $vcpkgRepository = "https://github.com/microsoft/vcpkg.git"
 $sdkRepository = "https://github.com/hweifluids/SCP-SolverSDK.git"
@@ -209,29 +210,65 @@ Invoke-NativeCommand -Executable $cmake.Source `
     -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel") `
     -FailureMessage "SCP-ResamplerIO Release build failed."
 
-$toolsDirectory = [System.IO.Path]::GetFullPath((Join-Path $InstallDir "tools"))
-if (-not $toolsDirectory.StartsWith($InstallDir + [System.IO.Path]::DirectorySeparatorChar,
-                                    [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing to replace a tools directory outside the selected install prefix: $toolsDirectory"
-}
-if (Test-Path -LiteralPath $toolsDirectory) {
-    Remove-Item -LiteralPath $toolsDirectory -Recurse -Force
+function Assert-ResamplerReleaseIdentity {
+    param([Parameter(Mandatory = $true)][string]$ReleaseRoot)
+
+    $toolsRoot = Join-Path $ReleaseRoot "tools"
+    $tools = @(Get-ChildItem -LiteralPath $toolsRoot -Filter "Resample_solver_*.exe" `
+        -File -ErrorAction SilentlyContinue)
+    if ($tools.Count -ne 1 -or $tools[0].Length -le 0) {
+        throw "Validated release must contain exactly one non-empty dated Resample tool under $toolsRoot."
+    }
+    $identity = (& $tools[0].FullName --solver-info | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "The staged Resample tool failed its identity command. Exit code: $LASTEXITCODE"
+    }
+    $requiredLines = @(
+        "streamcenterplus_solver_identity=1",
+        "product=Streamcenter+",
+        "type=tools",
+        "solver=Resample",
+        "version=0.3.0",
+        "cpu=1",
+        "cuda=0"
+    )
+    $identityLines = @($identity -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($required in $requiredLines) {
+        if ($identityLines -cnotcontains $required) {
+            throw "The staged Resample identity is missing exact line '$required'."
+        }
+    }
 }
 
-Invoke-NativeCommand -Executable $cmake.Source `
-    -Arguments @("--install", $BuildDir, "--config", "Release", "--prefix", $InstallDir) `
-    -FailureMessage "SCP-ResamplerIO Release install failed."
-
-$tool = Get-ChildItem -LiteralPath (Join-Path $InstallDir "tools") `
-    -Filter "Resample_solver_*.exe" -File -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-if ($null -eq $tool) {
-    throw "Install succeeded, but no dated Resample tool was found in $(Join-Path $InstallDir 'tools')."
+$stageParent = [System.IO.Path]::GetFullPath((Join-Path $BuildDir "publish-stage"))
+$stagedRelease = Join-Path $stageParent "release"
+if (-not $stageParent.StartsWith($BuildDir + [System.IO.Path]::DirectorySeparatorChar,
+                                 [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to stage installation outside the module build tree: $stageParent"
 }
-Invoke-NativeCommand -Executable $tool.FullName `
-    -Arguments @("--solver-info") `
-    -FailureMessage "The installed Resample tool failed its identity check."
+if (Test-Path -LiteralPath $stageParent) {
+    Remove-Item -LiteralPath $stageParent -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $stageParent | Out-Null
+try {
+    Invoke-NativeCommand -Executable $cmake.Source `
+        -Arguments @("--install", $BuildDir, "--config", "Release", "--prefix", $stagedRelease) `
+        -FailureMessage "SCP-ResamplerIO staged Release install failed."
+    Assert-ResamplerReleaseIdentity -ReleaseRoot $stagedRelease
+    $validatedIdentity = Publish-TransactionalDirectory `
+        -StagedDirectory $stagedRelease `
+        -DestinationDirectory $InstallDir `
+        -Validate ${function:Assert-ResamplerReleaseIdentity}
+    Write-Host "Validated release content SHA-256: $validatedIdentity"
+}
+finally {
+    if (Test-Path -LiteralPath $stageParent) {
+        Remove-Item -LiteralPath $stageParent -Recurse -Force
+    }
+}
+
+$tool = @(Get-ChildItem -LiteralPath (Join-Path $InstallDir "tools") `
+    -Filter "Resample_solver_*.exe" -File)[0]
 
 Write-Host "SCP-ResamplerIO installed to $InstallDir"
 Write-Host "Resample tool ready at $($tool.FullName)"

@@ -13,11 +13,25 @@
 
 The command-line release is always installed below this repository at `release/tools`. Build trees, downloaded dependencies, and generated releases stay under `.build`, `.deps`, and `release`; all are ignored by Git.
 
+Resample result publication is namespace- and manifest-bound. `output_basename`
+must be one portable filename component (no absolute root, separator, `..`, or
+reserved filename characters). Before changing an existing result, the solver
+fully loads and fingerprints the selected input sequence. Its
+`<basename>.scp-resample-manifest` binds ordered source content, frame times,
+array schema, grid topology/coordinates, every interpolation and domain
+transform setting, implementation version, and SHA-256 checksums for published
+VTI/PVD/summary files. `solver_status=error` reuses only a contiguous checksum-
+validated prefix with the same complete identity. Cleanup never sweeps unrelated
+VTI/PVD files; without a valid ownership manifest, an occupied basename
+namespace is preserved and the run fails closed. Frame files, PVD, summary, and
+the manifest are published through same-directory temporary files and atomic
+replacement.
+
 ## Format boundary
 
 - **VTK:** scans legacy/XML VTK datasets, PVD collections, and VTKHDF time steps. The resampler accepts VTK datasets and writes uniform `vtkImageData` frames as VTI plus a PVD collection.
 - **Tecplot:** accepts ASCII `.dat` and classic binary `.plt` sources, including `ORDERED` zones (loaded as `vtkStructuredGrid`), fixed finite-element line, triangle, quadrilateral, tetrahedron, and brick zones, plus face-based `FEPOLYGON` and `FEPOLYHEDRON` zones (loaded as VTK polygon/polyhedron cells). Each file is exposed through the same single-file frame API used by the raw solvers and can be passed directly to the Resample tool or `FlowDataInspector::scanFolder`; folders are ordered as normal frame series. Classic `.plt` supports its documented v112/v191 layouts, byte order, nodal/cell variables, shared variables/connectivity, and shared face maps. Tecplot subzone `.szplt` and solution-only `.plt` files are intentionally not supported.
-- **Nek5000:** accepts `.nek5000` and `.nek` descriptors and reads the referenced `#std` field files directly, without an intermediate VTU. Standard `visnek` file templates with one, two, or three integer conversions are supported, including multi-output-directory layouts such as `A%01d/case%01d.f%05d`. The reader supports 4/8-byte words, either endian, 2-D/3-D and anisotropic GLL dimensions, multi-file element maps, mesh-bearing or mesh-reusing frames, velocity, pressure, temperature, and passive scalars. Values remain element-local `double` GLL nodal values; coincident interface nodes are intentionally not merged, and elements are returned in canonical global-ID order across pieces and frames. The output can carry reference GLL weights, the signed mapping Jacobian, physical quadrature weights `w_r w_s w_t |J|`, global spectral-element IDs, and tensor dimensions. `ComputeNek5000SpectralGradient` differentiates in reference space with the GLL derivative matrices and transforms with the inverse physical Jacobian (or the 2-D tangent metric). `Nek5000SpectralPointEvaluator` inverts the curved element mapping with Newton iteration and evaluates the tensor-product GLL polynomial. Its BVH uses conservative bounds for the complete high-order mapping, including curved regions outside the GLL-node box; `bounds()` exposes the resulting global physical box. The Resample solver automatically uses this spectral interpolation path for Nek data instead of interpolating the visualization-only linear subcells.
+- **Nek5000:** accepts `.nek5000` and `.nek` descriptors and reads the referenced `#std` field files directly, without an intermediate VTU. Standard `visnek` file templates with one, two, or three integer conversions are supported, including multi-output-directory layouts such as `A%01d/case%01d.f%05d`. The reader supports 4/8-byte words, either endian, 2-D/3-D and anisotropic GLL dimensions, multi-file element maps, mesh-bearing or mesh-reusing frames, velocity, pressure, temperature, and passive scalars. Header dimensions, element/file counts, offsets, file extent, and all allocation arithmetic are checked before allocation; explicit resource ceilings reject unreasonable headers while retaining the fixed large integration corpus. Sparse positive global element IDs are supported and duplicates are rejected across pieces. Values remain element-local `double` GLL nodal values; coincident interface nodes are intentionally not merged, and elements are returned in canonical global-ID order across pieces and frames. The output can carry reference GLL weights, the signed mapping Jacobian, physical quadrature weights `w_r w_s w_t |J|`, global spectral-element IDs, and tensor dimensions. `ComputeNek5000SpectralGradient` differentiates in reference space with the GLL derivative matrices and transforms with the inverse physical Jacobian (or the 2-D tangent metric). `Nek5000SpectralPointEvaluator` inverts the curved element mapping with Newton iteration and evaluates the tensor-product GLL polynomial. Its BVH uses conservative bounds for the complete high-order mapping, including curved regions outside the GLL-node box; `bounds()` exposes the resulting global physical box. The Resample solver automatically uses this spectral interpolation path for Nek data instead of interpolating the visualization-only linear subcells.
 - **OpenFOAM:** opens reconstructed or decomposed cases and their native time sequence directly through `vtkPOpenFOAMReader`; only the internal volume mesh is assembled for analysis.
 - **EnSight Gold:** opens ASCII or binary Gold `.case` sources and their native time sequence directly through `vtkGenericEnSightReader`.
 
@@ -164,7 +178,15 @@ bash ./install.sh
 
 The installers bootstrap vcpkg at commit `42f37e46d37baf7b218966434b91116bddf73461` when the selected fixed checkout is absent. Package versions are anchored by the same manifest baseline. No dependency path, triplet, SDK path, or environment variable is accepted.
 
-Windows target and host dependency builds use the module overlay triplet with the Visual Studio 2022 `v143` platform toolset, dynamic CRT/libraries, and Release-only packages. Linux uses the matching `x64-linux-release` overlay triplet for target and host packages. Pass `-Clean` on Windows or `--clean` on Linux to remove only this module's `.build` tree before rebuilding. Every installation replaces `release/tools` after a successful build so stale dated executables cannot survive.
+Windows target and host dependency builds use the module overlay triplet with the Visual Studio 2022 `v143` platform toolset, dynamic CRT/libraries, and Release-only packages. Linux uses the matching `x64-linux-release` overlay triplet for target and host packages. Pass `-Clean` on Windows or `--clean` on Linux to remove only this module's `.build` tree before rebuilding. Every installation transactionally replaces the complete `release` prefix after a successful staged validation, so stale dated executables cannot survive.
+
+Installers first install into a staging prefix under the fixed module build
+tree. They reject links/reparse points, compute a complete staged-content
+SHA-256 identity, and require exactly one non-empty Resample executable whose
+`--solver-info` fields identify Streamcenter+ `type=tools`, `solver=Resample`,
+version `0.3.0`, CPU enabled and CUDA disabled. Only then is the complete
+`release` directory swapped into place; post-swap identity validation failure
+restores the previous release.
 
 Inside the Streamcenter+ superproject, the installer automatically uses the superproject checkout at `.deps/vcpkg`; detached use automatically uses this module's `.deps/vcpkg`. In both cases installed packages remain private at `SCP-ResamplerIO/.deps/vcpkg_installed`.
 

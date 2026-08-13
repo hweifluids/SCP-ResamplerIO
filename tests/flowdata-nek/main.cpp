@@ -273,8 +273,8 @@ void ValidateSpectralBounds(const fs::path& descriptor) {
 
 int main() {
     try {
-        const fs::path root = fs::path(SCP_REPOSITORY_ROOT) / ".tests" /
-            "flowdata-nek" / "SCP-ResamplerIO";
+        const fs::path root = fs::path(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT) /
+                              "flowdata-nek";
         fs::remove_all(root);
         fs::create_directories(root);
         ValidateCanonicalFlowDataScan(CreateFixture(root));

@@ -1,13 +1,17 @@
 #include "streamcenterplus_resample/Core.h"
+#include "ParameterValidation.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -33,6 +37,13 @@ std::string ToLower(std::string value) {
 
 std::string StripQuotes(std::string value) {
     value = Trim(value);
+    const bool startsQuote = !value.empty() && (value.front() == '"' || value.front() == '\'');
+    const bool endsQuote = !value.empty() && (value.back() == '"' || value.back() == '\'');
+    if (startsQuote || endsQuote) {
+        if (value.size() < 2 || value.front() != value.back()) {
+            throw std::runtime_error("Parameter value has unmatched or mismatched quotes: " + value);
+        }
+    }
     if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') ||
                               (value.front() == '\'' && value.back() == '\''))) {
         return value.substr(1, value.size() - 2);
@@ -101,16 +112,20 @@ std::map<std::string, std::string> ParseDeck(const std::filesystem::path& deckFi
     std::map<std::string, std::string> raw;
     std::vector<std::string> blockStack;
     std::string line;
+    std::size_t lineNumber = 0;
     while (std::getline(input, line)) {
+        ++lineNumber;
         line = StripInlineComment(line);
         if (line.empty()) {
             continue;
         }
 
         while (!line.empty() && line.front() == '}') {
-            if (!blockStack.empty()) {
-                blockStack.pop_back();
+            if (blockStack.empty()) {
+                throw std::runtime_error("Unexpected closing block at parameter line " +
+                                         std::to_string(lineNumber) + ".");
             }
+            blockStack.pop_back();
             line = Trim(line.substr(1));
         }
         if (line.empty()) {
@@ -119,15 +134,18 @@ std::map<std::string, std::string> ParseDeck(const std::filesystem::path& deckFi
 
         if (line.back() == '{') {
             const std::string blockName = NormalizeKey(line.substr(0, line.size() - 1));
-            if (!blockName.empty()) {
-                blockStack.push_back(blockName);
+            if (blockName.empty()) {
+                throw std::runtime_error("Empty parameter block name at line " +
+                                         std::to_string(lineNumber) + ".");
             }
+            blockStack.push_back(blockName);
             continue;
         }
 
         const auto eq = line.find('=');
         if (eq == std::string::npos) {
-            continue;
+            throw std::runtime_error("Malformed parameter line " + std::to_string(lineNumber) +
+                                     ": expected key=value or a block delimiter.");
         }
 
         std::string key = NormalizeKey(line.substr(0, eq));
@@ -135,10 +153,15 @@ std::map<std::string, std::string> ParseDeck(const std::filesystem::path& deckFi
         int bracketBalance = static_cast<int>(std::count(value.begin(), value.end(), '[')) -
                              static_cast<int>(std::count(value.begin(), value.end(), ']'));
         while (bracketBalance > 0 && std::getline(input, line)) {
+            ++lineNumber;
             line = StripInlineComment(line);
             value += " " + line;
             bracketBalance += static_cast<int>(std::count(line.begin(), line.end(), '['));
             bracketBalance -= static_cast<int>(std::count(line.begin(), line.end(), ']'));
+        }
+        if (bracketBalance != 0) {
+            throw std::runtime_error("Unbalanced list brackets near parameter line " +
+                                     std::to_string(lineNumber) + ".");
         }
 
         std::string fullKey;
@@ -146,37 +169,55 @@ std::map<std::string, std::string> ParseDeck(const std::filesystem::path& deckFi
             fullKey += block + ".";
         }
         fullKey += key;
-        raw[NormalizeKey(fullKey)] = value;
+        fullKey = NormalizeKey(fullKey);
+        if (key.empty()) {
+            throw std::runtime_error("Parameter line " + std::to_string(lineNumber) +
+                                     " has an empty key.");
+        }
+        if (!raw.emplace(fullKey, value).second) {
+            throw std::runtime_error("Duplicate parameter key '" + fullKey + "'.");
+        }
+    }
+    if (!blockStack.empty()) {
+        throw std::runtime_error("Parameter file ended before closing block '" +
+                                 blockStack.back() + "'.");
     }
     return raw;
-}
-
-bool TryRaw(const std::map<std::string, std::string>& raw, const std::string& key, std::string* out) {
-    const std::string normalized = NormalizeKey(key);
-    if (const auto it = raw.find(normalized); it != raw.end()) {
-        if (out != nullptr) {
-            *out = it->second;
-        }
-        return true;
-    }
-    if (const auto it = raw.find("resample." + normalized); it != raw.end()) {
-        if (out != nullptr) {
-            *out = it->second;
-        }
-        return true;
-    }
-    return false;
 }
 
 bool TryAliases(const std::map<std::string, std::string>& raw,
                 const std::initializer_list<const char*> keys,
                 std::string* out) {
+    std::set<std::string> visited;
+    std::optional<std::pair<std::string, std::string>> selected;
     for (const char* key : keys) {
-        if (TryRaw(raw, key, out)) {
-            return true;
+        const std::string normalized = NormalizeKey(key);
+        const std::array<std::string, 2> candidates = {
+            normalized,
+            "resample." + normalized,
+        };
+        for (const std::string& candidate : candidates) {
+            if (!visited.insert(candidate).second) {
+                continue;
+            }
+            const auto found = raw.find(candidate);
+            if (found == raw.end()) {
+                continue;
+            }
+            if (selected.has_value()) {
+                throw std::runtime_error("Parameter aliases '" + selected->first + "' and '" +
+                                         candidate + "' were both provided.");
+            }
+            selected = std::make_pair(candidate, found->second);
         }
     }
-    return false;
+    if (!selected.has_value()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = selected->second;
+    }
+    return true;
 }
 
 bool TryString(const std::map<std::string, std::string>& raw,
@@ -212,7 +253,53 @@ bool TryBool(const std::map<std::string, std::string>& raw,
              const std::initializer_list<const char*> keys,
              bool* out) {
     std::string value;
-    return TryAliases(raw, keys, &value) && TryBoolText(value, out);
+    if (!TryAliases(raw, keys, &value)) {
+        return false;
+    }
+    if (!TryBoolText(value, out)) {
+        throw std::runtime_error("Invalid boolean parameter value: '" + value + "'.");
+    }
+    return true;
+}
+
+int ParseIntToken(const std::string& rawValue, const char* description) {
+    const std::string value = StripQuotes(rawValue);
+    if (value.empty()) {
+        throw std::runtime_error(std::string(description) + " must be an integer, not an empty value.");
+    }
+    try {
+        std::size_t consumed = 0;
+        const long long parsed = std::stoll(value, &consumed, 10);
+        if (consumed != value.size() ||
+            parsed < static_cast<long long>(std::numeric_limits<int>::min()) ||
+            parsed > static_cast<long long>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("out of range or trailing characters");
+        }
+        return static_cast<int>(parsed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string(description) +
+                                 " must be a complete in-range integer token; received '" +
+                                 rawValue + "'.");
+    }
+}
+
+double ParseFiniteDoubleToken(const std::string& rawValue, const char* description) {
+    const std::string value = StripQuotes(rawValue);
+    if (value.empty()) {
+        throw std::runtime_error(std::string(description) + " must be a finite number, not an empty value.");
+    }
+    try {
+        std::size_t consumed = 0;
+        const double parsed = std::stod(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed)) {
+            throw std::runtime_error("non-finite or trailing characters");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string(description) +
+                                 " must be a complete finite numeric token; received '" +
+                                 rawValue + "'.");
+    }
 }
 
 bool TryInt(const std::map<std::string, std::string>& raw,
@@ -222,12 +309,8 @@ bool TryInt(const std::map<std::string, std::string>& raw,
     if (!TryAliases(raw, keys, &value) || out == nullptr) {
         return false;
     }
-    try {
-        *out = std::stoi(StripQuotes(value));
-        return true;
-    } catch (...) {
-        return false;
-    }
+    *out = ParseIntToken(value, "Integer parameter");
+    return true;
 }
 
 bool TryDouble(const std::map<std::string, std::string>& raw,
@@ -237,17 +320,24 @@ bool TryDouble(const std::map<std::string, std::string>& raw,
     if (!TryAliases(raw, keys, &value) || out == nullptr) {
         return false;
     }
-    value = ToLower(StripQuotes(value));
-    if (value == "auto" || value == "default" || value == "none" || value.empty()) {
+    *out = ParseFiniteDoubleToken(value, "Numeric parameter");
+    return true;
+}
+
+bool TryAutoDouble(const std::map<std::string, std::string>& raw,
+                   const std::initializer_list<const char*> keys,
+                   double* out) {
+    std::string value;
+    if (!TryAliases(raw, keys, &value) || out == nullptr) {
+        return false;
+    }
+    const std::string normalized = ToLower(StripQuotes(value));
+    if (normalized == "auto" || normalized == "default" || normalized == "none") {
         *out = 0.0;
         return true;
     }
-    try {
-        *out = std::stod(value);
-        return true;
-    } catch (...) {
-        return false;
-    }
+    *out = ParseFiniteDoubleToken(value, "Numeric parameter");
+    return true;
 }
 
 bool TryVector3i(const std::map<std::string, std::string>& raw,
@@ -259,19 +349,17 @@ bool TryVector3i(const std::map<std::string, std::string>& raw,
     }
     const std::vector<std::string> tokens = SplitList(value);
     if (tokens.size() != 3) {
-        return false;
+        throw std::runtime_error("Grid dimensions must contain exactly three integer values.");
     }
-    try {
-        *out = {std::stoi(tokens[0]), std::stoi(tokens[1]), std::stoi(tokens[2])};
-        return true;
-    } catch (...) {
-        return false;
-    }
+    *out = {ParseIntToken(tokens[0], "Grid dimension"),
+            ParseIntToken(tokens[1], "Grid dimension"),
+            ParseIntToken(tokens[2], "Grid dimension")};
+    return true;
 }
 
 bool IsAutoText(const std::string& rawValue) {
     const std::string value = ToLower(StripQuotes(rawValue));
-    return value.empty() || value == "all" || value == "auto" || value == "default" ||
+    return value == "all" || value == "auto" || value == "default" ||
            value == "none";
 }
 
@@ -305,10 +393,10 @@ bool TryAxisRange(const std::map<std::string, std::string>& raw,
 
     AxisRange parsed;
     if (!IsAutoLowerBound(tokens[0])) {
-        parsed.min = std::stod(tokens[0]);
+        parsed.min = ParseFiniteDoubleToken(tokens[0], "Coordinate crop lower bound");
     }
     if (!IsAutoUpperBound(tokens[1])) {
-        parsed.max = std::stod(tokens[1]);
+        parsed.max = ParseFiniteDoubleToken(tokens[1], "Coordinate crop upper bound");
     }
     if (parsed.min.has_value() && parsed.max.has_value() && *parsed.max < *parsed.min) {
         throw std::runtime_error("Coordinate crop range max must be >= min.");
@@ -335,10 +423,10 @@ bool TryFrameRange(const std::map<std::string, std::string>& raw,
 
     FrameRange parsed;
     if (!IsAutoLowerBound(tokens[0])) {
-        parsed.start = static_cast<int>(std::nearbyint(std::stod(tokens[0])));
+        parsed.start = ParseIntToken(tokens[0], "Frame range start");
     }
     if (!IsAutoUpperBound(tokens[1])) {
-        parsed.end = static_cast<int>(std::nearbyint(std::stod(tokens[1])));
+        parsed.end = ParseIntToken(tokens[1], "Frame range end");
     }
     if (parsed.start.has_value() && parsed.end.has_value() && *parsed.end < *parsed.start) {
         throw std::runtime_error("Frame range end must be >= start.");
@@ -360,12 +448,14 @@ bool TryVector3dOrScalar(const std::map<std::string, std::string>& raw,
     }
     const std::vector<std::string> tokens = SplitList(value);
     if (tokens.size() == 1) {
-        const double scale = std::stod(tokens[0]);
+        const double scale = ParseFiniteDoubleToken(tokens[0], "Input scale");
         *out = {scale, scale, scale};
         return true;
     }
     if (tokens.size() == 3) {
-        *out = {std::stod(tokens[0]), std::stod(tokens[1]), std::stod(tokens[2])};
+        *out = {ParseFiniteDoubleToken(tokens[0], "Input scale"),
+                ParseFiniteDoubleToken(tokens[1], "Input scale"),
+                ParseFiniteDoubleToken(tokens[2], "Input scale")};
         return true;
     }
     throw std::runtime_error("Input scale must be a scalar or a three-value vector, or be empty/all/auto.");
@@ -525,7 +615,7 @@ void ParseEnums(const std::map<std::string, std::string>& raw, Parameters* param
     }
 }
 
-void Validate(Parameters* params) {
+void ValidateParametersImpl(Parameters* params) {
     if (params == nullptr) {
         return;
     }
@@ -545,11 +635,24 @@ void Validate(Parameters* params) {
             throw std::runtime_error("resample dimensions/Nx Ny Nz must all be >= 1.");
         }
     }
+    constexpr std::uint64_t kMaximumOutputPoints = 1000000000ull;
+    std::uint64_t pointCount = 1;
+    for (int dim : params->dimensions) {
+        const std::uint64_t factor = static_cast<std::uint64_t>(dim);
+        if (factor > kMaximumOutputPoints || pointCount > kMaximumOutputPoints / factor) {
+            throw std::runtime_error(
+                "resample dimensions request more than the 1,000,000,000-point safety limit.");
+        }
+        pointCount *= factor;
+    }
     if (params->physicalDt <= 0.0 || !std::isfinite(params->physicalDt)) {
         throw std::runtime_error("physical_dt/dt must be positive when provided.");
     }
     if (params->frameRange.start.has_value() && *params->frameRange.start < 0) {
         throw std::runtime_error("frame_range/T_range start must be non-negative.");
+    }
+    if (params->frameRange.end.has_value() && *params->frameRange.end < 0) {
+        throw std::runtime_error("frame_range/T_range end must be non-negative.");
     }
     if (params->frameRange.start.has_value() && params->frameRange.end.has_value() &&
         *params->frameRange.end < *params->frameRange.start) {
@@ -569,31 +672,63 @@ void Validate(Parameters* params) {
             throw std::runtime_error("Input scale values must be positive finite numbers.");
         }
     }
-    params->idw.neighbors = std::max(1, params->idw.neighbors);
-    params->kriging.neighbors = std::max(1, params->kriging.neighbors);
-    params->kriging.minNeighbors = std::max(1, params->kriging.minNeighbors);
-    if (params->kriging.minNeighbors > params->kriging.neighbors &&
-        params->kriging.neighborMode == NeighborMode::Nearest) {
-        params->kriging.minNeighbors = params->kriging.neighbors;
+    if (!std::isfinite(params->linear.tolerance) || params->linear.tolerance < 0.0) {
+        throw std::runtime_error("Linear tolerance must be a finite non-negative number.");
+    }
+    if (params->idw.neighbors < 1) {
+        throw std::runtime_error("IDW neighbors must be at least 1.");
+    }
+    if (params->kriging.neighbors < 1 || params->kriging.minNeighbors < 1) {
+        throw std::runtime_error("Kriging neighbors and min_neighbors must be at least 1.");
+    }
+    if (params->kriging.minNeighbors > params->kriging.neighbors) {
+        throw std::runtime_error("Kriging min_neighbors cannot exceed the neighbor limit.");
     }
     if (params->idw.power <= 0.0 || !std::isfinite(params->idw.power)) {
         throw std::runtime_error("IDW power must be positive.");
     }
-    if (params->idw.radius < 0.0 || params->kriging.radius < 0.0 ||
-        params->kriging.range < 0.0) {
+    if (!std::isfinite(params->idw.radius) || !std::isfinite(params->kriging.radius) ||
+        !std::isfinite(params->kriging.range) || params->idw.radius < 0.0 ||
+        params->kriging.radius < 0.0 || params->kriging.range < 0.0) {
         throw std::runtime_error("Interpolation radii/range must be non-negative; use 0/auto for automatic values.");
+    }
+    if (!std::isfinite(params->idw.nullValue)) {
+        throw std::runtime_error("IDW null_value must be finite.");
     }
     if (params->kriging.sill <= 0.0 || !std::isfinite(params->kriging.sill)) {
         throw std::runtime_error("Kriging sill must be positive.");
     }
-    if (params->kriging.nugget < 0.0 || params->kriging.regularization < 0.0) {
+    if (!std::isfinite(params->kriging.nugget) ||
+        !std::isfinite(params->kriging.regularization) ||
+        params->kriging.nugget < 0.0 || params->kriging.regularization < 0.0) {
         throw std::runtime_error("Kriging nugget and regularization must be non-negative.");
+    }
+    if (!std::isfinite(params->kriging.nullValue)) {
+        throw std::runtime_error("Kriging null_value must be finite.");
     }
     if (params->kriging.fallbackIdwPower <= 0.0 || !std::isfinite(params->kriging.fallbackIdwPower)) {
         throw std::runtime_error("Kriging fallback_idw_power must be positive.");
     }
     if (params->outputBasename.empty()) {
         params->outputBasename = DefaultBasename(params->deckFile);
+    }
+    const std::filesystem::path basenamePath(params->outputBasename);
+    const bool containsSeparator = params->outputBasename.find('/') != std::string::npos ||
+                                   params->outputBasename.find('\\') != std::string::npos;
+    const bool containsTraversal = params->outputBasename.find("..") != std::string::npos;
+    const bool containsPortableInvalid =
+        params->outputBasename.find_first_of("<>:\"|?*") != std::string::npos;
+    const bool containsControl = std::any_of(
+        params->outputBasename.begin(), params->outputBasename.end(), [](unsigned char ch) {
+            return ch < 0x20u || ch == 0x7fu;
+        });
+    if (basenamePath.is_absolute() || basenamePath.has_root_name() ||
+        basenamePath.has_root_directory() || basenamePath.has_parent_path() ||
+        containsSeparator || containsTraversal || containsPortableInvalid || containsControl ||
+        params->outputBasename == ".") {
+        throw std::runtime_error(
+            "output_basename must be one portable filename component without absolute roots, "
+            "path separators, '..', control characters, or reserved filename characters.");
     }
 }
 
@@ -629,6 +764,10 @@ std::string FormatVector3d(const std::array<double, 3>& values) {
 }
 
 }  // namespace
+
+void ValidateParameters(Parameters* params) {
+    ValidateParametersImpl(params);
+}
 
 std::string ToString(Backend value) {
     switch (value) {
@@ -748,12 +887,24 @@ Parameters LoadParameters(const std::filesystem::path& deckFile) {
     if (std::string pathValue; TryString(raw,
                                          {"input_path", "input", "vtk_folder", "vtk_path", "source"},
                                          &pathValue)) {
+        if (pathValue.empty()) {
+            throw std::runtime_error("input_path was provided but is empty.");
+        }
         params.inputPath = pathValue;
     }
     if (std::string pathValue; TryString(raw, {"output_dir", "output_folder", "output.path"}, &pathValue)) {
+        if (pathValue.empty()) {
+            throw std::runtime_error("output_dir was provided but is empty.");
+        }
         params.outputDir = pathValue;
     }
-    TryString(raw, {"output_basename", "basename", "output.basename"}, &params.outputBasename);
+    if (std::string basename;
+        TryString(raw, {"output_basename", "basename", "output.basename"}, &basename)) {
+        if (basename.empty()) {
+            throw std::runtime_error("output_basename was provided but is empty.");
+        }
+        params.outputBasename = basename;
+    }
     TryVector3i(raw, {"dimensions", "dims", "resolution", "grid_size", "sampling_dimensions"},
                 &params.dimensions);
     TryDouble(raw, {"physical_dt", "dt", "time_step"}, &params.physicalDt);
@@ -785,7 +936,7 @@ Parameters LoadParameters(const std::filesystem::path& deckFile) {
             &params.linear.snapToCellWithClosestPoint);
 
     TryInt(raw, {"interpolation.idw.neighbors", "idw.neighbors", "idw.k"}, &params.idw.neighbors);
-    TryDouble(raw, {"interpolation.idw.radius", "idw.radius"}, &params.idw.radius);
+    TryAutoDouble(raw, {"interpolation.idw.radius", "idw.radius"}, &params.idw.radius);
     TryDouble(raw, {"interpolation.idw.power", "idw.power"}, &params.idw.power);
     TryDouble(raw, {"interpolation.idw.null_value", "idw.null_value"}, &params.idw.nullValue);
 
@@ -795,8 +946,8 @@ Parameters LoadParameters(const std::filesystem::path& deckFile) {
     TryInt(raw,
            {"interpolation.kriging.min_neighbors", "kriging.min_neighbors"},
            &params.kriging.minNeighbors);
-    TryDouble(raw, {"interpolation.kriging.radius", "kriging.radius"}, &params.kriging.radius);
-    TryDouble(raw, {"interpolation.kriging.range", "kriging.range"}, &params.kriging.range);
+    TryAutoDouble(raw, {"interpolation.kriging.radius", "kriging.radius"}, &params.kriging.radius);
+    TryAutoDouble(raw, {"interpolation.kriging.range", "kriging.range"}, &params.kriging.range);
     TryDouble(raw, {"interpolation.kriging.sill", "kriging.sill"}, &params.kriging.sill);
     TryDouble(raw, {"interpolation.kriging.nugget", "kriging.nugget"}, &params.kriging.nugget);
     TryDouble(raw,
@@ -808,7 +959,7 @@ Parameters LoadParameters(const std::filesystem::path& deckFile) {
               &params.kriging.fallbackIdwPower);
 
     ParseEnums(raw, &params);
-    Validate(&params);
+    ValidateParameters(&params);
     return params;
 }
 

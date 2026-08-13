@@ -31,16 +31,8 @@ void Require(bool condition, const std::string& message) {
     }
 }
 
-std::filesystem::path ModuleRoot() {
-    return std::filesystem::path(SCP_RESAMPLER_IO_SOURCE_DIR).lexically_normal();
-}
-
 std::filesystem::path TestRoot() {
-    const std::filesystem::path moduleRoot = ModuleRoot();
-    if (moduleRoot.parent_path().filename() == "modules") {
-        return moduleRoot.parent_path().parent_path() / ".tests";
-    }
-    return moduleRoot / ".tests";
+    return std::filesystem::path(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT).lexically_normal();
 }
 
 std::filesystem::path DescriptorPath() {
@@ -138,9 +130,7 @@ int main() {
                 "The Nek5000 descriptor does not advertise frames 490 and 491.");
 
         const std::filesystem::path outputDirectory =
-            TestRoot() / "integration" / "SCP-ResamplerIO" / "nek5000-general-adapter";
-        Require(outputDirectory.generic_string().find("/.tests/") != std::string::npos,
-                "Refusing to write the integration test outside the fixed .tests tree.");
+            TestRoot() / "nek5000-integration" / "nek5000-general-adapter";
         std::filesystem::remove_all(outputDirectory);
         std::filesystem::create_directories(outputDirectory);
 

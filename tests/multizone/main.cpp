@@ -1281,8 +1281,8 @@ void ValidateManifestReaderAndResampler(const fs::path& root) {
 
 int main() {
     try {
-        const fs::path root = fs::path(SCP_REPOSITORY_ROOT) / ".tests" /
-                              "multizone" / "SCP-ResamplerIO";
+        const fs::path root = fs::path(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT) /
+                              "multizone";
         fs::remove_all(root);
         fs::create_directories(root);
         ValidateManifestReaderAndResampler(root);

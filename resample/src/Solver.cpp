@@ -1,4 +1,6 @@
 #include "streamcenterplus_resample/Core.h"
+#include "Integrity.h"
+#include "ParameterValidation.h"
 #include "streamcenterplus/io/DataSetReader.h"
 
 #include <vtkAbstractArray.h>
@@ -15,10 +17,10 @@
 #include <vtkImageData.h>
 #include <vtkMultiThreader.h>
 #include <vtkNew.h>
-#include <vtkPointSet.h>
 #include <vtkPointData.h>
-#include <vtkPointInterpolator.h>
 #include <vtkPoints.h>
+#include <vtkPointInterpolator.h>
+#include <vtkPointSet.h>
 #include <vtkProbeFilter.h>
 #include <vtkResampleToImage.h>
 #include <vtkSMP.h>
@@ -26,8 +28,10 @@
 #include <vtkShepardKernel.h>
 #include <vtkSmartPointer.h>
 #include <vtkStaticPointLocator.h>
+#include <vtkType.h>
 #include <vtkUnsignedCharArray.h>
 #include <vtkUnstructuredGrid.h>
+#include <vtkVariant.h>
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +39,8 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -49,6 +55,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -299,29 +306,6 @@ std::string LowerAscii(std::string value) {
         return static_cast<char>(std::tolower(ch));
     });
     return value;
-}
-
-int RemoveStaleVtiAndPvdFiles(const std::filesystem::path& outputDir) {
-    if (!std::filesystem::exists(outputDir)) {
-        return 0;
-    }
-    if (!std::filesystem::is_directory(outputDir)) {
-        throw std::runtime_error("Output path exists but is not a directory: " + outputDir.string());
-    }
-
-    int removed = 0;
-    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(outputDir)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        const std::string extension = LowerAscii(entry.path().extension().string());
-        if (extension != ".vti" && extension != ".pvd") {
-            continue;
-        }
-        std::filesystem::remove(entry.path());
-        ++removed;
-    }
-    return removed;
 }
 
 std::array<double, 6> BoundsOf(vtkDataSet* dataSet) {
@@ -1377,6 +1361,746 @@ std::string FrameFilename(const std::string& basename, int frameIndex) {
     return out.str();
 }
 
+std::optional<int> OutputFrameIndex(const std::filesystem::path& path,
+                                    const std::string& basename);
+
+constexpr const char* kResumeManifestFormat = "streamcenterplus_resample_cache_v2";
+constexpr const char* kResumeImplementationVersion = "SCP-ResamplerIO-0.3.0-resume-v2";
+constexpr std::uintmax_t kMaximumResumeManifestBytes = 16u * 1024u * 1024u;
+
+struct FrameInputIdentity {
+    std::string source;
+    double time = 0.0;
+    std::string contentChecksum;
+    std::string schemaChecksum;
+    std::string gridChecksum;
+};
+
+struct RunIdentity {
+    std::string parameterChecksum;
+    std::string signature;
+    std::vector<FrameInputIdentity> frames;
+};
+
+struct ResumeManifest {
+    std::string outputBasename;
+    std::string parameterChecksum;
+    std::string runSignature;
+    std::string state = "in_progress";
+    std::vector<FrameInputIdentity> frames;
+    std::vector<std::string> outputFiles;
+    std::vector<std::string> outputChecksums;
+    std::string pvdChecksum;
+    std::string summaryChecksum;
+};
+
+struct OutputLayout {
+    std::filesystem::path root;
+    std::filesystem::path manifest;
+    std::filesystem::path pvd;
+    std::filesystem::path summary;
+    std::vector<std::filesystem::path> frames;
+};
+
+void HashToken(integrity::Sha256* digest, const std::string& value) {
+    if (digest == nullptr) {
+        throw std::runtime_error("Internal error: null SHA-256 digest.");
+    }
+    const std::string length = std::to_string(value.size());
+    digest->Update(length);
+    digest->Update(":");
+    digest->Update(value);
+    digest->Update(";");
+}
+
+void HashInteger(integrity::Sha256* digest, long long value) {
+    HashToken(digest, std::to_string(value));
+}
+
+void HashDouble(integrity::Sha256* digest, double value) {
+    static_assert(sizeof(double) == sizeof(std::uint64_t),
+                  "Dataset identity requires an IEEE-754-sized double.");
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    std::ostringstream text;
+    text << std::hex << std::setw(16) << std::setfill('0') << bits;
+    HashToken(digest, text.str());
+}
+
+void HashArraySchema(vtkFieldData* arrays,
+                     const char* association,
+                     integrity::Sha256* schemaDigest) {
+    HashToken(schemaDigest, association != nullptr ? association : "unknown");
+    const int arrayCount = arrays != nullptr ? arrays->GetNumberOfArrays() : 0;
+    HashInteger(schemaDigest, arrayCount);
+    for (int index = 0; index < arrayCount; ++index) {
+        vtkAbstractArray* array = arrays->GetAbstractArray(index);
+        if (array == nullptr) {
+            throw std::runtime_error("Input dataset contains a null data-array entry.");
+        }
+        HashToken(schemaDigest, array->GetName() != nullptr ? array->GetName() : "");
+        HashInteger(schemaDigest, array->GetDataType());
+        HashInteger(schemaDigest, array->GetNumberOfComponents());
+        HashInteger(schemaDigest, array->GetNumberOfTuples());
+        for (int component = 0; component < array->GetNumberOfComponents(); ++component) {
+            const char* componentName = array->GetComponentName(component);
+            HashToken(schemaDigest, componentName != nullptr ? componentName : "");
+        }
+    }
+    vtkDataSetAttributes* attributes = vtkDataSetAttributes::SafeDownCast(arrays);
+    HashInteger(schemaDigest, attributes != nullptr ? 1 : 0);
+    if (attributes != nullptr) {
+        std::array<int, vtkDataSetAttributes::NUM_ATTRIBUTES> attributeIndices{};
+        attributes->GetAttributeIndices(attributeIndices.data());
+        for (int index : attributeIndices) {
+            HashInteger(schemaDigest, index);
+        }
+    }
+}
+
+bool HashNumericArrayStorage(vtkDataArray* array,
+                             integrity::Sha256* contentDigest) {
+    if (array == nullptr || array->GetDataType() == VTK_BIT) {
+        return false;
+    }
+    const vtkIdType valueCount = array->GetNumberOfValues();
+    const int bytesPerValue = array->GetDataTypeSize();
+    if (valueCount < 0 || bytesPerValue <= 0) {
+        throw std::runtime_error("Input numeric array has an invalid storage extent.");
+    }
+    const std::uint64_t count = static_cast<std::uint64_t>(valueCount);
+    const std::uint64_t width = static_cast<std::uint64_t>(bytesPerValue);
+    if (count != 0 && width > std::numeric_limits<std::uint64_t>::max() / count) {
+        throw std::runtime_error("Input numeric array byte count overflows uint64.");
+    }
+    const std::uint64_t byteCount = count * width;
+    if (byteCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("Input numeric array byte count exceeds size_t capacity.");
+    }
+    HashToken(contentDigest, std::to_string(byteCount));
+    if (byteCount == 0) {
+        return true;
+    }
+    void* storage = array->GetVoidPointer(0);
+    if (storage == nullptr) {
+        return false;
+    }
+    contentDigest->Update(storage, static_cast<std::size_t>(byteCount));
+    return true;
+}
+
+void HashArrayContents(vtkFieldData* arrays,
+                       const char* association,
+                       integrity::Sha256* contentDigest) {
+    HashToken(contentDigest, association != nullptr ? association : "unknown");
+    const int arrayCount = arrays != nullptr ? arrays->GetNumberOfArrays() : 0;
+    HashInteger(contentDigest, arrayCount);
+    for (int index = 0; index < arrayCount; ++index) {
+        vtkAbstractArray* array = arrays->GetAbstractArray(index);
+        if (array == nullptr) {
+            throw std::runtime_error("Input dataset contains a null data-array entry.");
+        }
+        HashToken(contentDigest, array->GetName() != nullptr ? array->GetName() : "");
+        vtkDataArray* numeric = vtkDataArray::SafeDownCast(array);
+        if (numeric != nullptr) {
+            if (HashNumericArrayStorage(numeric, contentDigest)) {
+                continue;
+            }
+            HashToken(contentDigest, "component-fallback");
+            const vtkIdType tuples = numeric->GetNumberOfTuples();
+            const int components = numeric->GetNumberOfComponents();
+            for (vtkIdType tuple = 0; tuple < tuples; ++tuple) {
+                for (int component = 0; component < components; ++component) {
+                    HashDouble(contentDigest, numeric->GetComponent(tuple, component));
+                }
+            }
+            continue;
+        }
+        const vtkIdType values = array->GetNumberOfValues();
+        for (vtkIdType value = 0; value < values; ++value) {
+            HashToken(contentDigest, array->GetVariantValue(value).ToString());
+        }
+    }
+}
+
+FrameInputIdentity ComputeFrameInputIdentityFromDataSet(const Parameters& params,
+                                                        const SequenceInfo& sequence,
+                                                        std::size_t frameIndex,
+                                                        vtkDataSet* input,
+                                                        bool executablePreflight) {
+    const FrameInfo& frame = sequence.frames.at(frameIndex);
+    if (input == nullptr) {
+        throw std::runtime_error("Cannot fingerprint a null input dataset.");
+    }
+
+    integrity::Sha256 gridDigest;
+    HashToken(&gridDigest, input->GetClassName() != nullptr ? input->GetClassName() : "");
+    HashInteger(&gridDigest, input->GetNumberOfPoints());
+    HashInteger(&gridDigest, input->GetNumberOfCells());
+    vtkPointSet* pointSet = vtkPointSet::SafeDownCast(input);
+    if (pointSet != nullptr && pointSet->GetPoints() != nullptr &&
+        pointSet->GetPoints()->GetData() != nullptr) {
+        vtkDataArray* coordinates = pointSet->GetPoints()->GetData();
+        HashToken(&gridDigest, "explicit-point-storage");
+        HashInteger(&gridDigest, coordinates->GetDataType());
+        HashInteger(&gridDigest, coordinates->GetNumberOfComponents());
+        HashInteger(&gridDigest, coordinates->GetNumberOfTuples());
+        if (!HashNumericArrayStorage(coordinates, &gridDigest)) {
+            throw std::runtime_error("Cannot access explicit point-coordinate storage for identity.");
+        }
+    } else {
+        HashToken(&gridDigest, "evaluated-point-coordinates");
+        for (vtkIdType pointId = 0; pointId < input->GetNumberOfPoints(); ++pointId) {
+            double point[3] = {};
+            input->GetPoint(pointId, point);
+            HashDouble(&gridDigest, point[0]);
+            HashDouble(&gridDigest, point[1]);
+            HashDouble(&gridDigest, point[2]);
+        }
+    }
+    vtkNew<vtkIdList> pointIds;
+    for (vtkIdType cellId = 0; cellId < input->GetNumberOfCells(); ++cellId) {
+        HashInteger(&gridDigest, input->GetCellType(cellId));
+        input->GetCellPoints(cellId, pointIds);
+        HashInteger(&gridDigest, pointIds->GetNumberOfIds());
+        for (vtkIdType local = 0; local < pointIds->GetNumberOfIds(); ++local) {
+            HashInteger(&gridDigest, pointIds->GetId(local));
+        }
+    }
+
+    integrity::Sha256 schemaDigest;
+    HashArraySchema(input->GetPointData(), "point", &schemaDigest);
+    HashArraySchema(input->GetCellData(), "cell", &schemaDigest);
+    HashArraySchema(input->GetFieldData(), "field", &schemaDigest);
+
+    integrity::Sha256 arrayDigest;
+    HashArrayContents(input->GetPointData(), "point", &arrayDigest);
+    HashArrayContents(input->GetCellData(), "cell", &arrayDigest);
+    HashArrayContents(input->GetFieldData(), "field", &arrayDigest);
+
+    FrameInputIdentity identity;
+    std::error_code canonicalError;
+    std::filesystem::path source = std::filesystem::weakly_canonical(
+        std::filesystem::absolute(frame.path), canonicalError);
+    if (canonicalError) {
+        source = std::filesystem::absolute(frame.path).lexically_normal();
+    }
+    std::ostringstream sourceText;
+    sourceText << source.generic_string() << "|kind=" << ToString(frame.kind)
+               << "|source_index=" << frame.sourceIndex
+               << "|coordinate_source_index=" << frame.coordinateSourceIndex
+               << "|background_index=" << frame.multiZoneBackgroundIndex;
+    if (frame.readerTime.has_value()) {
+        sourceText << "|reader_time=" << std::setprecision(17) << *frame.readerTime;
+    }
+    if (!frame.coordinatePath.empty()) {
+        sourceText << "|coordinate_path=" <<
+            std::filesystem::absolute(frame.coordinatePath).lexically_normal().generic_string();
+    }
+    identity.source = sourceText.str();
+    identity.time = frame.time;
+    identity.gridChecksum = gridDigest.FinalHex();
+    identity.schemaChecksum = schemaDigest.FinalHex();
+    identity.contentChecksum = integrity::Sha256String(
+        identity.gridChecksum + "\n" + identity.schemaChecksum + "\n" + arrayDigest.FinalHex());
+
+    if (executablePreflight) {
+        // Complete the non-destructive executable-input preflight before any old
+        // run-owned result is removed. This catches unreadable arrays, invalid
+        // crop bounds, and unsupported coordinate transforms up front.
+        vtkSmartPointer<vtkDataSet> prepared = PreparePointData(input);
+        const std::array<double, 6> inputBounds = BoundsOf(prepared);
+        (void)(sequence.seriesBoundsPrecomputed
+                   ? sequence.bounds
+                   : ResolveConfiguredBounds(params, inputBounds));
+        vtkSmartPointer<vtkDataSet> transformed =
+            ApplyInputDomainTransform(prepared, params, inputBounds);
+        if (transformed == nullptr || transformed->GetNumberOfPoints() <= 0) {
+            throw std::runtime_error("Input preflight produced no usable points for frame " +
+                                     std::to_string(frameIndex) + ".");
+        }
+    }
+    return identity;
+}
+
+FrameInputIdentity ComputeFrameInputIdentity(const Parameters& params,
+                                             const SequenceInfo& sequence,
+                                             std::size_t frameIndex) {
+    vtkSmartPointer<vtkDataSet> input = ReadDataSet(sequence.frames.at(frameIndex));
+    return ComputeFrameInputIdentityFromDataSet(params, sequence, frameIndex, input, true);
+}
+
+std::string ParameterIdentityText(const Parameters& params) {
+    const auto precise = [](double value) {
+        std::ostringstream text;
+        text << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+        return text.str();
+    };
+    std::ostringstream out;
+    out << std::setprecision(std::numeric_limits<double>::max_digits10);
+    out << "implementation=" << kResumeImplementationVersion << "\n";
+    out << "enabled=" << params.enabled << "\n";
+    out << "backend=" << ToString(params.backend) << "\n";
+    out << "method=" << ToString(params.method) << "\n";
+    out << "dimensions=" << params.dimensions[0] << ',' << params.dimensions[1] << ','
+        << params.dimensions[2] << "\n";
+    out << "bounds_mode=" << ToString(params.boundsMode) << "\n";
+    out << "output_basename=" << params.outputBasename << "\n";
+    out << "physical_dt=" << params.physicalDt << "\n";
+    out << "frame_start=" << (params.frameRange.start.has_value()
+                                  ? std::to_string(*params.frameRange.start) : "auto") << "\n";
+    out << "frame_end=" << (params.frameRange.end.has_value()
+                                ? std::to_string(*params.frameRange.end) : "auto") << "\n";
+    for (int axis = 0; axis < 3; ++axis) {
+        const AxisRange& range = params.cropRanges[static_cast<std::size_t>(axis)];
+        out << "crop" << axis << "_min="
+            << (range.min.has_value() ? precise(*range.min) : "auto") << "\n";
+        out << "crop" << axis << "_max="
+            << (range.max.has_value() ? precise(*range.max) : "auto") << "\n";
+        out << "input_scale" << axis << '=' << params.inputScale[static_cast<std::size_t>(axis)] << "\n";
+    }
+    out << "linear.compute_tolerance=" << params.linear.computeTolerance << "\n";
+    out << "linear.tolerance=" << params.linear.tolerance << "\n";
+    out << "linear.snap=" << params.linear.snapToCellWithClosestPoint << "\n";
+    out << "idw.neighbor_mode=" << ToString(params.idw.neighborMode) << "\n";
+    out << "idw.neighbors=" << params.idw.neighbors << "\n";
+    out << "idw.radius=" << params.idw.radius << "\n";
+    out << "idw.power=" << params.idw.power << "\n";
+    out << "idw.null_strategy=" << ToString(params.idw.nullStrategy) << "\n";
+    out << "idw.null_value=" << params.idw.nullValue << "\n";
+    out << "kriging.variogram=" << ToString(params.kriging.variogram) << "\n";
+    out << "kriging.neighbor_mode=" << ToString(params.kriging.neighborMode) << "\n";
+    out << "kriging.neighbors=" << params.kriging.neighbors << "\n";
+    out << "kriging.min_neighbors=" << params.kriging.minNeighbors << "\n";
+    out << "kriging.radius=" << params.kriging.radius << "\n";
+    out << "kriging.range=" << params.kriging.range << "\n";
+    out << "kriging.sill=" << params.kriging.sill << "\n";
+    out << "kriging.nugget=" << params.kriging.nugget << "\n";
+    out << "kriging.regularization=" << params.kriging.regularization << "\n";
+    out << "kriging.null_value=" << params.kriging.nullValue << "\n";
+    out << "kriging.fallback=" << ToString(params.kriging.fallback) << "\n";
+    out << "kriging.fallback_idw_power=" << params.kriging.fallbackIdwPower << "\n";
+    return out.str();
+}
+
+RunIdentity BuildRunIdentity(const Parameters& params, const SequenceInfo& sequence) {
+    RunIdentity identity;
+    identity.parameterChecksum = integrity::Sha256String(ParameterIdentityText(params));
+    identity.frames.reserve(sequence.frames.size());
+    integrity::Sha256 signature;
+    HashToken(&signature, kResumeImplementationVersion);
+    HashToken(&signature, identity.parameterChecksum);
+    for (std::size_t index = 0; index < sequence.frames.size(); ++index) {
+        FrameInputIdentity frame = ComputeFrameInputIdentity(params, sequence, index);
+        HashInteger(&signature, static_cast<long long>(index));
+        HashToken(&signature, frame.source);
+        HashDouble(&signature, frame.time);
+        HashToken(&signature, frame.contentChecksum);
+        HashToken(&signature, frame.schemaChecksum);
+        HashToken(&signature, frame.gridChecksum);
+        identity.frames.push_back(std::move(frame));
+    }
+    identity.signature = signature.FinalHex();
+    return identity;
+}
+
+bool SameFrameInputIdentity(const FrameInputIdentity& lhs,
+                            const FrameInputIdentity& rhs) {
+    return lhs.source == rhs.source && lhs.time == rhs.time &&
+           lhs.contentChecksum == rhs.contentChecksum &&
+           lhs.schemaChecksum == rhs.schemaChecksum &&
+           lhs.gridChecksum == rhs.gridChecksum;
+}
+
+bool SameFrameInputIdentities(const std::vector<FrameInputIdentity>& lhs,
+                              const std::vector<FrameInputIdentity>& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < lhs.size(); ++index) {
+        if (!SameFrameInputIdentity(lhs[index], rhs[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::filesystem::path CanonicalContainedPath(const std::filesystem::path& root,
+                                             const std::string& filename) {
+    const std::filesystem::path name(filename);
+    if (filename.empty() || name.is_absolute() || name.has_root_name() ||
+        name.has_root_directory() || name.has_parent_path() ||
+        filename.find('/') != std::string::npos || filename.find('\\') != std::string::npos ||
+        filename.find("..") != std::string::npos) {
+        throw std::runtime_error("Refusing output filename outside the validated run namespace: " +
+                                 filename);
+    }
+    const std::filesystem::path directCandidate = (root / name).lexically_normal();
+    if (directCandidate.parent_path() != root) {
+        throw std::runtime_error("Output path is not a direct child of the selected directory: " +
+                                 directCandidate.string());
+    }
+    std::error_code error;
+    const std::filesystem::file_status linkStatus =
+        std::filesystem::symlink_status(directCandidate, error);
+    if (error && linkStatus.type() != std::filesystem::file_type::not_found) {
+        throw std::runtime_error("Cannot inspect output path '" + directCandidate.string() +
+                                 "': " + error.message());
+    }
+    if (std::filesystem::is_symlink(linkStatus)) {
+        throw std::runtime_error("Output namespace entry must not be a symbolic link/reparse point: " +
+                                 directCandidate.string());
+    }
+    error.clear();
+    const std::filesystem::path candidate =
+        std::filesystem::weakly_canonical(directCandidate, error);
+    if (error) {
+        throw std::runtime_error("Cannot canonicalize output path '" + directCandidate.string() +
+                                 "': " + error.message());
+    }
+    const std::filesystem::path relative = candidate.lexically_relative(root);
+    if (relative.empty() || relative.is_absolute() || relative.has_root_name() ||
+        *relative.begin() == ".." || candidate.parent_path() != root) {
+        throw std::runtime_error("Canonical output path escapes the selected output directory: " +
+                                 candidate.string());
+    }
+    if (candidate != directCandidate) {
+        throw std::runtime_error(
+            "Requested output path aliases an existing filesystem entry with a different "
+            "identity: " + candidate.string());
+    }
+    return directCandidate;
+}
+
+OutputLayout BuildOutputLayout(const Parameters& params, std::size_t frameCount) {
+    std::error_code error;
+    const std::filesystem::path absoluteRoot = std::filesystem::absolute(params.outputDir);
+    if (std::filesystem::exists(absoluteRoot, error) && !error &&
+        !std::filesystem::is_directory(absoluteRoot)) {
+        throw std::runtime_error("Output path exists but is not a directory: " + absoluteRoot.string());
+    }
+    error.clear();
+    const std::filesystem::path root = std::filesystem::weakly_canonical(absoluteRoot, error);
+    if (error) {
+        throw std::runtime_error("Cannot canonicalize output directory '" + absoluteRoot.string() +
+                                 "': " + error.message());
+    }
+    OutputLayout layout;
+    layout.root = root;
+    layout.manifest = CanonicalContainedPath(root, params.outputBasename + ".scp-resample-manifest");
+    layout.pvd = CanonicalContainedPath(root, params.outputBasename + ".pvd");
+    layout.summary = CanonicalContainedPath(root, params.outputBasename + "_run_summary.txt");
+    layout.frames.reserve(frameCount);
+    for (std::size_t index = 0; index < frameCount; ++index) {
+        if (index > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("Frame count exceeds output filename index capacity.");
+        }
+        layout.frames.push_back(CanonicalContainedPath(
+            root, FrameFilename(params.outputBasename, static_cast<int>(index))));
+    }
+    return layout;
+}
+
+bool IsChecksum(const std::string& value, bool allowEmpty) {
+    if (allowEmpty && value.empty()) {
+        return true;
+    }
+    return value.size() == 64 &&
+           std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+               return std::isdigit(ch) != 0 || (ch >= 'a' && ch <= 'f');
+           });
+}
+
+std::string SerializeResumeManifestBody(const ResumeManifest& manifest) {
+    if (manifest.frames.size() != manifest.outputFiles.size() ||
+        manifest.frames.size() != manifest.outputChecksums.size()) {
+        throw std::runtime_error("Internal error: inconsistent resume manifest frame counts.");
+    }
+    std::ostringstream out;
+    out << "format=" << kResumeManifestFormat << "\n";
+    out << "implementation=" << integrity::HexEncode(kResumeImplementationVersion) << "\n";
+    out << "namespace=" << integrity::HexEncode(manifest.outputBasename) << "\n";
+    out << "state=" << manifest.state << "\n";
+    out << "parameter_sha256=" << manifest.parameterChecksum << "\n";
+    out << "run_sha256=" << manifest.runSignature << "\n";
+    out << "frame_count=" << manifest.frames.size() << "\n";
+    for (std::size_t index = 0; index < manifest.frames.size(); ++index) {
+        const FrameInputIdentity& frame = manifest.frames[index];
+        out << "frame." << index << ".source=" << integrity::HexEncode(frame.source) << "\n";
+        out << "frame." << index << ".time="
+            << std::setprecision(std::numeric_limits<double>::max_digits10) << frame.time << "\n";
+        out << "frame." << index << ".content_sha256=" << frame.contentChecksum << "\n";
+        out << "frame." << index << ".schema_sha256=" << frame.schemaChecksum << "\n";
+        out << "frame." << index << ".grid_sha256=" << frame.gridChecksum << "\n";
+        out << "output." << index << ".file=" << integrity::HexEncode(manifest.outputFiles[index]) << "\n";
+        out << "output." << index << ".sha256="
+            << (manifest.outputChecksums[index].empty() ? "-" : manifest.outputChecksums[index]) << "\n";
+    }
+    out << "pvd_file=" << integrity::HexEncode(manifest.outputBasename + ".pvd") << "\n";
+    out << "pvd_sha256=" << (manifest.pvdChecksum.empty() ? "-" : manifest.pvdChecksum) << "\n";
+    out << "summary_file=" << integrity::HexEncode(manifest.outputBasename + "_run_summary.txt") << "\n";
+    out << "summary_sha256="
+        << (manifest.summaryChecksum.empty() ? "-" : manifest.summaryChecksum) << "\n";
+    return out.str();
+}
+
+std::string SerializeResumeManifest(const ResumeManifest& manifest) {
+    const std::string body = SerializeResumeManifestBody(manifest);
+    return body + "manifest_sha256=" + integrity::Sha256String(body) + "\n";
+}
+
+std::size_t ParseManifestSize(const std::string& value, const char* description) {
+    try {
+        std::size_t consumed = 0;
+        const unsigned long long parsed = std::stoull(value, &consumed, 10);
+        if (consumed != value.size() ||
+            parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max()) ||
+            parsed > 1000000ull) {
+            throw std::runtime_error("out of range");
+        }
+        return static_cast<std::size_t>(parsed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid resume manifest ") + description + ".");
+    }
+}
+
+double ParseManifestTime(const std::string& value) {
+    try {
+        std::size_t consumed = 0;
+        const double parsed = std::stod(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed)) {
+            throw std::runtime_error("invalid");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid resume manifest frame time.");
+    }
+}
+
+ResumeManifest ParseResumeManifest(const std::string& text,
+                                   const std::string& expectedBasename) {
+    const std::string marker = "manifest_sha256=";
+    const std::size_t markerPosition = text.rfind(marker);
+    if (markerPosition == std::string::npos ||
+        (markerPosition != 0 && text[markerPosition - 1] != '\n')) {
+        throw std::runtime_error("Resume manifest is missing its integrity checksum.");
+    }
+    const std::string body = text.substr(0, markerPosition);
+    std::string recordedChecksum = text.substr(markerPosition + marker.size());
+    while (!recordedChecksum.empty() &&
+           (recordedChecksum.back() == '\n' || recordedChecksum.back() == '\r')) {
+        recordedChecksum.pop_back();
+    }
+    if (!IsChecksum(recordedChecksum, false) ||
+        recordedChecksum != integrity::Sha256String(body)) {
+        throw std::runtime_error("Resume manifest integrity checksum does not match its contents.");
+    }
+
+    std::unordered_map<std::string, std::string> values;
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const std::size_t equal = line.find('=');
+        if (equal == std::string::npos || equal == 0 ||
+            !values.emplace(line.substr(0, equal), line.substr(equal + 1)).second) {
+            throw std::runtime_error("Resume manifest contains a malformed or duplicate entry.");
+        }
+    }
+    auto require = [&](const std::string& key) -> const std::string& {
+        const auto found = values.find(key);
+        if (found == values.end()) {
+            throw std::runtime_error("Resume manifest is missing required key '" + key + "'.");
+        }
+        return found->second;
+    };
+    if (require("format") != kResumeManifestFormat ||
+        integrity::HexDecode(require("implementation")) != kResumeImplementationVersion) {
+        throw std::runtime_error("Resume manifest format/implementation version is unsupported.");
+    }
+
+    ResumeManifest manifest;
+    manifest.outputBasename = integrity::HexDecode(require("namespace"));
+    if (manifest.outputBasename != expectedBasename) {
+        throw std::runtime_error("Resume manifest namespace does not match output_basename.");
+    }
+    manifest.state = require("state");
+    if (manifest.state != "in_progress" && manifest.state != "complete") {
+        throw std::runtime_error("Resume manifest has an invalid state.");
+    }
+    manifest.parameterChecksum = require("parameter_sha256");
+    manifest.runSignature = require("run_sha256");
+    if (!IsChecksum(manifest.parameterChecksum, false) ||
+        !IsChecksum(manifest.runSignature, false)) {
+        throw std::runtime_error("Resume manifest has an invalid parameter/run checksum.");
+    }
+    const std::size_t frameCount = ParseManifestSize(require("frame_count"), "frame_count");
+    manifest.frames.resize(frameCount);
+    manifest.outputFiles.resize(frameCount);
+    manifest.outputChecksums.resize(frameCount);
+    for (std::size_t index = 0; index < frameCount; ++index) {
+        const std::string prefix = "frame." + std::to_string(index) + ".";
+        FrameInputIdentity& frame = manifest.frames[index];
+        frame.source = integrity::HexDecode(require(prefix + "source"));
+        frame.time = ParseManifestTime(require(prefix + "time"));
+        frame.contentChecksum = require(prefix + "content_sha256");
+        frame.schemaChecksum = require(prefix + "schema_sha256");
+        frame.gridChecksum = require(prefix + "grid_sha256");
+        if (!IsChecksum(frame.contentChecksum, false) ||
+            !IsChecksum(frame.schemaChecksum, false) ||
+            !IsChecksum(frame.gridChecksum, false)) {
+            throw std::runtime_error("Resume manifest has an invalid input identity checksum.");
+        }
+        const std::string outputPrefix = "output." + std::to_string(index) + ".";
+        manifest.outputFiles[index] = integrity::HexDecode(require(outputPrefix + "file"));
+        if (index > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            manifest.outputFiles[index] !=
+                FrameFilename(expectedBasename, static_cast<int>(index))) {
+            throw std::runtime_error("Resume manifest contains an output outside its frame namespace.");
+        }
+        const std::string checksum = require(outputPrefix + "sha256");
+        manifest.outputChecksums[index] = checksum == "-" ? std::string() : checksum;
+        if (!IsChecksum(manifest.outputChecksums[index], true)) {
+            throw std::runtime_error("Resume manifest has an invalid output checksum.");
+        }
+    }
+    if (integrity::HexDecode(require("pvd_file")) != expectedBasename + ".pvd" ||
+        integrity::HexDecode(require("summary_file")) !=
+            expectedBasename + "_run_summary.txt") {
+        throw std::runtime_error("Resume manifest metadata outputs escape their namespace.");
+    }
+    manifest.pvdChecksum = require("pvd_sha256") == "-" ? std::string() : require("pvd_sha256");
+    manifest.summaryChecksum = require("summary_sha256") == "-"
+                                   ? std::string() : require("summary_sha256");
+    if (!IsChecksum(manifest.pvdChecksum, true) || !IsChecksum(manifest.summaryChecksum, true)) {
+        throw std::runtime_error("Resume manifest has an invalid metadata-output checksum.");
+    }
+    return manifest;
+}
+
+std::optional<ResumeManifest> ReadResumeManifest(const OutputLayout& layout,
+                                                 const std::string& basename) {
+    if (!std::filesystem::exists(layout.manifest)) {
+        return std::nullopt;
+    }
+    if (!std::filesystem::is_regular_file(layout.manifest) ||
+        std::filesystem::file_size(layout.manifest) > kMaximumResumeManifestBytes) {
+        throw std::runtime_error("Resume manifest is not a bounded regular file: " +
+                                 layout.manifest.string());
+    }
+    std::ifstream input(layout.manifest, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Cannot open resume manifest: " + layout.manifest.string());
+    }
+    std::ostringstream text;
+    text << input.rdbuf();
+    if (!input.eof() && input.fail()) {
+        throw std::runtime_error("Cannot read resume manifest: " + layout.manifest.string());
+    }
+    return ParseResumeManifest(text.str(), basename);
+}
+
+void WriteResumeManifest(const OutputLayout& layout, const ResumeManifest& manifest) {
+    WriteTextFile(layout.manifest, SerializeResumeManifest(manifest));
+}
+
+ResumeManifest MakeResumeManifest(const Parameters& params,
+                                  const RunIdentity& identity) {
+    ResumeManifest manifest;
+    manifest.outputBasename = params.outputBasename;
+    manifest.parameterChecksum = identity.parameterChecksum;
+    manifest.runSignature = identity.signature;
+    manifest.frames = identity.frames;
+    manifest.outputFiles.reserve(identity.frames.size());
+    manifest.outputChecksums.resize(identity.frames.size());
+    for (std::size_t index = 0; index < identity.frames.size(); ++index) {
+        manifest.outputFiles.push_back(
+            FrameFilename(params.outputBasename, static_cast<int>(index)));
+    }
+    return manifest;
+}
+
+int RemoveManifestOwnedOutputs(const ResumeManifest& manifest,
+                               const std::filesystem::path& root,
+                               std::size_t startFrame,
+                               bool removeMetadata) {
+    int removed = 0;
+    for (std::size_t index = startFrame; index < manifest.outputFiles.size(); ++index) {
+        const std::filesystem::path path =
+            CanonicalContainedPath(root, manifest.outputFiles[index]);
+        std::error_code error;
+        const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
+        if (error && status.type() != std::filesystem::file_type::not_found) {
+            throw std::runtime_error("Cannot inspect manifest-owned output '" + path.string() +
+                                     "': " + error.message());
+        }
+        if (status.type() == std::filesystem::file_type::not_found) {
+            continue;
+        }
+        if (!std::filesystem::is_regular_file(status)) {
+            throw std::runtime_error("Refusing to remove a non-regular manifest namespace entry: " +
+                                     path.string());
+        }
+        const bool didRemove = std::filesystem::remove(path, error);
+        if (error) {
+            throw std::runtime_error("Cannot remove manifest-owned output '" + path.string() +
+                                     "': " + error.message());
+        }
+        removed += didRemove ? 1 : 0;
+    }
+    if (removeMetadata) {
+        for (const std::string& filename : {
+                 manifest.outputBasename + ".pvd",
+                 manifest.outputBasename + "_run_summary.txt"}) {
+            const std::filesystem::path path = CanonicalContainedPath(root, filename);
+            std::error_code error;
+            const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
+            if (error && status.type() != std::filesystem::file_type::not_found) {
+                throw std::runtime_error("Cannot inspect manifest-owned metadata output '" +
+                                         path.string() + "': " + error.message());
+            }
+            if (status.type() == std::filesystem::file_type::not_found) {
+                continue;
+            }
+            if (!std::filesystem::is_regular_file(status)) {
+                throw std::runtime_error(
+                    "Refusing to remove a non-regular manifest metadata entry: " + path.string());
+            }
+            const bool didRemove = std::filesystem::remove(path, error);
+            if (error) {
+                throw std::runtime_error("Cannot remove manifest-owned metadata output '" +
+                                         path.string() + "': " + error.message());
+            }
+            removed += didRemove ? 1 : 0;
+        }
+    }
+    return removed;
+}
+
+void RequireNamespaceAvailableWithoutManifest(const Parameters& params,
+                                              const OutputLayout& layout) {
+    if (!std::filesystem::exists(layout.root)) {
+        return;
+    }
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(layout.root)) {
+        const std::string filename = entry.path().filename().string();
+        const std::string normalizedFilename = LowerAscii(filename);
+        const std::string normalizedPvd = LowerAscii(params.outputBasename + ".pvd");
+        const std::string normalizedSummary =
+            LowerAscii(params.outputBasename + "_run_summary.txt");
+        const bool metadataCollision =
+            normalizedFilename == normalizedPvd || normalizedFilename == normalizedSummary;
+        if (metadataCollision || OutputFrameIndex(entry.path(), params.outputBasename).has_value()) {
+            throw std::runtime_error(
+                "Output namespace already contains files without a valid ownership manifest; "
+                "refusing to overwrite: " + entry.path().string());
+        }
+    }
+}
+
 bool ResumeExistingOutputRequested(const Parameters& params) {
     return LowerAscii(params.solverStatus) == "error";
 }
@@ -1409,8 +2133,8 @@ bool BoundsNearlyEqual(const std::array<double, 6>& expected,
 }
 
 std::optional<int> OutputFrameIndex(const std::filesystem::path& path, const std::string& basename) {
-    const std::string fileName = path.filename().string();
-    const std::string prefix = basename + "_f";
+    const std::string fileName = LowerAscii(path.filename().string());
+    const std::string prefix = LowerAscii(basename) + "_f";
     constexpr const char* suffix = ".vti";
     constexpr std::size_t suffixLength = 4;
     if (fileName.size() <= prefix.size() + suffixLength ||
@@ -1430,40 +2154,6 @@ std::optional<int> OutputFrameIndex(const std::filesystem::path& path, const std
     } catch (const std::exception&) {
         return std::nullopt;
     }
-}
-
-int RemoveResumeOutputsFromFrame(const std::filesystem::path& outputDir,
-                                 const std::string& basename,
-                                 std::size_t startFrame) {
-    if (!std::filesystem::exists(outputDir)) {
-        return 0;
-    }
-    if (!std::filesystem::is_directory(outputDir)) {
-        throw std::runtime_error("Output path exists but is not a directory: " + outputDir.string());
-    }
-
-    int removed = 0;
-    const std::string pvdName = basename + ".pvd";
-    const std::string summaryName = basename + "_run_summary.txt";
-    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(outputDir)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        const std::string fileName = entry.path().filename().string();
-        bool removeFile = fileName == pvdName || fileName == summaryName;
-        if (!removeFile) {
-            if (std::optional<int> frameIndex = OutputFrameIndex(entry.path(), basename)) {
-                removeFile = *frameIndex >= 0 &&
-                             static_cast<std::size_t>(*frameIndex) >= startFrame;
-            }
-        }
-        if (!removeFile) {
-            continue;
-        }
-        std::filesystem::remove(entry.path());
-        ++removed;
-    }
-    return removed;
 }
 
 std::array<double, 6> ExpectedOutputBoundsForFrame(const Parameters& params,
@@ -1539,46 +2229,47 @@ struct ResumePlan {
 
 ResumePlan BuildResumePlan(const Parameters& params,
                            SequenceInfo* sequence,
+                           ResumeManifest* manifest,
+                           const OutputLayout& layout,
                            const std::chrono::steady_clock::time_point& progressStart) {
-    if (sequence == nullptr) {
-        throw std::runtime_error("Internal error: null sequence for resume plan.");
+    if (sequence == nullptr || manifest == nullptr) {
+        throw std::runtime_error("Internal error: null sequence/manifest for resume plan.");
+    }
+    if (manifest->frames.size() != sequence->frames.size() ||
+        manifest->outputChecksums.size() != sequence->frames.size() ||
+        manifest->outputFiles.size() != sequence->frames.size()) {
+        throw std::runtime_error("Resume manifest frame count does not match the validated input sequence.");
     }
 
     ResumePlan plan;
     plan.totalWork = static_cast<vtkIdType>(sequence->frames.size());
-    std::cout << "[Resume] Existing output resume requested; target folder will be inspected before cleanup.\n";
+    std::cout << "[Resume] Manifest-bound output resume requested; checksums and VTK invariants will be validated.\n";
 
     std::size_t candidateCount = 0;
     for (; candidateCount < sequence->frames.size(); ++candidateCount) {
-        const std::filesystem::path outputPath =
-            params.outputDir / FrameFilename(params.outputBasename, static_cast<int>(candidateCount));
-        if (!std::filesystem::is_regular_file(outputPath)) {
+        if (manifest->outputChecksums[candidateCount].empty()) {
             break;
         }
     }
 
     const auto validationStage = LogStageStarted("Restart validation",
                                                  "candidate_frames=" + std::to_string(candidateCount));
-    if (candidateCount == 0) {
-        LogStageFinished("Restart validation", validationStage, "usable_prefix=0");
-        const auto cleanupStage = LogStageStarted("Output cleanup", params.outputDir.string());
-        const int removedStaleFiles = RemoveStaleVtiAndPvdFiles(params.outputDir);
-        LogStageFinished("Output cleanup",
-                         cleanupStage,
-                         "removed_vti_pvd_files=" + std::to_string(removedStaleFiles));
-        std::cout << "[Resume] No contiguous completed frame outputs were found; starting from frame 0.\n";
-        return plan;
-    }
-
-    plan.totalWork = static_cast<vtkIdType>(sequence->frames.size() + 1);
     std::vector<ValidatedResumeFrame> validatedFrames;
     validatedFrames.reserve(candidateCount);
     for (std::size_t i = 0; i < candidateCount; ++i) {
-        const std::filesystem::path outputPath =
-            params.outputDir / FrameFilename(params.outputBasename, static_cast<int>(i));
-        std::cout << "[Resume] Validating existing frame " << i
-                  << " range: " << outputPath.filename().string() << "\n";
+        const std::filesystem::path& outputPath = layout.frames.at(i);
+        std::cout << "[Resume] Validating existing frame " << i << ": "
+                  << outputPath.filename().string() << "\n";
         try {
+            if (!std::filesystem::is_regular_file(outputPath)) {
+                throw std::runtime_error("Manifest-bound output file is missing or not regular: " +
+                                         outputPath.string());
+            }
+            const std::string checksum = integrity::Sha256File(outputPath);
+            if (checksum != manifest->outputChecksums[i]) {
+                throw std::runtime_error("Existing resume output checksum does not match manifest: " +
+                                         outputPath.string());
+            }
             ValidatedResumeFrame validated = ValidateResumeFrame(params, *sequence, i, outputPath);
             if (!sequence->seriesBoundsPrecomputed) {
                 MergeBounds(validated.expectedBounds, &sequence->bounds, &sequence->boundsInitialized);
@@ -1591,15 +2282,7 @@ ResumePlan BuildResumePlan(const Parameters& params,
                                  ", validation_failed=true");
             std::cout << "[Resume] Existing frame " << i << " failed validation: "
                       << exception.what() << "\n";
-            const auto cleanupStage = LogStageStarted("Output cleanup", params.outputDir.string());
-            const int removedStaleFiles = RemoveStaleVtiAndPvdFiles(params.outputDir);
-            LogStageFinished("Output cleanup",
-                             cleanupStage,
-                             "removed_vti_pvd_files=" + std::to_string(removedStaleFiles));
-            std::cout << "[Resume] Existing outputs cannot be reused; starting from frame 0.\n";
-            plan.completedWork = 0;
-            plan.totalWork = static_cast<vtkIdType>(sequence->frames.size());
-            return plan;
+            break;
         }
 
         plan.completedWork = static_cast<vtkIdType>(validatedFrames.size());
@@ -1611,13 +2294,17 @@ ResumePlan BuildResumePlan(const Parameters& params,
                              plan.totalWork,
                              progressStart,
                              detail.str());
-        std::cout << "[Resume] Existing frame " << i << " passed range validation.\n";
+        std::cout << "[Resume] Existing frame " << i
+                  << " passed checksum, image type, dimension, and bounds validation.\n";
     }
-    LogStageFinished("Restart validation",
-                     validationStage,
-                     "usable_prefix=" + std::to_string(validatedFrames.size()));
+    if (validatedFrames.size() == candidateCount) {
+        LogStageFinished("Restart validation",
+                         validationStage,
+                         "usable_prefix=" + std::to_string(validatedFrames.size()));
+    }
 
-    plan.startFrame = validatedFrames.size() - 1;
+    plan.startFrame = validatedFrames.size();
+    plan.completedWork = static_cast<vtkIdType>(plan.startFrame);
     plan.reusedResults.reserve(plan.startFrame);
     plan.reusedPvdEntries.reserve(plan.startFrame);
     for (std::size_t i = 0; i < plan.startFrame; ++i) {
@@ -1625,11 +2312,17 @@ ResumePlan BuildResumePlan(const Parameters& params,
         plan.reusedPvdEntries.push_back({validatedFrames[i].result.time, validatedFrames[i].result.relativeFile});
     }
 
-    const int removedRestartFiles = RemoveResumeOutputsFromFrame(params.outputDir,
-                                                                 params.outputBasename,
-                                                                 plan.startFrame);
-    std::cout << "[Resume] Dropped validated frame " << plan.startFrame
-              << " and newer outputs before continuing; removed_files=" << removedRestartFiles << ".\n";
+    const int removedRestartFiles = RemoveManifestOwnedOutputs(
+        *manifest, layout.root, plan.startFrame, true);
+    for (std::size_t i = plan.startFrame; i < manifest->outputChecksums.size(); ++i) {
+        manifest->outputChecksums[i].clear();
+    }
+    manifest->pvdChecksum.clear();
+    manifest->summaryChecksum.clear();
+    manifest->state = "in_progress";
+    WriteResumeManifest(layout, *manifest);
+    std::cout << "[Resume] Removed only manifest-owned outputs from frame " << plan.startFrame
+              << " onward; removed_files=" << removedRestartFiles << ".\n";
     std::cout << "[Resume] Reusing " << plan.reusedResults.size()
               << " validated frame output(s); continuing at frame " << plan.startFrame << ".\n";
     return plan;
@@ -1790,7 +2483,9 @@ int RunVtkSmpSmokeTest() {
     return 0;
 }
 
-int RunSolver(const Parameters& params) {
+int RunSolver(const Parameters& unvalidatedParams) {
+    Parameters params = unvalidatedParams;
+    ValidateParameters(&params);
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
 
@@ -1811,15 +2506,6 @@ int RunSolver(const Parameters& params) {
 
     const auto totalStart = std::chrono::steady_clock::now();
     const bool resumeExistingOutput = ResumeExistingOutputRequested(params);
-    std::filesystem::create_directories(params.outputDir);
-    if (!resumeExistingOutput) {
-        const auto cleanupStage = LogStageStarted("Output cleanup", params.outputDir.string());
-        const int removedStaleFiles = RemoveStaleVtiAndPvdFiles(params.outputDir);
-        LogStageFinished("Output cleanup",
-                         cleanupStage,
-                         "removed_vti_pvd_files=" + std::to_string(removedStaleFiles));
-    }
-
     const auto discoverStage = LogStageStarted("Data discovery", params.inputPath.string());
     SequenceInfo sequence = CollectInputSequence(params);
     LogStageFinished("Data discovery",
@@ -1829,6 +2515,20 @@ int RunSolver(const Parameters& params) {
                               ? ", bounds=" + FormatBounds(sequence.bounds)
                               : ", bounds=streaming_per_frame"));
 
+    const auto identityStage = LogStageStarted(
+        "Input executable preflight",
+        "frames=" + std::to_string(sequence.frames.size()));
+    const RunIdentity runIdentity = BuildRunIdentity(params, sequence);
+    LogStageFinished("Input executable preflight",
+                     identityStage,
+                     "run_sha256=" + runIdentity.signature);
+
+    const OutputLayout outputLayout = BuildOutputLayout(params, sequence.frames.size());
+    const std::optional<ResumeManifest> existingManifest =
+        ReadResumeManifest(outputLayout, params.outputBasename);
+    std::filesystem::create_directories(outputLayout.root);
+    ResumeManifest manifest = MakeResumeManifest(params, runIdentity);
+
     std::vector<FrameResult> results;
     results.reserve(sequence.frames.size());
     std::vector<std::pair<double, std::filesystem::path>> pvdEntries;
@@ -1836,11 +2536,33 @@ int RunSolver(const Parameters& params) {
 
     const auto progressStart = std::chrono::steady_clock::now();
     ResumePlan resumePlan;
-    if (resumeExistingOutput) {
-        resumePlan = BuildResumePlan(params, &sequence, progressStart);
+    const bool reusableManifest = resumeExistingOutput && existingManifest.has_value() &&
+                                  existingManifest->runSignature == runIdentity.signature &&
+                                  existingManifest->parameterChecksum == runIdentity.parameterChecksum &&
+                                  SameFrameInputIdentities(existingManifest->frames,
+                                                           runIdentity.frames);
+    if (reusableManifest) {
+        manifest = *existingManifest;
+        resumePlan = BuildResumePlan(params, &sequence, &manifest, outputLayout, progressStart);
         results = resumePlan.reusedResults;
         pvdEntries = resumePlan.reusedPvdEntries;
     } else {
+        const auto cleanupStage = LogStageStarted("Output ownership preparation",
+                                                  outputLayout.root.string());
+        int removedOwnedFiles = 0;
+        if (existingManifest.has_value()) {
+            removedOwnedFiles = RemoveManifestOwnedOutputs(
+                *existingManifest, outputLayout.root, 0, true);
+            if (resumeExistingOutput) {
+                std::cout << "[Resume] Cached source/configuration identity changed; "
+                             "reuse was rejected and only manifest-owned outputs were removed.\n";
+            }
+        }
+        RequireNamespaceAvailableWithoutManifest(params, outputLayout);
+        WriteResumeManifest(outputLayout, manifest);
+        LogStageFinished("Output ownership preparation",
+                         cleanupStage,
+                         "removed_manifest_owned_files=" + std::to_string(removedOwnedFiles));
         resumePlan.totalWork = static_cast<vtkIdType>(sequence.frames.size());
     }
     vtkIdType completedWork = resumePlan.completedWork;
@@ -1870,6 +2592,12 @@ int RunSolver(const Parameters& params) {
         const FrameInfo& frame = sequence.frames[i];
         const auto readStart = std::chrono::steady_clock::now();
         vtkSmartPointer<vtkDataSet> input = ReadDataSet(frame);
+        const FrameInputIdentity executionIdentity =
+            ComputeFrameInputIdentityFromDataSet(params, sequence, i, input, false);
+        if (!SameFrameInputIdentity(executionIdentity, runIdentity.frames.at(i))) {
+            throw std::runtime_error("Input frame changed after executable preflight; refusing "
+                                     "to publish output for frame " + std::to_string(i) + ".");
+        }
         const double readSeconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - readStart).count();
 
@@ -1890,9 +2618,12 @@ int RunSolver(const Parameters& params) {
         const double resampleSeconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - resampleStart).count();
 
-        const std::string fileName = FrameFilename(params.outputBasename, static_cast<int>(i));
+        const std::string& fileName = manifest.outputFiles.at(i);
         const auto writeStart = std::chrono::steady_clock::now();
-        WriteVti(params.outputDir / fileName, output);
+        WriteVti(outputLayout.frames.at(i), output);
+        manifest.outputChecksums.at(i) = integrity::Sha256File(outputLayout.frames.at(i));
+        manifest.state = "in_progress";
+        WriteResumeManifest(outputLayout, manifest);
         const double writeSeconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - writeStart).count();
 
@@ -1940,10 +2671,22 @@ int RunSolver(const Parameters& params) {
                 lastError = "unknown exception";
             }
 
-            const std::filesystem::path outputPath =
-                params.outputDir / FrameFilename(params.outputBasename, static_cast<int>(i));
+            const std::filesystem::path& outputPath = outputLayout.frames.at(i);
             std::error_code removeError;
             std::filesystem::remove(outputPath, removeError);
+            if (removeError) {
+                throw std::runtime_error("Frame failure cleanup could not remove manifest-owned output '" +
+                                         outputPath.string() + "': " + removeError.message() +
+                                         "; original error: " + lastError);
+            }
+            manifest.outputChecksums.at(i).clear();
+            manifest.state = "in_progress";
+            try {
+                WriteResumeManifest(outputLayout, manifest);
+            } catch (const std::exception& manifestError) {
+                throw std::runtime_error("Frame cleanup could not update its ownership manifest: " +
+                                         std::string(manifestError.what()));
+            }
             if (attempt == 0) {
                 std::cout << "[Frame] index=" << i << " failed: " << lastError << "\n";
                 std::cout << "[Frame] Retrying index=" << i << " once after frame error.\n";
@@ -1972,17 +2715,22 @@ int RunSolver(const Parameters& params) {
     }
     LogStageFinished("Frame resampling", resampleStage, "frames=" + std::to_string(results.size()));
 
-    const auto writeStage = LogStageStarted("Result writing", params.outputDir.string());
-    const std::filesystem::path pvdPath = params.outputDir / (params.outputBasename + ".pvd");
-    WritePvd(pvdPath, pvdEntries);
+    const auto writeStage = LogStageStarted("Result writing", outputLayout.root.string());
+    WritePvd(outputLayout.pvd, pvdEntries);
+    manifest.pvdChecksum = integrity::Sha256File(outputLayout.pvd);
+    manifest.state = "in_progress";
+    WriteResumeManifest(outputLayout, manifest);
     const double totalSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - totalStart).count();
-    WriteTextFile(params.outputDir / (params.outputBasename + "_run_summary.txt"),
+    WriteTextFile(outputLayout.summary,
                   BuildRunSummary(params, sequence, results, totalSeconds));
-    LogStageFinished("Result writing", writeStage, pvdPath.filename().string());
+    manifest.summaryChecksum = integrity::Sha256File(outputLayout.summary);
+    manifest.state = "complete";
+    WriteResumeManifest(outputLayout, manifest);
+    LogStageFinished("Result writing", writeStage, outputLayout.pvd.filename().string());
 
     std::cout << "\n[Stage] Solver finished. total=" << FormatSeconds(totalSeconds)
-              << "s, output=" << pvdPath.string() << "\n";
+              << "s, output=" << outputLayout.pvd.string() << "\n";
     return 0;
 }
 

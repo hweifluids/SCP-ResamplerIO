@@ -1,4 +1,5 @@
 #include "streamcenterplus_resample/Core.h"
+#include "Integrity.h"
 #include <streamcenterplus/io/DataSetReader.h>
 #include <streamcenterplus/VtkHdfIO.h>
 
@@ -682,40 +683,81 @@ void WriteVti(const std::filesystem::path& outputPath, vtkImageData* image) {
         throw std::runtime_error("Internal error: null output image.");
     }
     std::filesystem::create_directories(outputPath.parent_path());
-    auto writer = vtkSmartPointer<vtkXMLImageDataWriter>::New();
-    writer->SetFileName(outputPath.string().c_str());
-    writer->SetInputData(image);
-    writer->SetDataModeToBinary();
-    if (!writer->Write()) {
-        throw std::runtime_error("Failed to write VTI file: " + outputPath.string());
+    const std::filesystem::path temporary = integrity::TemporarySibling(outputPath);
+    try {
+        auto writer = vtkSmartPointer<vtkXMLImageDataWriter>::New();
+        writer->SetFileName(temporary.string().c_str());
+        writer->SetInputData(image);
+        writer->SetDataModeToBinary();
+        if (!writer->Write() || !std::filesystem::is_regular_file(temporary) ||
+            std::filesystem::file_size(temporary) == 0) {
+            throw std::runtime_error("Failed to write complete VTI file: " + outputPath.string());
+        }
+        integrity::AtomicReplaceFile(temporary, outputPath);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
     }
 }
 
 void WritePvd(const std::filesystem::path& outputPath,
               const std::vector<std::pair<double, std::filesystem::path>>& frames) {
     std::filesystem::create_directories(outputPath.parent_path());
-    std::ofstream output(outputPath);
-    if (!output) {
-        throw std::runtime_error("Failed to write PVD file: " + outputPath.string());
+    const std::filesystem::path temporary = integrity::TemporarySibling(outputPath);
+    try {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Failed to open temporary PVD file: " + temporary.string());
+        }
+        output << "<?xml version=\"1.0\"?>\n";
+        output << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+        output << "  <Collection>\n";
+        for (const auto& frame : frames) {
+            output << "    <DataSet timestep=\"" << std::setprecision(17) << frame.first
+                   << "\" group=\"\" part=\"0\" file=\"" << XmlEscape(frame.second.generic_string()) << "\"/>\n";
+        }
+        output << "  </Collection>\n";
+        output << "</VTKFile>\n";
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Failed to flush temporary PVD file: " + temporary.string());
+        }
+        output.close();
+        if (output.fail()) {
+            throw std::runtime_error("Failed to close temporary PVD file: " + temporary.string());
+        }
+        integrity::AtomicReplaceFile(temporary, outputPath);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
     }
-    output << "<?xml version=\"1.0\"?>\n";
-    output << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
-    output << "  <Collection>\n";
-    for (const auto& frame : frames) {
-        output << "    <DataSet timestep=\"" << std::setprecision(17) << frame.first
-               << "\" group=\"\" part=\"0\" file=\"" << XmlEscape(frame.second.generic_string()) << "\"/>\n";
-    }
-    output << "  </Collection>\n";
-    output << "</VTKFile>\n";
 }
 
 void WriteTextFile(const std::filesystem::path& outputPath, const std::string& text) {
     std::filesystem::create_directories(outputPath.parent_path());
-    std::ofstream output(outputPath);
-    if (!output) {
-        throw std::runtime_error("Failed to write text file: " + outputPath.string());
+    const std::filesystem::path temporary = integrity::TemporarySibling(outputPath);
+    try {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Failed to open temporary text file: " + temporary.string());
+        }
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Failed to write or flush temporary text file: " + temporary.string());
+        }
+        output.close();
+        if (output.fail()) {
+            throw std::runtime_error("Failed to close temporary text file: " + temporary.string());
+        }
+        integrity::AtomicReplaceFile(temporary, outputPath);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
     }
-    output << text;
 }
 
 }  // namespace streamcenterplus::resample

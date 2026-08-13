@@ -2299,6 +2299,7 @@ struct NekFieldMeta {
     std::string code;
     bool littleEndian = true;
     std::uint64_t dataBaseOffset = 0;
+    std::uint64_t fileSize = 0;
     std::vector<std::string> labels;
 
     std::size_t pointCount() const {
@@ -2306,6 +2307,86 @@ struct NekFieldMeta {
                static_cast<std::size_t>(nxyz);
     }
 };
+
+constexpr std::uint64_t kMaximumNekTensorDimension = 64;
+constexpr std::uint64_t kMaximumNekPointsPerElement =
+    kMaximumNekTensorDimension * kMaximumNekTensorDimension * kMaximumNekTensorDimension;
+constexpr std::uint64_t kMaximumNekElements = 10000000;
+constexpr std::uint64_t kMaximumNekPoints = 100000000;
+// A production frame in the fixed integration corpus contains about 96 million
+// GLL points and eight stored components (roughly 3.1 GB at FP32). Keep that
+// supported while bounding any one field file below one billion stored values.
+constexpr std::uint64_t kMaximumNekStoredValues = 1000000000;
+constexpr std::uint64_t kMaximumNekFileCount = 16384;
+constexpr std::uint64_t kMaximumNekComponents = 4096;
+constexpr int kMaximumNekDescriptorFrames = 1000000;
+
+std::uint64_t CheckedNekAdd(std::uint64_t lhs,
+                            std::uint64_t rhs,
+                            const char* description) {
+    if (rhs > std::numeric_limits<std::uint64_t>::max() - lhs) {
+        throw std::runtime_error(std::string("Nek5000 ") + description + " overflows uint64 arithmetic.");
+    }
+    return lhs + rhs;
+}
+
+std::uint64_t CheckedNekMultiply(std::uint64_t lhs,
+                                 std::uint64_t rhs,
+                                 const char* description) {
+    if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        throw std::runtime_error(std::string("Nek5000 ") + description + " overflows uint64 arithmetic.");
+    }
+    return lhs * rhs;
+}
+
+std::size_t CheckedNekSize(std::uint64_t value, const char* description) {
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error(std::string("Nek5000 ") + description + " exceeds size_t capacity.");
+    }
+    return static_cast<std::size_t>(value);
+}
+
+int ParseNekInteger(const std::string& token, const char* description) {
+    try {
+        std::size_t consumed = 0;
+        const long long value = std::stoll(token, &consumed, 10);
+        if (consumed != token.size() ||
+            value < static_cast<long long>(std::numeric_limits<int>::min()) ||
+            value > static_cast<long long>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("out of range or trailing characters");
+        }
+        return static_cast<int>(value);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid Nek5000 ") + description +
+                                 " integer token: '" + token + "'.");
+    }
+}
+
+double ParseNekFiniteDouble(std::string token, const char* description) {
+    std::replace(token.begin(), token.end(), 'D', 'E');
+    std::replace(token.begin(), token.end(), 'd', 'E');
+    try {
+        std::size_t consumed = 0;
+        const double value = std::stod(token, &consumed);
+        if (consumed != token.size() || !std::isfinite(value)) {
+            throw std::runtime_error("non-finite or trailing characters");
+        }
+        return value;
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid Nek5000 ") + description +
+                                 " numeric token: '" + token + "'.");
+    }
+}
+
+std::uint64_t NekFileSize(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::uintmax_t size = std::filesystem::file_size(path, error);
+    if (error || size > std::numeric_limits<std::uint64_t>::max()) {
+        throw std::runtime_error("Cannot determine bounded Nek5000 field file size: " +
+                                 path.string());
+    }
+    return static_cast<std::uint64_t>(size);
+}
 
 int ValidateNekPrintfTemplate(const std::string& format) {
     int conversions = 0;
@@ -2377,10 +2458,10 @@ NekDescriptor ParseNekDescriptor(const std::filesystem::path& descriptorPath) {
             descriptor.fileTemplate = value;
             hasTemplate = !value.empty();
         } else if (key == "firsttimestep") {
-            descriptor.firstTimeStep = std::stoi(value);
+            descriptor.firstTimeStep = ParseNekInteger(value, "firsttimestep");
             hasFirst = true;
         } else if (key == "numtimesteps") {
-            descriptor.numberOfTimeSteps = std::stoi(value);
+            descriptor.numberOfTimeSteps = ParseNekInteger(value, "numtimesteps");
             hasCount = true;
         } else if (key == "nek5000" || key == "endian" || key == "version") {
             continue;
@@ -2392,6 +2473,11 @@ NekDescriptor ParseNekDescriptor(const std::filesystem::path& descriptorPath) {
         throw std::runtime_error(
             "Nek5000 descriptor must define filetemplate, firsttimestep, and numtimesteps.");
     }
+    if (descriptor.numberOfTimeSteps > kMaximumNekDescriptorFrames ||
+        descriptor.firstTimeStep >
+            std::numeric_limits<int>::max() - (descriptor.numberOfTimeSteps - 1)) {
+        throw std::runtime_error("Nek5000 descriptor timestep range exceeds the bounded integer/frame limit.");
+    }
     descriptor.integerConversions = ValidateNekPrintfTemplate(descriptor.fileTemplate);
     return descriptor;
 }
@@ -2399,6 +2485,10 @@ NekDescriptor ParseNekDescriptor(const std::filesystem::path& descriptorPath) {
 std::filesystem::path FormatNekFieldPath(const NekDescriptor& descriptor,
                                          int relativeFrameIndex,
                                          int fileIndex) {
+    if (relativeFrameIndex < 0 || relativeFrameIndex >= descriptor.numberOfTimeSteps ||
+        fileIndex < 0) {
+        throw std::runtime_error("Nek5000 field path indices are outside the validated descriptor range.");
+    }
     const int timeStep = descriptor.firstTimeStep + relativeFrameIndex;
     std::array<char, 4096> buffer{};
     int written = 0;
@@ -2475,7 +2565,10 @@ std::vector<std::string> NekLabelsForCode(std::string code, int dimensions) {
             ++end;
         }
         const std::string countToken = code.substr(scalar + 1, end - scalar - 1);
-        const int count = countToken.empty() ? 1 : std::stoi(countToken);
+        const int count = countToken.empty() ? 1 : ParseNekInteger(countToken, "passive-scalar count");
+        if (count < 1 || static_cast<std::uint64_t>(count) > kMaximumNekComponents) {
+            throw std::runtime_error("Nek5000 passive-scalar count exceeds the component safety limit.");
+        }
         for (int i = 0; i < count; ++i) {
             std::ostringstream name;
             name << 's' << std::setw(2) << std::setfill('0') << (i + 1);
@@ -2505,21 +2598,20 @@ NekFieldMeta ReadNekHeader(const std::filesystem::path& path) {
 
     NekFieldMeta meta;
     meta.path = path;
-    meta.wordSize = std::stoi(parts[1]);
-    meta.nx = std::stoi(parts[2]);
-    meta.ny = std::stoi(parts[3]);
-    meta.nz = std::stoi(parts[4]);
-    meta.elementCount = std::stoi(parts[5]);
-    meta.globalElementCount = std::stoi(parts[6]);
-    std::string timeToken = parts[7];
-    std::replace(timeToken.begin(), timeToken.end(), 'D', 'E');
-    std::replace(timeToken.begin(), timeToken.end(), 'd', 'E');
-    meta.time = std::stod(timeToken);
-    meta.fileIndex = std::stoi(parts[9]);
-    meta.fileCount = std::max(1, std::stoi(parts[10]));
+    meta.wordSize = ParseNekInteger(parts[1], "word-size");
+    meta.nx = ParseNekInteger(parts[2], "nx");
+    meta.ny = ParseNekInteger(parts[3], "ny");
+    meta.nz = ParseNekInteger(parts[4], "nz");
+    meta.elementCount = ParseNekInteger(parts[5], "local element-count");
+    meta.globalElementCount = ParseNekInteger(parts[6], "global element-count");
+    meta.time = ParseNekFiniteDouble(parts[7], "time");
+    meta.fileIndex = ParseNekInteger(parts[9], "file index");
+    meta.fileCount = ParseNekInteger(parts[10], "file count");
     meta.code = parts[11];
+    std::transform(meta.code.begin(), meta.code.end(), meta.code.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
     meta.dimensions = meta.nz > 1 ? 3 : 2;
-    meta.nxyz = meta.nx * meta.ny * meta.nz;
     const float littleTag = DecodeEndianTag(tagBytes, true);
     const float bigTag = DecodeEndianTag(tagBytes, false);
     if (std::abs(littleTag - 6.54321f) < 1.0e-4f) {
@@ -2535,13 +2627,66 @@ NekFieldMeta ReadNekHeader(const std::filesystem::path& path) {
                                  path.string());
     }
     if (meta.nx < 2 || meta.ny < 2 || meta.nz < 1 || meta.elementCount <= 0 ||
-        meta.globalElementCount <= 0 || !IsFiniteTime(meta.time)) {
+        meta.globalElementCount <= 0 || meta.elementCount > meta.globalElementCount ||
+        meta.fileCount <= 0 || meta.fileIndex < 0 || meta.fileIndex >= meta.fileCount ||
+        !IsFiniteTime(meta.time)) {
         throw std::runtime_error("Invalid Nek5000 field dimensions or metadata: " +
                                  path.string());
     }
-    meta.dataBaseOffset = 136ull +
-                          4ull * static_cast<std::uint64_t>(meta.elementCount);
+    if (static_cast<std::uint64_t>(meta.nx) > kMaximumNekTensorDimension ||
+        static_cast<std::uint64_t>(meta.ny) > kMaximumNekTensorDimension ||
+        static_cast<std::uint64_t>(meta.nz) > kMaximumNekTensorDimension ||
+        static_cast<std::uint64_t>(meta.elementCount) > kMaximumNekElements ||
+        static_cast<std::uint64_t>(meta.globalElementCount) > kMaximumNekElements ||
+        static_cast<std::uint64_t>(meta.fileCount) > kMaximumNekFileCount) {
+        throw std::runtime_error("Nek5000 field metadata exceeds configured resource limits: " +
+                                 path.string());
+    }
+    const std::uint64_t xy = CheckedNekMultiply(static_cast<std::uint64_t>(meta.nx),
+                                                static_cast<std::uint64_t>(meta.ny),
+                                                "nx*ny");
+    const std::uint64_t nxyz = CheckedNekMultiply(xy,
+                                                  static_cast<std::uint64_t>(meta.nz),
+                                                  "nx*ny*nz");
+    if (nxyz > kMaximumNekPointsPerElement ||
+        nxyz > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("Nek5000 points-per-element exceeds the resource limit: " +
+                                 path.string());
+    }
+    const std::uint64_t pointCount = CheckedNekMultiply(
+        static_cast<std::uint64_t>(meta.elementCount), nxyz, "local point-count");
+    const std::uint64_t globalPointCount = CheckedNekMultiply(
+        static_cast<std::uint64_t>(meta.globalElementCount), nxyz, "global point-count");
+    if (pointCount > kMaximumNekPoints || globalPointCount > kMaximumNekPoints) {
+        throw std::runtime_error("Nek5000 point count exceeds the resource limit: " + path.string());
+    }
+    (void)CheckedNekSize(pointCount, "local point-count");
+    meta.nxyz = static_cast<int>(nxyz);
+    meta.dataBaseOffset = CheckedNekAdd(
+        136ull,
+        CheckedNekMultiply(4ull, static_cast<std::uint64_t>(meta.elementCount),
+                           "element-map byte count"),
+        "data-base offset");
     meta.labels = NekLabelsForCode(meta.code, meta.dimensions);
+    if (meta.labels.empty() || meta.labels.size() > kMaximumNekComponents) {
+        throw std::runtime_error("Nek5000 field rdcode has no supported data or exceeds the component limit: " +
+                                 path.string());
+    }
+    const std::uint64_t payloadValues = CheckedNekMultiply(
+        pointCount, static_cast<std::uint64_t>(meta.labels.size()), "field value-count");
+    if (payloadValues > kMaximumNekStoredValues) {
+        throw std::runtime_error("Nek5000 field payload exceeds the stored-value resource limit: " +
+                                 path.string());
+    }
+    const std::uint64_t payloadBytes = CheckedNekMultiply(
+        payloadValues, static_cast<std::uint64_t>(meta.wordSize), "field payload byte-count");
+    const std::uint64_t requiredFileSize = CheckedNekAdd(meta.dataBaseOffset, payloadBytes,
+                                                        "required file size");
+    meta.fileSize = NekFileSize(path);
+    if (meta.fileSize < requiredFileSize) {
+        throw std::runtime_error("Nek5000 field file is truncated for its validated header: " +
+                                 path.string());
+    }
     return meta;
 }
 
@@ -2566,6 +2711,10 @@ std::vector<NekFieldMeta> ReadNekPieceSet(const NekDescriptor& descriptor,
                                           int relativeFrameIndex) {
     NekFieldMeta first =
         ReadNekHeader(FormatNekFieldPath(descriptor, relativeFrameIndex, 0));
+    if (first.fileIndex != 0) {
+        throw std::runtime_error("The first Nek5000 field piece must advertise file index 0: " +
+                                 first.path.string());
+    }
     if (first.fileCount > 1 && descriptor.integerConversions < 2) {
         throw std::runtime_error(
             "Multi-file Nek5000 output requires filetemplate to contain file and timestep conversions.");
@@ -2577,13 +2726,19 @@ std::vector<NekFieldMeta> ReadNekPieceSet(const NekDescriptor& descriptor,
         NekFieldMeta piece =
             ReadNekHeader(FormatNekFieldPath(descriptor, relativeFrameIndex, fileIndex));
         ValidateNekPieceCompatible(first, piece, true);
+        if (piece.fileIndex != fileIndex) {
+            throw std::runtime_error("Nek5000 field piece index does not match its filetemplate position: " +
+                                     piece.path.string());
+        }
         pieces.push_back(std::move(piece));
     }
-    std::size_t totalElements = 0;
+    std::uint64_t totalElements = 0;
     for (const NekFieldMeta& piece : pieces) {
-        totalElements += static_cast<std::size_t>(piece.elementCount);
+        totalElements = CheckedNekAdd(totalElements,
+                                      static_cast<std::uint64_t>(piece.elementCount),
+                                      "piece element total");
     }
-    if (totalElements != static_cast<std::size_t>(first.globalElementCount)) {
+    if (totalElements != static_cast<std::uint64_t>(first.globalElementCount)) {
         throw std::runtime_error("Nek5000 field pieces do not cover the advertised global elements.");
     }
     return pieces;
@@ -2595,9 +2750,18 @@ std::vector<int> ReadNekElementMap(const NekFieldMeta& meta) {
         throw std::runtime_error("Cannot open Nek5000 element map: " + meta.path.string());
     }
     input.seekg(136, std::ios::beg);
-    std::vector<std::int32_t> raw(static_cast<std::size_t>(meta.elementCount));
+    const std::size_t mapCount = CheckedNekSize(
+        static_cast<std::uint64_t>(meta.elementCount), "element-map count");
+    const std::uint64_t mapBytes = CheckedNekMultiply(
+        static_cast<std::uint64_t>(mapCount), sizeof(std::int32_t), "element-map byte-count");
+    if (CheckedNekAdd(136ull, mapBytes, "element-map end offset") > meta.fileSize ||
+        mapBytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("Nek5000 element map exceeds the validated file extent: " +
+                                 meta.path.string());
+    }
+    std::vector<std::int32_t> raw(mapCount);
     input.read(reinterpret_cast<char*>(raw.data()),
-               static_cast<std::streamsize>(raw.size() * sizeof(std::int32_t)));
+               static_cast<std::streamsize>(mapBytes));
     if (!input) {
         throw std::runtime_error("Cannot read Nek5000 element map: " + meta.path.string());
     }
@@ -2606,6 +2770,13 @@ std::vector<int> ReadNekElementMap(const NekFieldMeta& meta) {
         std::int32_t value = raw[i];
         if (meta.littleEndian != HostIsLittleEndian()) {
             value = ByteSwapValue(value);
+        }
+        // Nek global element ids are positive identifiers, not necessarily a
+        // dense 1..nelgt range (real writers and legacy cases use stable sparse
+        // ids). Duplicate ids are rejected when piece maps are assembled.
+        if (value < 1) {
+            throw std::runtime_error("Nek5000 element map contains a non-positive global id: " +
+                                     meta.path.string());
         }
         ids[i] = static_cast<int>(value);
     }
@@ -2617,6 +2788,19 @@ void ReadNekRawValues(std::ifstream& input,
                       std::uint64_t byteOffset,
                       std::size_t count,
                       double* destination) {
+    if (count > 0 && destination == nullptr) {
+        throw std::runtime_error("Internal error: null Nek5000 field destination.");
+    }
+    const std::uint64_t byteCount = CheckedNekMultiply(
+        static_cast<std::uint64_t>(count), static_cast<std::uint64_t>(meta.wordSize),
+        "component read byte-count");
+    const std::uint64_t endOffset = CheckedNekAdd(byteOffset, byteCount,
+                                                  "component read end offset");
+    if (endOffset > meta.fileSize ||
+        byteOffset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        throw std::runtime_error("Nek5000 field read exceeds the validated file extent: " +
+                                 meta.path.string());
+    }
     input.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
     if (!input) {
         throw std::runtime_error("Cannot seek Nek5000 field data: " + meta.path.string());
@@ -2693,10 +2877,18 @@ std::optional<NekVectorLayout> ResolveNekVectorLayout(const NekFieldMeta& meta,
                 ? 0ull
                 : static_cast<std::uint64_t>(dimensions);
         const std::uint64_t blockOffset =
-            meta.dataBaseOffset + coordinateComponents *
-                                      static_cast<std::uint64_t>(meta.elementCount) *
-                                      static_cast<std::uint64_t>(meta.nxyz) *
-                                      static_cast<std::uint64_t>(meta.wordSize);
+            CheckedNekAdd(
+                meta.dataBaseOffset,
+                CheckedNekMultiply(
+                    CheckedNekMultiply(
+                        CheckedNekMultiply(coordinateComponents,
+                                           static_cast<std::uint64_t>(meta.elementCount),
+                                           "coordinate block element-count"),
+                        static_cast<std::uint64_t>(meta.nxyz),
+                        "coordinate block value-count"),
+                    static_cast<std::uint64_t>(meta.wordSize),
+                    "coordinate block byte-count"),
+                "velocity block offset");
         return NekVectorLayout{blockOffset,
                                lower == "u" ? 0 : (lower == "v" ? 1 : 2)};
     }
@@ -2728,15 +2920,22 @@ void ReadNekComponent(const NekFieldMeta& meta,
     if (const std::optional<NekVectorLayout> layout =
             ResolveNekVectorLayout(meta, label)) {
         const std::size_t nxyz = static_cast<std::size_t>(meta.nxyz);
-        const std::size_t valuesPerElement =
-            static_cast<std::size_t>(meta.dimensions) * nxyz;
+        const std::size_t valuesPerElement = CheckedNekSize(
+            CheckedNekMultiply(static_cast<std::uint64_t>(meta.dimensions),
+                               static_cast<std::uint64_t>(nxyz),
+                               "vector values per element"),
+            "vector values per element");
         std::vector<double> raw(valuesPerElement);
         for (int element = 0; element < meta.elementCount; ++element) {
-            const std::uint64_t offset =
-                layout->blockOffset +
-                static_cast<std::uint64_t>(element) *
-                    static_cast<std::uint64_t>(valuesPerElement) *
-                    static_cast<std::uint64_t>(meta.wordSize);
+            const std::uint64_t offset = CheckedNekAdd(
+                layout->blockOffset,
+                CheckedNekMultiply(
+                    CheckedNekMultiply(static_cast<std::uint64_t>(element),
+                                       static_cast<std::uint64_t>(valuesPerElement),
+                                       "vector element value offset"),
+                    static_cast<std::uint64_t>(meta.wordSize),
+                    "vector element byte offset"),
+                "vector component offset");
             ReadNekRawValues(input, meta, offset, valuesPerElement, raw.data());
             const std::size_t source =
                 static_cast<std::size_t>(layout->component) * nxyz;
@@ -2746,11 +2945,18 @@ void ReadNekComponent(const NekFieldMeta& meta,
         return;
     }
     const int componentIndex = NekLabelIndex(meta, label);
-    const std::uint64_t offset =
-        meta.dataBaseOffset + static_cast<std::uint64_t>(componentIndex) *
-                                  static_cast<std::uint64_t>(meta.elementCount) *
-                                  static_cast<std::uint64_t>(meta.nxyz) *
-                                  static_cast<std::uint64_t>(meta.wordSize);
+    const std::uint64_t offset = CheckedNekAdd(
+        meta.dataBaseOffset,
+        CheckedNekMultiply(
+            CheckedNekMultiply(
+                CheckedNekMultiply(static_cast<std::uint64_t>(componentIndex),
+                                   static_cast<std::uint64_t>(meta.elementCount),
+                                   "component element offset"),
+                static_cast<std::uint64_t>(meta.nxyz),
+                "component value offset"),
+            static_cast<std::uint64_t>(meta.wordSize),
+            "component byte offset"),
+        "component data offset");
     ReadNekRawValues(input, meta, offset, meta.pointCount(), values->data());
 }
 

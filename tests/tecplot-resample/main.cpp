@@ -826,8 +826,8 @@ void ValidateFolder(const fs::path& directory) {
 
 int main() {
     try {
-        const fs::path root = fs::path(SCP_REPOSITORY_ROOT) / ".tests" /
-                              "tecplot-resample" / "SCP-ResamplerIO";
+        const fs::path root = fs::path(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT) /
+                              "tecplot-resample";
         fs::remove_all(root);
         fs::create_directories(root);
         const fs::path asciiPath = root / "frame_000.dat";

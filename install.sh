@@ -2,6 +2,7 @@
 set -euo pipefail
 
 module_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${module_root}/cmake/transactional-publish.sh"
 vcpkg_commit="42f37e46d37baf7b218966434b91116bddf73461"
 vcpkg_repository="https://github.com/microsoft/vcpkg.git"
 sdk_repository="https://github.com/hweifluids/SCP-SolverSDK.git"
@@ -173,19 +174,64 @@ cmake "${configure_args[@]}"
 cmake --build "${build_dir}" --config Release --parallel
 
 if [[ -z "${install_dir}" || "${install_dir}" == "/" ]]; then
-  echo "Refusing to replace tools under an empty or filesystem-root install prefix." >&2
+  echo "Refusing to replace an empty or filesystem-root install prefix." >&2
   exit 1
 fi
-rm -rf -- "${install_dir%/}/tools"
 
-cmake --install "${build_dir}" --config Release --prefix "${install_dir}"
+validate_resampler_release_identity() {
+  local release_root="$1" identity required tool_path
+  local -a tools=()
+  if [[ -d "${release_root}/tools" ]]; then
+    mapfile -d '' tools < <(find "${release_root}/tools" -maxdepth 1 -type f \
+      -name 'Resample_solver_*' -print0)
+  fi
+  if [[ ${#tools[@]} -ne 1 ]]; then
+    echo "Validated release must contain exactly one non-empty dated Resample tool under ${release_root}/tools." >&2
+    return 1
+  fi
+  if [[ ! -s "${tools[0]}" ]]; then
+    echo "Validated Resample tool is empty: ${tools[0]}" >&2
+    return 1
+  fi
+  tool_path="${tools[0]}"
+  identity="$("${tool_path}" --solver-info)" || return 1
+  for required in \
+      'streamcenterplus_solver_identity=1' \
+      'product=Streamcenter+' \
+      'type=tools' \
+      'solver=Resample' \
+      'version=0.3.0' \
+      'cpu=1' \
+      'cuda=0'; do
+    grep -Fqx -- "${required}" <<<"${identity}" || {
+      echo "The staged Resample identity is missing exact line '${required}'." >&2
+      return 1
+    }
+  done
+}
 
-tool_path="$(find "${install_dir}/tools" -maxdepth 1 -type f -name 'Resample_solver_*' -print -quit 2>/dev/null || true)"
-if [[ -z "${tool_path}" ]]; then
-  echo "Install succeeded, but no dated Resample tool was found in ${install_dir}/tools." >&2
+stage_parent="${build_dir}/publish-stage"
+staged_release="${stage_parent}/release"
+[[ "${stage_parent}" == "${build_dir}/publish-stage" ]] || {
+  echo "Refusing to stage installation outside the module build tree." >&2
   exit 1
-fi
-"${tool_path}" --solver-info
+}
+rm -rf -- "${stage_parent}"
+mkdir -p -- "${stage_parent}"
+cleanup_publish_stage() {
+  rm -rf -- "${stage_parent}"
+}
+trap cleanup_publish_stage EXIT
+
+cmake --install "${build_dir}" --config Release --prefix "${staged_release}"
+validate_resampler_release_identity "${staged_release}"
+validated_identity="$(publish_transactional_directory \
+  "${staged_release}" "${install_dir}" validate_resampler_release_identity)"
+echo "Validated release content SHA-256: ${validated_identity}"
+trap - EXIT
+cleanup_publish_stage
+
+tool_path="$(find "${install_dir}/tools" -maxdepth 1 -type f -name 'Resample_solver_*' -print -quit)"
 
 echo "SCP-ResamplerIO installed to ${install_dir}"
 echo "Resample tool ready at ${tool_path}"

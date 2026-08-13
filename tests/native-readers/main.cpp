@@ -1345,9 +1345,8 @@ void ValidateOpenFoam(const fs::path& marker) {
 
 int main() {
     try {
-        const fs::path root =
-            fs::path(SCP_REPOSITORY_ROOT) / ".tests" / "native-readers" /
-            "SCP-ResamplerIO";
+        const fs::path root = fs::path(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT) /
+                              "native-readers";
         fs::remove_all(root);
         fs::create_directories(root);
         ValidateNek(CreateNekFixture(root));

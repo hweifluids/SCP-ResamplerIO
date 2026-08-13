@@ -47,11 +47,18 @@ if(NOT TARGET SCP::SolverSDK)
         "SCP-ResamplerIO requires SCP-SolverSDK 0.2.0; found '${scp_solver_sdk_version}' "
         "at ${scp_solver_sdk_source}.")
     endif()
+    # SCP-SolverSDK currently keys its own tests from the global BUILD_TESTING
+    # switch. ResamplerIO must keep that switch enabled for its tests without
+    # importing the sibling SDK's independent test suite into this build.
+    set(scp_resampler_io_saved_build_testing "${BUILD_TESTING}")
+    set(BUILD_TESTING OFF)
     add_subdirectory(
       "${scp_solver_sdk_source}"
       "${CMAKE_CURRENT_BINARY_DIR}/_deps/SCP-SolverSDK"
       EXCLUDE_FROM_ALL
     )
+    set(BUILD_TESTING "${scp_resampler_io_saved_build_testing}")
+    unset(scp_resampler_io_saved_build_testing)
   else()
     file(GLOB scp_solver_sdk_installed_configs
       "${scp_solver_sdk_sibling}/release/*/lib/cmake/SCPSolverSDK/SCPSolverSDKConfig.cmake"
@@ -141,6 +148,7 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS Core)
 
 add_library(SCP_ResamplerIO STATIC
   src/FlowDataInspector.cpp
+  resample/src/Integrity.cpp
   resample/src/Parameters.cpp
   resample/src/Solver.cpp
   resample/src/VtkIO.cpp
@@ -228,12 +236,16 @@ if(SCP_RESAMPLER_IO_BUILD_TOOL)
 endif()
 
 if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
+  set(SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../.tests/SCP-ResamplerIO"
+    CACHE PATH "Root for SCP-ResamplerIO test fixtures and generated results.")
+
   add_executable(scp_resampler_io_native_readers
     tests/native-readers/main.cpp
   )
   target_link_libraries(scp_resampler_io_native_readers PRIVATE SCP::ResamplerReaders)
   target_compile_definitions(scp_resampler_io_native_readers PRIVATE
-    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT="${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}"
   )
   vtk_module_autoinit(
     TARGETS scp_resampler_io_native_readers
@@ -248,7 +260,7 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
   )
   target_link_libraries(scp_resampler_io_flowdata_nek PRIVATE SCP::ResamplerIO)
   target_compile_definitions(scp_resampler_io_flowdata_nek PRIVATE
-    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT="${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}"
   )
   vtk_module_autoinit(
     TARGETS scp_resampler_io_flowdata_nek
@@ -270,12 +282,29 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
     COMMAND scp_resampler_io_nek_resample
   )
 
+  add_executable(scp_resampler_io_safety
+    tests/resample-safety/main.cpp
+  )
+  target_include_directories(scp_resampler_io_safety PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/resample/src"
+  )
+  target_link_libraries(scp_resampler_io_safety PRIVATE SCP::ResamplerIO)
+  vtk_module_autoinit(
+    TARGETS scp_resampler_io_safety
+    MODULES ${VTK_LIBRARIES}
+  )
+  add_test(NAME SCPResamplerIO.SafetyRegression
+    COMMAND scp_resampler_io_safety
+      "${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}/safety-regression"
+  )
+  set_tests_properties(SCPResamplerIO.SafetyRegression PROPERTIES TIMEOUT 180)
+
   add_executable(scp_resampler_io_tecplot_resample
     tests/tecplot-resample/main.cpp
   )
   target_link_libraries(scp_resampler_io_tecplot_resample PRIVATE SCP::ResamplerIO)
   target_compile_definitions(scp_resampler_io_tecplot_resample PRIVATE
-    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT="${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}"
   )
   vtk_module_autoinit(
     TARGETS scp_resampler_io_tecplot_resample
@@ -297,7 +326,7 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
     VTK::hdf5
   )
   target_compile_definitions(scp_resampler_io_multizone PRIVATE
-    SCP_REPOSITORY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT="${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}"
   )
   vtk_module_autoinit(
     TARGETS scp_resampler_io_multizone
@@ -313,7 +342,7 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
   )
   target_link_libraries(scp_resampler_io_nek5000_integration PRIVATE SCP::ResamplerIO)
   target_compile_definitions(scp_resampler_io_nek5000_integration PRIVATE
-    SCP_RESAMPLER_IO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT="${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}"
   )
   vtk_module_autoinit(
     TARGETS scp_resampler_io_nek5000_integration
@@ -326,6 +355,27 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
     SKIP_RETURN_CODE 77
     TIMEOUT 600
   )
+
+  if(WIN32)
+    find_program(SCP_RESAMPLER_IO_POWERSHELL_EXECUTABLE
+      NAMES powershell.exe pwsh.exe REQUIRED)
+    add_test(NAME SCPResamplerIO.TransactionalInstallPublish
+      COMMAND "${SCP_RESAMPLER_IO_POWERSHELL_EXECUTABLE}"
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+        -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/install-publish/Test-TransactionalPublish.ps1"
+        -Helper "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TransactionalPublish.ps1"
+        -FixtureRoot "${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}/install-publish-windows"
+    )
+  else()
+    find_program(SCP_RESAMPLER_IO_BASH_EXECUTABLE NAMES bash REQUIRED)
+    add_test(NAME SCPResamplerIO.TransactionalInstallPublish
+      COMMAND "${SCP_RESAMPLER_IO_BASH_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/install-publish/test-transactional-publish.sh"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/transactional-publish.sh"
+        "${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}/install-publish-linux"
+    )
+  endif()
+  set_tests_properties(SCPResamplerIO.TransactionalInstallPublish PROPERTIES TIMEOUT 60)
 endif()
 
 install(TARGETS SCP_ResamplerReaders SCP_ResamplerIO

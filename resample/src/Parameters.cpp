@@ -681,6 +681,11 @@ void ValidateParametersImpl(Parameters* params) {
     if (params->kriging.neighbors < 1 || params->kriging.minNeighbors < 1) {
         throw std::runtime_error("Kriging neighbors and min_neighbors must be at least 1.");
     }
+    if (params->kriging.neighbors > kMaximumKrigingNeighbors) {
+        throw std::runtime_error(
+            "Kriging neighbors cannot exceed " + std::to_string(kMaximumKrigingNeighbors) +
+            " because the solver uses a dense local system.");
+    }
     if (params->kriging.minNeighbors > params->kriging.neighbors) {
         throw std::runtime_error("Kriging min_neighbors cannot exceed the neighbor limit.");
     }

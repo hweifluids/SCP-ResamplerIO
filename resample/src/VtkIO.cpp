@@ -170,6 +170,23 @@ std::string AttributeValue(const std::string& tag, const std::string& name) {
     return XmlUnescape(match[2].str());
 }
 
+double ParsePvdTimestep(const std::string& rawValue, const std::filesystem::path& path) {
+    const auto first = rawValue.find_first_not_of(" \t\r\n");
+    const std::string value = first == std::string::npos
+                                  ? std::string()
+                                  : rawValue.substr(first, rawValue.find_last_not_of(" \t\r\n") - first + 1);
+    try {
+        std::size_t consumed = 0;
+        const double parsed = std::stod(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed)) {
+            throw std::runtime_error("non-finite or trailing characters");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid PVD timestep '" + rawValue + "' in " + path.string());
+    }
+}
+
 std::vector<FrameInfo> CollectFolderFiles(const std::filesystem::path& folder, double physicalDt) {
     if (!std::filesystem::is_directory(folder)) {
         throw std::runtime_error("Input folder does not exist: " + folder.string());
@@ -241,11 +258,7 @@ std::vector<FrameInfo> CollectPvdFiles(const std::filesystem::path& pvdFile, dou
         std::string timestep = AttributeValue(tag, "timestep");
         double time = static_cast<double>(frames.size()) * physicalDt;
         if (!timestep.empty()) {
-            try {
-                time = std::stod(timestep);
-            } catch (...) {
-                throw std::runtime_error("Invalid PVD timestep '" + timestep + "' in " + pvdFile.string());
-            }
+            time = ParsePvdTimestep(timestep, pvdFile);
         }
         std::filesystem::path framePath(file);
         if (framePath.is_relative()) {

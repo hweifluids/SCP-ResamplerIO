@@ -27,6 +27,10 @@ namespace is preserved and the run fails closed. Frame files, PVD, summary, and
 the manifest are published through same-directory temporary files and atomic
 replacement.
 
+Kriging uses a dense local system and therefore accepts at most 1024 neighbors.
+PVD `file` attributes are XML-entity decoded, and explicit `timestep` values
+must be complete finite numbers.
+
 ## Format boundary
 
 - **VTK:** scans legacy/XML VTK datasets, PVD collections, and VTKHDF time steps. The resampler accepts VTK datasets and writes uniform `vtkImageData` frames as VTI plus a PVD collection.

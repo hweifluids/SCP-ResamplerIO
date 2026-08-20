@@ -3759,6 +3759,38 @@ vtkSmartPointer<vtkDataSet> ReadNek5000(const DataSetFrame& frame,
     return grid;
 }
 
+std::string XmlUnescapeAttribute(std::string value) {
+    const std::pair<const char*, const char*> replacements[] = {
+        {"&quot;", "\""},
+        {"&apos;", "'"},
+        {"&lt;", "<"},
+        {"&gt;", ">"},
+        {"&amp;", "&"},
+    };
+    for (const auto& replacement : replacements) {
+        std::string::size_type position = 0;
+        while ((position = value.find(replacement.first, position)) != std::string::npos) {
+            value.replace(position, std::strlen(replacement.first), replacement.second);
+            position += std::strlen(replacement.second);
+        }
+    }
+    return value;
+}
+
+double ParsePvdTimestep(const std::string& rawValue, const std::filesystem::path& path) {
+    const std::string value = TrimAscii(rawValue);
+    try {
+        std::size_t consumed = 0;
+        const double parsed = std::stod(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed)) {
+            throw std::runtime_error("non-finite or trailing characters");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid PVD timestep '" + rawValue + "' in " + path.string());
+    }
+}
+
 std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
                                    double fallbackPhysicalDt) {
     std::ifstream input(path);
@@ -3779,14 +3811,14 @@ std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
         if (!std::regex_search(tag, fileMatch, filePattern)) {
             continue;
         }
-        std::filesystem::path framePath(fileMatch[2].str());
+        std::filesystem::path framePath(XmlUnescapeAttribute(fileMatch[2].str()));
         if (framePath.is_relative()) {
             framePath = path.parent_path() / framePath;
         }
         double time = static_cast<double>(frames.size()) * fallbackPhysicalDt;
         std::smatch timeMatch;
         if (std::regex_search(tag, timeMatch, timePattern)) {
-            time = std::stod(timeMatch[2].str());
+            time = ParsePvdTimestep(XmlUnescapeAttribute(timeMatch[2].str()), path);
         }
         std::vector<DataSetFrame> expanded =
             EnumerateDataSetFrames(framePath, fallbackPhysicalDt);

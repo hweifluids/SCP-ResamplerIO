@@ -39,6 +39,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -1179,55 +1180,56 @@ bool KrigingWeights(vtkDataSet* source,
                     const double point[3],
                     double effectiveRange,
                     std::vector<double>* weights) {
-    const int n = static_cast<int>(neighborIds.size());
-    if (n <= 0 || weights == nullptr) {
+    const std::size_t neighborCount = neighborIds.size();
+    if (neighborCount == 0 || weights == nullptr ||
+        neighborCount > static_cast<std::size_t>(kMaximumKrigingNeighbors)) {
         return false;
     }
-    for (int i = 0; i < n; ++i) {
-        if (SquaredDistance(source, neighborIds[static_cast<std::size_t>(i)], point) <= 1e-24) {
-            weights->assign(static_cast<std::size_t>(n), 0.0);
-            (*weights)[static_cast<std::size_t>(i)] = 1.0;
+    for (std::size_t i = 0; i < neighborCount; ++i) {
+        if (SquaredDistance(source, neighborIds[i], point) <= 1e-24) {
+            weights->assign(neighborCount, 0.0);
+            (*weights)[i] = 1.0;
             return true;
         }
     }
 
-    const int systemSize = n + 1;
-    std::vector<double> matrix(static_cast<std::size_t>(systemSize * systemSize), 0.0);
-    std::vector<double> rhs(static_cast<std::size_t>(systemSize), 0.0);
-    for (int i = 0; i < n; ++i) {
+    const std::size_t systemSize = neighborCount + 1;
+    std::vector<double> matrix(systemSize * systemSize, 0.0);
+    std::vector<double> rhs(systemSize, 0.0);
+    for (std::size_t i = 0; i < neighborCount; ++i) {
         double pi[3] = {};
-        source->GetPoint(neighborIds[static_cast<std::size_t>(i)], pi);
-        for (int j = 0; j < n; ++j) {
+        source->GetPoint(neighborIds[i], pi);
+        for (std::size_t j = 0; j < neighborCount; ++j) {
             double pj[3] = {};
-            source->GetPoint(neighborIds[static_cast<std::size_t>(j)], pj);
+            source->GetPoint(neighborIds[j], pj);
             const double dx = pi[0] - pj[0];
             const double dy = pi[1] - pj[1];
             const double dz = pi[2] - pj[2];
             const double h = std::sqrt(dx * dx + dy * dy + dz * dz);
-            matrix[static_cast<std::size_t>(i * systemSize + j)] =
+            matrix[i * systemSize + j] =
                 VariogramValue(params.variogram, h, effectiveRange, params.sill, params.nugget);
         }
-        matrix[static_cast<std::size_t>(i * systemSize + i)] += params.regularization;
-        matrix[static_cast<std::size_t>(i * systemSize + n)] = 1.0;
-        matrix[static_cast<std::size_t>(n * systemSize + i)] = 1.0;
+        matrix[i * systemSize + i] += params.regularization;
+        matrix[i * systemSize + neighborCount] = 1.0;
+        matrix[neighborCount * systemSize + i] = 1.0;
 
         const double dx = pi[0] - point[0];
         const double dy = pi[1] - point[1];
         const double dz = pi[2] - point[2];
-        rhs[static_cast<std::size_t>(i)] =
+        rhs[i] =
             VariogramValue(params.variogram,
                            std::sqrt(dx * dx + dy * dy + dz * dz),
                            effectiveRange,
                            params.sill,
                            params.nugget);
     }
-    rhs[static_cast<std::size_t>(n)] = 1.0;
+    rhs[neighborCount] = 1.0;
 
     std::vector<double> solution;
     if (!SolveLinearSystem(std::move(matrix), std::move(rhs), &solution)) {
         return false;
     }
-    weights->assign(solution.begin(), solution.begin() + n);
+    weights->assign(solution.begin(), solution.begin() + static_cast<std::ptrdiff_t>(neighborCount));
     return true;
 }
 
@@ -2379,6 +2381,13 @@ vtkSmartPointer<vtkImageData> ResampleFrame(vtkDataSet* preparedInput,
         throw std::runtime_error("Internal error: null prepared input.");
     }
     EnsureVtkSmpConfigured();
+    if (params.method == InterpolationMethod::Kriging &&
+        (params.kriging.neighbors < 1 ||
+         params.kriging.neighbors > kMaximumKrigingNeighbors)) {
+        throw std::runtime_error(
+            "Kriging neighbors must be between 1 and " +
+            std::to_string(kMaximumKrigingNeighbors) + ".");
+    }
     if (streamcenterplus::io::HasNek5000SpectralMetadata(preparedInput)) {
         (void)streamcenterplus::io::GetNek5000SpectralMetadata(preparedInput);
         return ResampleNek5000Spectral(preparedInput, params, bounds);

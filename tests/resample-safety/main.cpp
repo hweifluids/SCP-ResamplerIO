@@ -142,6 +142,18 @@ void TestStrictParameters(const fs::path& root) {
                                       "kriging.neighbors=2\nkriging.min_neighbors=3\n"));
     }, "min_neighbors cannot exceed");
     ExpectThrows([&] {
+        (void)resample::LoadParameters(deck(
+            "kriging-neighbor-limit", input + "kriging.neighbors=65535\n"));
+    }, "Kriging neighbors cannot exceed");
+    vtkNew<vtkImageData> directKrigingInput;
+    resample::Parameters directKriging;
+    directKriging.method = resample::InterpolationMethod::Kriging;
+    directKriging.kriging.neighbors = 65535;
+    ExpectThrows([&] {
+        (void)resample::ResampleFrame(directKrigingInput, directKriging,
+                                      {0.0, 1.0, 0.0, 1.0, 0.0, 1.0});
+    }, "Kriging neighbors must be between");
+    ExpectThrows([&] {
         (void)resample::LoadParameters(deck("traversal", input + "output_basename=../escape\n"));
     }, "output_basename");
     ExpectThrows([&] {
@@ -195,6 +207,34 @@ void TestStrictParameters(const fs::path& root) {
                 fields.kriging.fallback == resample::KrigingFallback::Closest &&
                 std::abs(fields.kriging.fallbackIdwPower - 1.75) < 1.0e-15,
             "Linear/IDW/Kriging parameter fields were not loaded exactly.");
+}
+
+void TestPvdAttributeHandling(const fs::path& root) {
+    const fs::path directory = root / "pvd-attributes";
+    const fs::path frame = directory / "frame&name.vti";
+    WriteInputImage(frame, 2.0);
+
+    const fs::path generatedPvd = directory / "generated.pvd";
+    resample::WritePvd(generatedPvd, {{2.5, frame.filename()}});
+    Require(ReadText(generatedPvd).find("frame&amp;name.vti") != std::string::npos,
+            "PVD writer did not XML-escape the generated frame name.");
+    const std::vector<resample::FrameInfo> generatedFrames =
+        resample::EnumerateDataSetFrames(generatedPvd);
+    Require(generatedFrames.size() == 1 &&
+                generatedFrames.front().path.lexically_normal() == frame.lexically_normal() &&
+                std::abs(generatedFrames.front().time - 2.5) < 1.0e-12,
+            "PVD reader did not round-trip an XML-escaped frame name and timestep.");
+
+    for (const std::string& timestep : {std::string("nan"), std::string("1.5ms")}) {
+        const fs::path invalidPvd = directory / ("invalid-time-" + timestep + ".pvd");
+        WriteText(invalidPvd,
+                  "<?xml version=\"1.0\"?>\n"
+                  "<VTKFile type=\"Collection\"><Collection>\n"
+                  "<DataSet timestep=\"" + timestep + "\" file=\"frame&amp;name.vti\"/>\n"
+                  "</Collection></VTKFile>\n");
+        ExpectThrows([&] { (void)resample::EnumerateDataSetFrames(invalidPvd); },
+                     "Invalid PVD timestep");
+    }
 }
 
 void WriteNekHeader(const fs::path& fieldPath, const std::string& header) {
@@ -389,6 +429,7 @@ int main(int argc, char** argv) {
                     "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
                 "SHA-256 implementation failed its million-byte known-answer test.");
         TestStrictParameters(root);
+        TestPvdAttributeHandling(root);
         TestMaliciousNekHeaders(root);
         TestInvalidInputPreservesOutputs(root);
         TestContentBoundResumeAndOwnedCleanup(root);

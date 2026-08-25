@@ -35,6 +35,7 @@
 
 #include <QDate>
 #include <QCryptographicHash>
+#include <QByteArray>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -48,6 +49,7 @@
 #include <QXmlStreamWriter>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <exception>
 #include <filesystem>
@@ -1431,7 +1433,61 @@ struct VtkDataSummary {
     int spatialDimension = 0;
     QList<ArrayInfo> arrays;
     QStringList termCandidates;
+    QList<QByteArray> coordinateSignatures;
 };
+
+template <typename Value>
+void addGeometryHashValue(QCryptographicHash* hash, const Value& value) {
+    hash->addData(reinterpret_cast<const char*>(&value),
+                  static_cast<qsizetype>(sizeof(value)));
+}
+
+QByteArray coordinateSignature(vtkDataSet* dataSet) {
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    constexpr char version[] = "SCP-FlowDataCoordinates-v1";
+    hash.addData(version, static_cast<qsizetype>(sizeof(version) - 1));
+    if (dataSet == nullptr) {
+        return hash.result();
+    }
+
+    const vtkIdType pointCount = dataSet->GetNumberOfPoints();
+    std::vector<std::array<double, 3>> points;
+    points.reserve(static_cast<std::size_t>(pointCount));
+    bool hasNonFiniteCoordinate = false;
+    for (vtkIdType pointId = 0; pointId < pointCount; ++pointId) {
+        std::array<double, 3> point{};
+        dataSet->GetPoint(pointId, point.data());
+        for (double& coordinate : point) {
+            // Treat the two IEEE representations of physical zero equally.
+            if (coordinate == 0.0) {
+                coordinate = 0.0;
+            }
+            hasNonFiniteCoordinate = hasNonFiniteCoordinate || !std::isfinite(coordinate);
+        }
+        points.push_back(point);
+    }
+    if (hasNonFiniteCoordinate) {
+        // Invalid geometry must never be made equal by an unordered NaN sort.
+        // Preserve the source tuple sequence in this diagnostic signature.
+        addGeometryHashValue(&hash, static_cast<qsizetype>(points.size()));
+        for (const std::array<double, 3>& point : points) {
+            hash.addData(reinterpret_cast<const char*>(point.data()),
+                         static_cast<qsizetype>(sizeof(point)));
+        }
+        return hash.result();
+    }
+    std::sort(points.begin(), points.end(), [](const auto& lhs, const auto& rhs) {
+        return std::lexicographical_compare(lhs.cbegin(), lhs.cend(),
+                                            rhs.cbegin(), rhs.cend());
+    });
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    addGeometryHashValue(&hash, static_cast<qsizetype>(points.size()));
+    for (const std::array<double, 3>& point : points) {
+        hash.addData(reinterpret_cast<const char*>(point.data()),
+                     static_cast<qsizetype>(sizeof(point)));
+    }
+    return hash.result();
+}
 
 void mergeBounds(VtkDataSummary* summary, const double* bounds) {
     if (summary == nullptr || bounds == nullptr) {
@@ -1480,6 +1536,7 @@ bool summarizeDataSet(vtkDataSet* dataSet, VtkDataSummary* summary) {
     summary->spatialDimension = std::max(
         summary->spatialDimension, spatialDimensionForDataSet(dataSet, dims));
     summary->uniformStructured = summary->uniformStructured || isUniformStructured(dataSet, dims);
+    summary->coordinateSignatures.append(coordinateSignature(dataSet));
 
     if (summary->arrays.isEmpty()) {
         collectArrays(dataSet->GetPointData(), ArrayInfo::Association::Point,
@@ -1554,7 +1611,7 @@ bool coordinateBoundsEquivalent(const double* lhs, const double* rhs) {
     return true;
 }
 
-bool boundsEquivalent(const VtkDataSummary& lhs, const VtkDataSummary& rhs) {
+bool coordinatesEquivalent(const VtkDataSummary& lhs, const VtkDataSummary& rhs) {
     if (!lhs.hasBounds || !rhs.hasBounds) {
         return false;
     }
@@ -1571,7 +1628,7 @@ bool boundsEquivalent(const VtkDataSummary& lhs, const VtkDataSummary& rhs) {
             }
         }
     }
-    return true;
+    return lhs.coordinateSignatures == rhs.coordinateSignatures;
 }
 
 bool summarizeAnyVtk(const QString& filePath, VtkDataSummary* summary, QString* errorMessage) {
@@ -1770,7 +1827,10 @@ void inferTerms(const QList<ArrayInfo>& arrays, int dimension, FlowDataEntry* en
     }
 }
 
-bool boundsEquivalent(vtkDataSet* lhs, vtkDataSet* rhs) {
+bool coordinatesEquivalent(vtkDataSet* lhs, vtkDataSet* rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
     double left[6] = {};
     double right[6] = {};
     lhs->GetBounds(left);
@@ -1792,13 +1852,7 @@ bool boundsEquivalent(vtkDataSet* lhs, vtkDataSet* rhs) {
             }
         }
     }
-    return true;
-}
-
-bool boundsRangeEquivalent(const double* left, vtkDataSet* rhs) {
-    double right[6] = {};
-    rhs->GetBounds(right);
-    return coordinateBoundsEquivalent(left, right);
+    return coordinateSignature(lhs) == coordinateSignature(rhs);
 }
 
 QString boundsSummary(const double* bounds) {
@@ -5339,7 +5393,7 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                 result.errorMessage = frameError;
                 return result;
             }
-            if (!boundsEquivalent(first, frame)) {
+            if (!coordinatesEquivalent(first, frame)) {
                 result.errorMessage = QString("Snapshot grid coordinates differ from the first frame: %1")
                                           .arg(result.files.at(index));
                 return result;
@@ -5747,10 +5801,9 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
     auto effectiveDimension = [](const VtkDataSummary& summary) {
         return summary.spatialDimension;
     };
-    auto sameBounds = [](const VtkDataSummary& lhs,
-                         const VtkDataSummary& rhs) {
-        return lhs.hasBounds && rhs.hasBounds
-            && coordinateBoundsEquivalent(lhs.bounds, rhs.bounds);
+    auto sameCoordinates = [](const VtkDataSummary& lhs,
+                              const VtkDataSummary& rhs) {
+        return coordinatesEquivalent(lhs, rhs);
     };
 
     VtkDataSummary firstFrame;
@@ -5825,10 +5878,10 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
                     "Converted resampled PVD grid dimensions differ from the first frame: %1")
                                   .arg(referencedFiles.at(index)));
             }
-            if (coordinateCheck && !sameBounds(firstFrame, frame)
+            if (coordinateCheck && !sameCoordinates(firstFrame, frame)
                 && result.warningMessage.isEmpty()) {
                 result.warningMessage = QStringLiteral(
-                    "Converted PVD contains moving or deforming mesh coordinates; dimensions and all frame field schemas were still validated.");
+                    "Converted PVD contains changed mesh coordinates; dimensions and all frame field schemas were still validated.");
             }
         }
         validatedFrameInfos.append(frameAfter);
@@ -6279,7 +6332,7 @@ FlowDataScanResult FlowDataInspector::scanOpenFoamCase(const QString& casePath,
                 result.errorMessage = frameError;
                 return result;
             }
-            if (coordinateCheck && !boundsEquivalent(first, frame)) {
+            if (coordinateCheck && !coordinatesEquivalent(first, frame)) {
                 result.errorMessage = QString("OpenFOAM frame grid coordinates differ from the first frame at time %1.")
                                           .arg(formatDouble(timeValues.at(index)));
                 return result;
@@ -6459,6 +6512,7 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
     QStringList commonFields;
     double firstBounds[6] = {};
     QString firstBoundsText;
+    QByteArray firstCoordinateSignature;
     int dimension = 3;
     {
         const EnSightGoldFrameSource& firstFrame = frames.first();
@@ -6482,6 +6536,7 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         }
 
         first->GetBounds(firstBounds);
+        firstCoordinateSignature = coordinateSignature(first);
         firstBoundsText = boundsSummary(firstBounds);
         result.entry.xRange = formatRange(firstBounds[0], firstBounds[1]);
         result.entry.yRange = formatRange(firstBounds[2], firstBounds[3]);
@@ -6523,8 +6578,9 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
                 result.errorMessage = frameError;
                 return result;
             }
-            if (coordinateCheck && !boundsRangeEquivalent(firstBounds, frame) && result.warningMessage.isEmpty()) {
-                result.warningMessage = QString("EnSight Gold frame XYZ bounds differ from the first frame at time %1 in %2.\nFirst bounds: %3\nCurrent bounds: %4\nImport will continue; verify the combined dataset before analysis.")
+            if (coordinateCheck && coordinateSignature(frame) != firstCoordinateSignature &&
+                result.warningMessage.isEmpty()) {
+                result.warningMessage = QString("EnSight Gold frame coordinates differ from the first frame at time %1 in %2.\nFirst bounds: %3\nCurrent bounds: %4\nImport will continue; verify the combined dataset before analysis.")
                                             .arg(formatDouble(frameSource.timeValue),
                                                  cases.at(frameSource.caseIndex).path,
                                                  firstBoundsText,

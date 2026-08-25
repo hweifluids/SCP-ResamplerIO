@@ -331,6 +331,10 @@ bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath);
 // binary PLT (.plt) finite-element data. A directory is treated as an OpenFOAM
 // case when it contains a *.foam marker (or a recognizable
 // system/constant/processor layout), and as a normal frame directory otherwise.
+// Exactly one .pvd collection in a normal frame directory is authoritative;
+// sibling files are not mixed into its ordered, timestamped frame list. A
+// directory with multiple .pvd collections must be disambiguated by selecting
+// a collection explicitly.
 std::vector<DataSetFrame> EnumerateDataSetFrames(
     const std::filesystem::path& sourcePath,
     double fallbackPhysicalDt = 1.0);
@@ -342,6 +346,10 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(
     const DataSetFrame& frame,
     const ReadOptions& options = {});
 
+// Returns true only when the complete Nek5000 metadata contract is present and
+// self-consistent with the point count: tensor dimensions, element count and
+// one unique positive global element ID per element. GetNek5000SpectralMetadata
+// reports the corresponding reason when this validation fails.
 bool HasNek5000SpectralMetadata(vtkDataSet* dataSet);
 Nek5000SpectralMetadata GetNek5000SpectralMetadata(vtkDataSet* dataSet);
 

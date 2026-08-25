@@ -28,8 +28,12 @@ the manifest are published through same-directory temporary files and atomic
 replacement.
 
 Kriging uses a dense local system and therefore accepts at most 1024 neighbors.
-PVD `file` attributes are XML-entity decoded, and explicit `timestep` values
-must be complete finite numbers.
+PVD `file` attributes are XML-entity decoded, explicit `timestep` values must
+be complete finite numbers, comments/CDATA are not treated as collection
+entries, and recursive PVD references are rejected. When a normal frame
+directory contains exactly one PVD collection, that collection is authoritative:
+its ordered references and timestamps are used without mixing in sibling files.
+Directories containing multiple PVD collections must select one explicitly.
 
 ## Format boundary
 

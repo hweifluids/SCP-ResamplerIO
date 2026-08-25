@@ -235,6 +235,51 @@ void TestPvdAttributeHandling(const fs::path& root) {
         ExpectThrows([&] { (void)resample::EnumerateDataSetFrames(invalidPvd); },
                      "Invalid PVD timestep");
     }
+
+    const fs::path commentedPvd = directory / "commented.pvd";
+    WriteText(commentedPvd,
+              "<?xml version=\"1.0\"?>\n"
+              "<VTKFile type=\"Collection\"><Collection>\n"
+              "<!-- <DataSet timestep=\"99\" file=\"missing.vti\"/> -->\n"
+              "<![CDATA[<DataSet timestep=\"98\" file=\"also-missing.vti\"/>]]>\n"
+              "<DataSet timestep=\"3.5\" file=\"frame&amp;name.vti\"/>\n"
+              "</Collection></VTKFile>\n");
+    const std::vector<resample::FrameInfo> commentedFrames =
+        resample::EnumerateDataSetFrames(commentedPvd);
+    Require(commentedFrames.size() == 1 &&
+                commentedFrames.front().path.lexically_normal() == frame.lexically_normal() &&
+                std::abs(commentedFrames.front().time - 3.5) < 1.0e-12,
+            "PVD parser treated a comment or CDATA payload as a DataSet entry.");
+
+    const fs::path collectionDirectory = directory / "directory-collection";
+    const fs::path collectionFrame = collectionDirectory / "frame0.vti";
+    WriteInputImage(collectionFrame, 4.0);
+    resample::WritePvd(collectionDirectory / "series.pvd", {{7.5, collectionFrame.filename()}});
+    const std::vector<resample::FrameInfo> directoryFrames =
+        resample::EnumerateDataSetFrames(collectionDirectory);
+    Require(directoryFrames.size() == 1 &&
+                directoryFrames.front().path.lexically_normal() == collectionFrame.lexically_normal() &&
+                std::abs(directoryFrames.front().time - 7.5) < 1.0e-12,
+            "Directory enumeration did not use its explicit PVD collection.");
+
+    const fs::path cyclicPvd = directory / "cyclic.pvd";
+    WriteText(cyclicPvd,
+              "<?xml version=\"1.0\"?>\n"
+              "<VTKFile type=\"Collection\"><Collection>\n"
+              "<DataSet timestep=\"0\" file=\"cyclic.pvd\"/>\n"
+              "</Collection></VTKFile>\n");
+    ExpectThrows([&] { (void)resample::EnumerateDataSetFrames(cyclicPvd); },
+                 "Recursive PVD collection");
+
+    const fs::path longTagDirectory = directory / "long-numeric-tag";
+    const fs::path longTagFrame = longTagDirectory /
+        "frame999999999999999999999999999999999999999999999999999999.vti";
+    WriteInputImage(longTagFrame, 5.0);
+    const std::vector<resample::FrameInfo> longTagFrames =
+        resample::EnumerateDataSetFrames(longTagDirectory);
+    Require(longTagFrames.size() == 1 &&
+                longTagFrames.front().path.lexically_normal() == longTagFrame.lexically_normal(),
+            "A long numeric filename prevented deterministic folder enumeration.");
 }
 
 void WriteNekHeader(const fs::path& fieldPath, const std::string& header) {

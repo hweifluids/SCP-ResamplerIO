@@ -360,6 +360,7 @@ std::uint64_t CoordinateBlockOffset(const NekHeader& header, std::uint64_t eleme
 
 void WriteMask(const Options& options,
                const std::vector<QueryPoint>& points,
+               std::uint64_t totalPoints,
                std::uint64_t pointStart,
                MPI_Comm communicator) {
     std::vector<unsigned char> mask(points.size(), 0);
@@ -374,6 +375,11 @@ void WriteMask(const Options& options,
                            MPI_INFO_NULL,
                            &file),
              "MPI_File_open(mask)");
+    // MPI_MODE_CREATE preserves an existing file length. Reset it collectively
+    // before partitioned writes so rerunning with a smaller target grid cannot
+    // retain a stale valid-mask tail.
+    CheckMpi(MPI_File_set_size(file, static_cast<MPI_Offset>(totalPoints)),
+             "MPI_File_set_size(mask)");
     CheckMpi(MPI_File_write_at_all(file,
                                    static_cast<MPI_Offset>(pointStart),
                                    mask.data(),
@@ -401,6 +407,13 @@ void WriteVelocityFrame(const Options& options,
                            MPI_INFO_NULL,
                            &file),
              "MPI_File_open(cache frame)");
+    const std::uint64_t expectedBytes = sizeof(BinaryVelocityHeader) +
+        sizeof(float) * 3 * totalPoints;
+    // A previous interrupted or larger run can leave this partial file in
+    // place. MPI_MODE_CREATE does not truncate it, so publish only an exact
+    // current-size cache frame.
+    CheckMpi(MPI_File_set_size(file, static_cast<MPI_Offset>(expectedBytes)),
+             "MPI_File_set_size(cache frame)");
 
     int rank = 0;
     MPI_Comm_rank(communicator, &rank);
@@ -629,7 +642,7 @@ int main(int argc, char** argv) {
                  "MPI_Allreduce(valid points)");
         CheckMpi(MPI_Allreduce(&localMaxDistance, &maxDistance, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD),
                  "MPI_Allreduce(max distance)");
-        WriteMask(options, points, pointStart, MPI_COMM_WORLD);
+        WriteMask(options, points, totalPoints, pointStart, MPI_COMM_WORLD);
 
         if (rank == 0) {
             WriteMetadata(options, coordinateHeader, totalPoints, validCount, ranks);

@@ -70,6 +70,10 @@ vtkSmartPointer<vtkUnstructuredGrid> CreateSpectralElement() {
     elementCount->SetName(io::kNek5000ElementCountField);
     elementCount->InsertNextValue(1);
     grid->GetFieldData()->AddArray(elementCount);
+    vtkNew<vtkIntArray> elementIds;
+    elementIds->SetName(io::kNek5000ElementIdsField);
+    elementIds->InsertNextValue(1);
+    grid->GetFieldData()->AddArray(elementIds);
     return grid;
 }
 

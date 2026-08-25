@@ -900,6 +900,55 @@ void ValidateAmbiguousOverlappingFacesStayVisible() {
             "ordinary interior interface.");
 }
 
+void ValidateMalformedNekMetadataIsRejected() {
+    vtkNew<vtkPoints> points;
+    points->SetDataTypeToDouble();
+    points->SetNumberOfPoints(8);
+    for (vtkIdType pointId = 0; pointId < 8; ++pointId) {
+        points->SetPoint(pointId,
+                         static_cast<double>(pointId & 1),
+                         static_cast<double>((pointId >> 1) & 1),
+                         static_cast<double>((pointId >> 2) & 1));
+    }
+    vtkSmartPointer<vtkUnstructuredGrid> data = vtkSmartPointer<vtkUnstructuredGrid>::New();
+    data->SetPoints(points);
+    vtkNew<vtkIntArray> dimensions;
+    dimensions->SetName(io::kNek5000GllDimensionsField);
+    dimensions->SetNumberOfComponents(3);
+    dimensions->InsertNextTuple3(2, 2, 2);
+    data->GetFieldData()->AddArray(dimensions);
+    vtkNew<vtkIntArray> count;
+    count->SetName(io::kNek5000ElementCountField);
+    count->InsertNextValue(1);
+    data->GetFieldData()->AddArray(count);
+
+    Require(!io::HasNek5000SpectralMetadata(data),
+            "Nek metadata without element ids was accepted.");
+    bool rejected = false;
+    try {
+        static_cast<void>(io::GetNek5000SpectralMetadata(data));
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    Require(rejected, "Nek metadata without element ids did not fail cleanly.");
+
+    vtkNew<vtkIntArray> validIds;
+    validIds->SetName(io::kNek5000ElementIdsField);
+    validIds->InsertNextValue(42);
+    data->GetFieldData()->AddArray(validIds);
+    Require(io::HasNek5000SpectralMetadata(data) &&
+                io::GetNek5000SpectralMetadata(data).elementIds == std::vector<int>{42},
+            "Complete valid Nek metadata was rejected.");
+
+    data->GetFieldData()->RemoveArray(io::kNek5000ElementIdsField);
+    vtkNew<vtkDoubleArray> invalidIds;
+    invalidIds->SetName(io::kNek5000ElementIdsField);
+    invalidIds->InsertNextValue(std::numeric_limits<double>::quiet_NaN());
+    data->GetFieldData()->AddArray(invalidIds);
+    Require(!io::HasNek5000SpectralMetadata(data),
+            "Non-finite Nek element ids were accepted.");
+}
+
 fs::path CreateNek2DFixture(const fs::path& root) {
     const fs::path directory = root / "nek5000-2d";
     fs::create_directories(directory);
@@ -1025,6 +1074,10 @@ void ValidateCurvedNekMetrics() {
     count->SetName(io::kNek5000ElementCountField);
     count->InsertNextValue(1);
     data->GetFieldData()->AddArray(count);
+    vtkNew<vtkIntArray> elementIds;
+    elementIds->SetName(io::kNek5000ElementIdsField);
+    elementIds->InsertNextValue(1);
+    data->GetFieldData()->AddArray(elementIds);
 
     vtkSmartPointer<vtkDoubleArray> gradient =
         io::ComputeNek5000SpectralGradient(data, scalar, "curved_gradient");
@@ -1098,6 +1151,10 @@ void ValidateConservativeCurvedNekBounds() {
     count->SetName(io::kNek5000ElementCountField);
     count->InsertNextValue(1);
     data->GetFieldData()->AddArray(count);
+    vtkNew<vtkIntArray> elementIds;
+    elementIds->SetName(io::kNek5000ElementIdsField);
+    elementIds->InsertNextValue(1);
+    data->GetFieldData()->AddArray(elementIds);
 
     const double r = 0.999;
     const double s = 0.0;
@@ -1354,6 +1411,7 @@ int main() {
         ValidateMultiFileNek(CreateMultiFileNekFixture(root));
         ValidateThreeConversionNek(CreateThreeConversionNekFixture(root));
         ValidateAmbiguousOverlappingFacesStayVisible();
+        ValidateMalformedNekMetadataIsRejected();
         ValidateNek2D(CreateNek2DFixture(root));
         ValidateCurvedNekMetrics();
         ValidateConservativeCurvedNekBounds();

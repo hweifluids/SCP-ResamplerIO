@@ -7,6 +7,7 @@
 #include <vtkDataArray.h>
 #include <vtkCellData.h>
 #include <vtkDoubleArray.h>
+#include <vtkGenericCell.h>
 #include <vtkHexahedron.h>
 #include <vtkIntArray.h>
 #include <vtkNew.h>
@@ -14,6 +15,7 @@
 #include <vtkPoints.h>
 #include <vtkQuad.h>
 #include <vtkSmartPointer.h>
+#include <vtkStaticCellLocator.h>
 #include <vtkTetra.h>
 #include <vtkTriangle.h>
 #include <vtkUnstructuredGrid.h>
@@ -521,7 +523,8 @@ void WriteManifest(const fs::path& path,
 void WriteStaticWorldManifest(const fs::path& path,
                               const std::string& meshKind,
                               const std::string& backgroundSource = "background0.vtu",
-                              const std::string& foregroundSource = "foreground-static.vtu") {
+                              const std::string& foregroundSource = "foreground-static.vtu",
+                              int backgroundZone = -1) {
     std::ofstream output(path);
     Require(static_cast<bool>(output), "Cannot write synthetic .scpm: " + path.string());
     output << "streamcenterplus_meshset=1\n"
@@ -532,6 +535,30 @@ void WriteStaticWorldManifest(const fs::path& path,
            << "zone0_velocity_frame=world\n"
            << "zone1_source=" << foregroundSource << "\n"
            << "zone1_motion=static\n"
+           << "zone1_velocity_frame=world\n"
+           << "overlap_policy=cut_background\n";
+    if (backgroundZone >= 0) {
+        output << "background_zone=" << backgroundZone << "\n";
+    }
+}
+
+void WriteHugeAxisManifest(const fs::path& path,
+                           const std::string& backgroundSource,
+                           const std::string& foregroundSource) {
+    std::ofstream output(path);
+    Require(static_cast<bool>(output), "Cannot write synthetic .scpm: " + path.string());
+    output << std::setprecision(17)
+           << "streamcenterplus_meshset=1\n"
+           << "zone_count=2\n"
+           << "mesh_kind=sliding\n"
+           << "zone0_source=" << backgroundSource << "\n"
+           << "zone0_motion=static\n"
+           << "zone0_velocity_frame=world\n"
+           << "zone1_source=" << foregroundSource << "\n"
+           << "zone1_motion=rigid\n"
+           << "zone1_rotation_axis=1e308,1e308,1e308\n"
+           << "zone1_angular_velocity=0\n"
+           << "zone1_phase=" << kPi << "\n"
            << "zone1_velocity_frame=world\n"
            << "overlap_policy=cut_background\n";
 }
@@ -817,6 +844,38 @@ vtkSmartPointer<vtkUnstructuredGrid> AppendDisjointBackground(
     return output;
 }
 
+vtkSmartPointer<vtkUnstructuredGrid> CreateCrossingGapTetra() {
+    vtkNew<vtkPoints> points;
+    points->SetDataTypeToDouble();
+    points->InsertNextPoint(0.75, 0.25, 0.25);
+    points->InsertNextPoint(0.75, 0.75, 0.25);
+    points->InsertNextPoint(0.75, 0.25, 0.75);
+    points->InsertNextPoint(1.20, 0.30, 0.30);
+
+    vtkSmartPointer<vtkUnstructuredGrid> grid =
+        vtkSmartPointer<vtkUnstructuredGrid>::New();
+    grid->SetPoints(points);
+    vtkNew<vtkTetra> tetra;
+    for (vtkIdType pointId = 0; pointId < 4; ++pointId) {
+        tetra->GetPointIds()->SetId(pointId, pointId);
+    }
+    grid->InsertNextCell(tetra->GetCellType(), tetra->GetPointIds());
+
+    vtkNew<vtkDoubleArray> pressure;
+    pressure->SetName("Pressure");
+    pressure->SetNumberOfComponents(1);
+    pressure->SetNumberOfTuples(4);
+    pressure->FillValue(20.0);
+    grid->GetPointData()->AddArray(pressure);
+    vtkNew<vtkDoubleArray> velocity;
+    velocity->SetName("Velocity");
+    velocity->SetNumberOfComponents(3);
+    velocity->SetNumberOfTuples(4);
+    velocity->FillValue(3.0);
+    grid->GetPointData()->AddArray(velocity);
+    return grid;
+}
+
 void RequireManifestReadRejected(const fs::path& manifest,
                                  const std::string& expectedError,
                                  const std::string& message) {
@@ -1020,6 +1079,99 @@ void ValidateFailClosedMeshSetGuards(const fs::path& directory) {
         physicalContainmentManifest,
         "physical background volume",
         "A foreground in a background AABB hole was accepted as physically contained.");
+
+    vtkSmartPointer<vtkUnstructuredGrid> edgeCrossingRight =
+        CreateBoxGrid(1.1, 2.1, 8, false, 5.0, 10.0);
+    for (vtkIdType pointId = 0;
+         pointId < edgeCrossingRight->GetNumberOfPoints(); ++pointId) {
+        double point[3] = {};
+        edgeCrossingRight->GetPoint(pointId, point);
+        edgeCrossingRight->GetPoints()->SetPoint(pointId, point[0], point[1] - 1.1,
+                                                  point[2] - 1.1);
+    }
+    edgeCrossingRight->GetPoints()->Modified();
+    edgeCrossingRight->Modified();
+    vtkSmartPointer<vtkUnstructuredGrid> edgeCrossingBackground =
+        AppendDisjointBackground(
+            CreateBoxGrid(0.0, 1.0, 8, false, 5.0, 10.0), edgeCrossingRight);
+    vtkSmartPointer<vtkUnstructuredGrid> edgeCrossingForeground =
+        CreateCrossingGapTetra();
+    WriteGrid(directory / "edge-crossing-background.vtu", edgeCrossingBackground);
+    WriteGrid(directory / "edge-crossing-foreground.vtu", edgeCrossingForeground);
+    vtkSmartPointer<vtkDataSet> persistedEdgeCrossingBackground = io::ReadDataSet(
+        directory / "edge-crossing-background.vtu");
+    vtkNew<vtkStaticCellLocator> edgeCrossingLocator;
+    edgeCrossingLocator->SetDataSet(persistedEdgeCrossingBackground);
+    edgeCrossingLocator->BuildLocator();
+    vtkNew<vtkGenericCell> edgeCrossingCell;
+    std::vector<double> edgeCrossingWeights(static_cast<std::size_t>(
+        std::max<vtkIdType>(1, persistedEdgeCrossingBackground->GetMaxCellSize())));
+    double edgeCrossingGapPoint[3] = {1.05, 0.35, 0.35};
+    double edgeCrossingPcoords[3] = {};
+    int edgeCrossingSubId = 0;
+    Require(edgeCrossingLocator->FindCell(edgeCrossingGapPoint, 0.0, edgeCrossingCell,
+                                          edgeCrossingSubId, edgeCrossingPcoords,
+                                          edgeCrossingWeights.data()) < 0,
+            "Synthetic edge-crossing fixture did not retain the intended background gap.");
+    double edgeCrossingCentre[3] = {};
+    for (vtkIdType pointId = 0;
+         pointId < edgeCrossingForeground->GetNumberOfPoints(); ++pointId) {
+        double point[3] = {};
+        edgeCrossingForeground->GetPoint(pointId, point);
+        edgeCrossingCentre[0] += point[0];
+        edgeCrossingCentre[1] += point[1];
+        edgeCrossingCentre[2] += point[2];
+        edgeCrossingSubId = 0;
+        edgeCrossingPcoords[0] = edgeCrossingPcoords[1] = edgeCrossingPcoords[2] = 0.0;
+        Require(edgeCrossingLocator->FindCell(point, 0.0, edgeCrossingCell,
+                                              edgeCrossingSubId, edgeCrossingPcoords,
+                                              edgeCrossingWeights.data()) >= 0,
+                "Synthetic edge-crossing foreground vertex was not covered by its background.");
+    }
+    const double pointCount = static_cast<double>(edgeCrossingForeground->GetNumberOfPoints());
+    edgeCrossingCentre[0] /= pointCount;
+    edgeCrossingCentre[1] /= pointCount;
+    edgeCrossingCentre[2] /= pointCount;
+    edgeCrossingSubId = 0;
+    edgeCrossingPcoords[0] = edgeCrossingPcoords[1] = edgeCrossingPcoords[2] = 0.0;
+    Require(edgeCrossingLocator->FindCell(edgeCrossingCentre, 0.0, edgeCrossingCell,
+                                          edgeCrossingSubId, edgeCrossingPcoords,
+                                          edgeCrossingWeights.data()) >= 0,
+            "Synthetic edge-crossing foreground centre was not covered by its background.");
+    const fs::path edgeCrossingManifest = directory / "edge-crossing-gap.scpm";
+    WriteStaticWorldManifest(edgeCrossingManifest, "nested", "edge-crossing-background.vtu",
+                             "edge-crossing-foreground.vtu", 0);
+    const std::vector<io::DataSetFrame> edgeCrossingFrames =
+        io::EnumerateDataSetFrames(edgeCrossingManifest);
+    Require(edgeCrossingFrames.size() == 1 &&
+                edgeCrossingFrames.front().multiZoneBackgroundIndex == 0,
+            "Synthetic edge-crossing manifest did not retain zone 0 as its background.");
+    RequireManifestReadRejected(
+        edgeCrossingManifest,
+        "cell edge crosses outside the physical background volume",
+        "A foreground cell crossing a background gap was accepted when its vertices and centre were covered.");
+
+    vtkSmartPointer<vtkUnstructuredGrid> hugeAxisBackground =
+        CreateBoxGrid(-2.0, 2.0, 8, false, 5.0, 10.0);
+    vtkSmartPointer<vtkUnstructuredGrid> hugeAxisForeground =
+        CreateBoxGrid(0.75, 1.25, 1, false, 20.0, 3.0);
+    WriteGrid(directory / "huge-axis-background.vtu", hugeAxisBackground);
+    WriteGrid(directory / "huge-axis-foreground.vtu", hugeAxisForeground);
+    const fs::path hugeAxisManifest = directory / "huge-axis.scpm";
+    WriteHugeAxisManifest(hugeAxisManifest, "huge-axis-background.vtu",
+                          "huge-axis-foreground.vtu");
+    const std::vector<io::DataSetFrame> hugeAxisFrames =
+        io::EnumerateDataSetFrames(hugeAxisManifest);
+    Require(hugeAxisFrames.size() == 1,
+            "Huge finite rotation-axis manifest did not enumerate one frame.");
+    vtkSmartPointer<vtkDataSet> hugeAxisComposed =
+        io::ReadDataSet(hugeAxisFrames.front());
+    vtkDataArray* hugeAxisOwnership = hugeAxisComposed->GetPointData()->GetArray(
+        io::kMultiZoneOwnershipArray);
+    const vtkIdType hugeAxisCentre = FindPoint(hugeAxisComposed, 1.0, 1.0, 1.0);
+    Require(hugeAxisOwnership != nullptr &&
+                NearlyEqual(hugeAxisOwnership->GetComponent(hugeAxisCentre, 0), 1.0),
+            "A huge finite rotation axis did not preserve its direction during world transform.");
 
     // A PVD indirection must not turn an already-composed two-zone manifest
     // into a source zone of another manifest.  That would silently exceed the

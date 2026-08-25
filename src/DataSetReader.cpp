@@ -67,7 +67,6 @@
 #include <limits>
 #include <map>
 #include <numeric>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -202,8 +201,23 @@ Vec3 Scale(const Vec3& value, double factor) {
     return {value.x * factor, value.y * factor, value.z * factor};
 }
 
-double Norm(const Vec3& value) {
-    return std::sqrt(Dot(value, value));
+bool NormalizeDirection(Vec3* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    const double scale = std::max(
+        {std::abs(value->x), std::abs(value->y), std::abs(value->z)});
+    if (!std::isfinite(scale) || scale == 0.0) {
+        return false;
+    }
+    const Vec3 scaled = Scale(*value, 1.0 / scale);
+    const double length = std::sqrt(Dot(scaled, scaled));
+    if (!std::isfinite(length) || length == 0.0) {
+        return false;
+    }
+    *value = Scale(scaled, 1.0 / length);
+    return std::isfinite(value->x) && std::isfinite(value->y) &&
+           std::isfinite(value->z);
 }
 
 Vec3 ParseVec3(const std::string& value, const std::string& key) {
@@ -486,12 +500,10 @@ MultiZoneManifest ParseMultiZoneManifest(const std::filesystem::path& sourcePath
         if (const std::string* value = FindManifestValue(values, prefix + "phase")) {
             zone.phase = ParseFiniteDouble(*value, prefix + "phase");
         }
-        const double axisNorm = Norm(zone.rotationAxis);
-        if (axisNorm == 0.0) {
+        if (!NormalizeDirection(&zone.rotationAxis)) {
             throw std::runtime_error("Manifest key '" + prefix +
-                                     "rotation_axis' must be non-zero.");
+                                     "rotation_axis' must be a finite non-zero direction.");
         }
-        zone.rotationAxis = Scale(zone.rotationAxis, 1.0 / axisNorm);
         if (zone.motion == MultiZoneMotion::Static &&
             (zone.angularVelocity != 0.0 || !IsZero(zone.linearVelocity))) {
             throw std::runtime_error("Static zone '" + std::to_string(index) +
@@ -1437,6 +1449,12 @@ bool FindContainingCell(vtkStaticCellLocator* locator,
                         std::vector<double>* weights,
                         const double point[3]);
 
+bool SegmentIsCoveredByDataSet(vtkStaticCellLocator* locator,
+                               vtkGenericCell* cell,
+                               std::vector<double>* weights,
+                               const double first[3],
+                               const double second[3]);
+
 void RequireForegroundWithinBackground(vtkDataSet* background,
                                        vtkDataSet* foreground,
                                        const std::filesystem::path& manifestPath) {
@@ -1476,17 +1494,32 @@ void RequireForegroundWithinBackground(vtkDataSet* background,
                                      "covering background or pre-resample the input.");
         }
     };
+    const auto requireCoveredSegment = [&](const double first[3], const double second[3],
+                                           const char* description) {
+        if (!SegmentIsCoveredByDataSet(backgroundLocator, locatorCell, &weights,
+                                       first, second)) {
+            throw std::runtime_error("The foreground " + std::string(description) +
+                                     " crosses outside the physical background volume in '" +
+                                     manifestPath.string() +
+                                     "'. Use a covering background or pre-resample the input.");
+        }
+    };
 
     double point[3] = {};
     for (vtkIdType pointId = 0; pointId < foreground->GetNumberOfPoints(); ++pointId) {
         foreground->GetPoint(pointId, point);
         requireCoveredPoint(point, "point");
     }
-    vtkNew<vtkIdList> pointIds;
     for (vtkIdType cellId = 0; cellId < foreground->GetNumberOfCells(); ++cellId) {
-        foreground->GetCellPoints(cellId, pointIds);
-        if (pointIds->GetNumberOfIds() <= 0) {
-            continue;
+        vtkCell* foregroundCell = foreground->GetCell(cellId);
+        if (foregroundCell == nullptr) {
+            throw std::runtime_error("The foreground contains an unreadable cell in '" +
+                                     manifestPath.string() + "'.");
+        }
+        vtkIdList* pointIds = foregroundCell->GetPointIds();
+        if (pointIds == nullptr || pointIds->GetNumberOfIds() <= 0) {
+            throw std::runtime_error("The foreground contains an empty cell in '" +
+                                     manifestPath.string() + "'.");
         }
         Vec3 centre;
         for (vtkIdType pointIndex = 0; pointIndex < pointIds->GetNumberOfIds(); ++pointIndex) {
@@ -1496,6 +1529,19 @@ void RequireForegroundWithinBackground(vtkDataSet* background,
         centre = Scale(centre, 1.0 / static_cast<double>(pointIds->GetNumberOfIds()));
         const double centrePoint[3] = {centre.x, centre.y, centre.z};
         requireCoveredPoint(centrePoint, "cell centre");
+        for (int edgeIndex = 0; edgeIndex < foregroundCell->GetNumberOfEdges(); ++edgeIndex) {
+            vtkCell* edge = foregroundCell->GetEdge(edgeIndex);
+            if (edge == nullptr || edge->GetNumberOfPoints() < 2) {
+                continue;
+            }
+            for (vtkIdType edgePoint = 1; edgePoint < edge->GetNumberOfPoints(); ++edgePoint) {
+                double first[3] = {};
+                double second[3] = {};
+                foreground->GetPoint(edge->GetPointId(edgePoint - 1), first);
+                foreground->GetPoint(edge->GetPointId(edgePoint), second);
+                requireCoveredSegment(first, second, "cell edge");
+            }
+        }
     }
 }
 
@@ -1512,6 +1558,126 @@ bool FindContainingCell(vtkStaticCellLocator* locator,
     const vtkIdType cellId = locator->FindCell(
         query, 0.0, cell, subId, parametricCoordinates, weights->data());
     return cellId >= 0;
+}
+
+bool SegmentIsCoveredByDataSet(vtkStaticCellLocator* locator,
+                               vtkGenericCell* cell,
+                               std::vector<double>* weights,
+                               const double first[3],
+                               const double second[3]) {
+    if (locator == nullptr || cell == nullptr || weights == nullptr || first == nullptr ||
+        second == nullptr) {
+        return false;
+    }
+    const std::array<double, 3> delta = {
+        second[0] - first[0], second[1] - first[1], second[2] - first[2]};
+    const double lengthSquared = Dot({delta[0], delta[1], delta[2]},
+                                     {delta[0], delta[1], delta[2]});
+    if (!std::isfinite(lengthSquared) || lengthSquared < 0.0) {
+        return false;
+    }
+    if (lengthSquared == 0.0) {
+        return FindContainingCell(locator, cell, weights, first);
+    }
+
+    std::vector<double> parameters = {0.0, 1.0};
+    vtkDataSet* dataSet = locator->GetDataSet();
+    if (dataSet == nullptr) {
+        return false;
+    }
+    const double coordinateScale = std::max(
+        {1.0, std::abs(first[0]), std::abs(first[1]), std::abs(first[2]),
+         std::abs(second[0]), std::abs(second[1]), std::abs(second[2])});
+    const double boundsTolerance =
+        128.0 * std::numeric_limits<double>::epsilon() * coordinateScale;
+    vtkNew<vtkIdList> candidateCellIds;
+    locator->FindCellsAlongLine(first, second, boundsTolerance, candidateCellIds);
+    for (vtkIdType candidateIndex = 0;
+         candidateIndex < candidateCellIds->GetNumberOfIds(); ++candidateIndex) {
+        vtkCell* candidate = dataSet->GetCell(candidateCellIds->GetId(candidateIndex));
+        if (candidate == nullptr) {
+            return false;
+        }
+
+        // Cell-bound intervals partition the line even when the locator's
+        // aggregate line-intersection overload elides an interior boundary.
+        // The exact cell intersections below further refine that partition for
+        // non-axis-aligned cells.
+        double bounds[6] = {};
+        candidate->GetBounds(bounds);
+        double entry = 0.0;
+        double exit = 1.0;
+        bool intersectsBounds = true;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double lower = bounds[2 * axis] - boundsTolerance;
+            const double upper = bounds[2 * axis + 1] + boundsTolerance;
+            const double component = delta[static_cast<std::size_t>(axis)];
+            if (component == 0.0) {
+                if (first[axis] < lower || first[axis] > upper) {
+                    intersectsBounds = false;
+                    break;
+                }
+                continue;
+            }
+            double lowerParameter = (lower - first[axis]) / component;
+            double upperParameter = (upper - first[axis]) / component;
+            if (lowerParameter > upperParameter) {
+                std::swap(lowerParameter, upperParameter);
+            }
+            entry = std::max(entry, lowerParameter);
+            exit = std::min(exit, upperParameter);
+            if (entry > exit) {
+                intersectsBounds = false;
+                break;
+            }
+        }
+        if (intersectsBounds) {
+            parameters.push_back(std::clamp(entry, 0.0, 1.0));
+            parameters.push_back(std::clamp(exit, 0.0, 1.0));
+        }
+
+        const auto appendIntersection = [&](const double start[3], const double end[3],
+                                            bool reverse) {
+            double t = 0.0;
+            double intersection[3] = {};
+            double parametricCoordinates[3] = {};
+            int subId = 0;
+            if (candidate->IntersectWithLine(start, end, 0.0, t, intersection,
+                                             parametricCoordinates, subId) != 0 &&
+                std::isfinite(t)) {
+                parameters.push_back(std::clamp(reverse ? 1.0 - t : t, 0.0, 1.0));
+            }
+        };
+        appendIntersection(first, second, false);
+        appendIntersection(second, first, true);
+    }
+    if (candidateCellIds->GetNumberOfIds() == 0) {
+        return false;
+    }
+    std::sort(parameters.begin(), parameters.end());
+    const double tolerance = 1.0e-12;
+    parameters.erase(std::unique(parameters.begin(), parameters.end(),
+                                 [tolerance](double lhs, double rhs) {
+                                     return std::abs(lhs - rhs) <= tolerance;
+                                 }),
+                     parameters.end());
+    for (std::size_t index = 1; index < parameters.size(); ++index) {
+        const double begin = parameters[index - 1];
+        const double end = parameters[index];
+        if (end - begin <= tolerance) {
+            continue;
+        }
+        const double midpointParameter = 0.5 * (begin + end);
+        const double midpoint[3] = {
+            first[0] + midpointParameter * delta[0],
+            first[1] + midpointParameter * delta[1],
+            first[2] + midpointParameter * delta[2],
+        };
+        if (!FindContainingCell(locator, cell, weights, midpoint)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void RequireForegroundRepresentableOnBackground(
@@ -3777,6 +3943,189 @@ std::string XmlUnescapeAttribute(std::string value) {
     return value;
 }
 
+struct PvdDataSetReference {
+    std::string file;
+    std::optional<std::string> timestep;
+};
+
+bool IsXmlNameCharacter(char value) {
+    const unsigned char character = static_cast<unsigned char>(value);
+    return std::isalnum(character) || value == '_' || value == '-' ||
+           value == ':' || value == '.';
+}
+
+void SkipXmlWhitespace(const std::string& xml, std::size_t* position) {
+    if (position == nullptr) {
+        return;
+    }
+    while (*position < xml.size() &&
+           std::isspace(static_cast<unsigned char>(xml[*position]))) {
+        ++(*position);
+    }
+}
+
+std::size_t FindXmlTagEnd(const std::string& xml,
+                          std::size_t position,
+                          const std::filesystem::path& path) {
+    char quote = '\0';
+    for (; position < xml.size(); ++position) {
+        const char current = xml[position];
+        if (quote != '\0') {
+            if (current == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (current == '\'' || current == '"') {
+            quote = current;
+        } else if (current == '>') {
+            return position;
+        }
+    }
+    throw std::runtime_error("Unterminated XML tag in PVD file: " + path.string());
+}
+
+std::size_t FindXmlDeclarationEnd(const std::string& xml,
+                                  std::size_t position,
+                                  const std::filesystem::path& path) {
+    char quote = '\0';
+    int bracketDepth = 0;
+    for (; position < xml.size(); ++position) {
+        const char current = xml[position];
+        if (quote != '\0') {
+            if (current == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (current == '\'' || current == '"') {
+            quote = current;
+        } else if (current == '[') {
+            ++bracketDepth;
+        } else if (current == ']' && bracketDepth > 0) {
+            --bracketDepth;
+        } else if (current == '>' && bracketDepth == 0) {
+            return position;
+        }
+    }
+    throw std::runtime_error("Unterminated XML declaration in PVD file: " + path.string());
+}
+
+std::vector<PvdDataSetReference> ParsePvdDataSetReferences(
+    const std::string& xml,
+    const std::filesystem::path& path) {
+    std::vector<PvdDataSetReference> references;
+    std::size_t position = 0;
+    while (position < xml.size()) {
+        const std::size_t tagStart = xml.find('<', position);
+        if (tagStart == std::string::npos) {
+            break;
+        }
+        if (xml.compare(tagStart, 4, "<!--") == 0) {
+            const std::size_t commentEnd = xml.find("-->", tagStart + 4);
+            if (commentEnd == std::string::npos) {
+                throw std::runtime_error("Unterminated XML comment in PVD file: " +
+                                         path.string());
+            }
+            position = commentEnd + 3;
+            continue;
+        }
+        if (xml.compare(tagStart, 9, "<![CDATA[") == 0) {
+            const std::size_t cdataEnd = xml.find("]]>", tagStart + 9);
+            if (cdataEnd == std::string::npos) {
+                throw std::runtime_error("Unterminated CDATA section in PVD file: " +
+                                         path.string());
+            }
+            position = cdataEnd + 3;
+            continue;
+        }
+        if (xml.compare(tagStart, 2, "<?") == 0) {
+            const std::size_t instructionEnd = xml.find("?>", tagStart + 2);
+            if (instructionEnd == std::string::npos) {
+                throw std::runtime_error("Unterminated XML instruction in PVD file: " +
+                                         path.string());
+            }
+            position = instructionEnd + 2;
+            continue;
+        }
+        if (xml.compare(tagStart, 2, "<!") == 0) {
+            position = FindXmlDeclarationEnd(xml, tagStart + 2, path) + 1;
+            continue;
+        }
+        if (xml.compare(tagStart, 2, "</") == 0) {
+            position = FindXmlTagEnd(xml, tagStart + 2, path) + 1;
+            continue;
+        }
+
+        position = tagStart + 1;
+        SkipXmlWhitespace(xml, &position);
+        const std::size_t nameStart = position;
+        while (position < xml.size() && IsXmlNameCharacter(xml[position])) {
+            ++position;
+        }
+        if (position == nameStart) {
+            throw std::runtime_error("Malformed XML element in PVD file: " + path.string());
+        }
+        const std::string elementName = ToLower(xml.substr(nameStart, position - nameStart));
+        const std::size_t tagEnd = FindXmlTagEnd(xml, position, path);
+        if (elementName != "dataset") {
+            position = tagEnd + 1;
+            continue;
+        }
+
+        PvdDataSetReference reference;
+        while (position < tagEnd) {
+            SkipXmlWhitespace(xml, &position);
+            if (position >= tagEnd || xml[position] == '/') {
+                break;
+            }
+            const std::size_t attributeStart = position;
+            while (position < tagEnd && IsXmlNameCharacter(xml[position])) {
+                ++position;
+            }
+            if (position == attributeStart) {
+                throw std::runtime_error("Malformed DataSet attribute in PVD file: " +
+                                         path.string());
+            }
+            const std::string attributeName = ToLower(
+                xml.substr(attributeStart, position - attributeStart));
+            SkipXmlWhitespace(xml, &position);
+            if (position >= tagEnd || xml[position] != '=') {
+                throw std::runtime_error("DataSet attribute has no value in PVD file: " +
+                                         path.string());
+            }
+            ++position;
+            SkipXmlWhitespace(xml, &position);
+            if (position >= tagEnd || (xml[position] != '\'' && xml[position] != '"')) {
+                throw std::runtime_error("DataSet attribute is not quoted in PVD file: " +
+                                         path.string());
+            }
+            const char quote = xml[position++];
+            const std::size_t valueStart = position;
+            while (position < tagEnd && xml[position] != quote) {
+                ++position;
+            }
+            if (position >= tagEnd) {
+                throw std::runtime_error("Unterminated DataSet attribute in PVD file: " +
+                                         path.string());
+            }
+            const std::string value = xml.substr(valueStart, position - valueStart);
+            ++position;
+            if (attributeName == "file") {
+                reference.file = value;
+            } else if (attributeName == "timestep") {
+                reference.timestep = value;
+            }
+        }
+        if (reference.file.empty()) {
+            throw std::runtime_error("PVD DataSet entry has no file attribute: " + path.string());
+        }
+        references.push_back(std::move(reference));
+        position = tagEnd + 1;
+    }
+    return references;
+}
+
 double ParsePvdTimestep(const std::string& rawValue, const std::filesystem::path& path) {
     const std::string value = TrimAscii(rawValue);
     try {
@@ -3791,34 +4140,53 @@ double ParsePvdTimestep(const std::string& rawValue, const std::filesystem::path
     }
 }
 
+std::filesystem::path CanonicalPvdPath(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(path, error);
+    if (!error) {
+        return canonical.lexically_normal();
+    }
+    error.clear();
+    canonical = std::filesystem::absolute(path, error);
+    return error ? path.lexically_normal() : canonical.lexically_normal();
+}
+
 std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
                                    double fallbackPhysicalDt) {
+    static thread_local std::vector<std::filesystem::path> activePvdPaths;
+    const std::filesystem::path canonicalPath = CanonicalPvdPath(path);
+    if (std::find(activePvdPaths.cbegin(), activePvdPaths.cend(), canonicalPath) !=
+        activePvdPaths.cend()) {
+        throw std::runtime_error("Recursive PVD collection reference is not supported: " +
+                                 canonicalPath.string());
+    }
+    activePvdPaths.push_back(canonicalPath);
+    struct ActivePvdScope {
+        std::vector<std::filesystem::path>* paths = nullptr;
+        ~ActivePvdScope() {
+            if (paths != nullptr) {
+                paths->pop_back();
+            }
+        }
+    } activePvdScope{&activePvdPaths};
+
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("Cannot open PVD file: " + path.string());
     }
     std::ostringstream text;
     text << input.rdbuf();
-    const std::regex tagPattern(R"(<\s*DataSet\b[^>]*>)", std::regex::icase);
-    const std::regex filePattern(R"(file\s*=\s*(['"])(.*?)\1)", std::regex::icase);
-    const std::regex timePattern(R"(timestep\s*=\s*(['"])(.*?)\1)", std::regex::icase);
-    const std::string xml = text.str();
+    const std::vector<PvdDataSetReference> references =
+        ParsePvdDataSetReferences(text.str(), path);
     std::vector<DataSetFrame> frames;
-    for (std::sregex_iterator it(xml.begin(), xml.end(), tagPattern), end;
-         it != end; ++it) {
-        const std::string tag = it->str();
-        std::smatch fileMatch;
-        if (!std::regex_search(tag, fileMatch, filePattern)) {
-            continue;
-        }
-        std::filesystem::path framePath(XmlUnescapeAttribute(fileMatch[2].str()));
+    for (const PvdDataSetReference& reference : references) {
+        std::filesystem::path framePath(XmlUnescapeAttribute(reference.file));
         if (framePath.is_relative()) {
             framePath = path.parent_path() / framePath;
         }
         double time = static_cast<double>(frames.size()) * fallbackPhysicalDt;
-        std::smatch timeMatch;
-        if (std::regex_search(tag, timeMatch, timePattern)) {
-            time = ParsePvdTimestep(XmlUnescapeAttribute(timeMatch[2].str()), path);
+        if (reference.timestep.has_value()) {
+            time = ParsePvdTimestep(XmlUnescapeAttribute(*reference.timestep), path);
         }
         std::vector<DataSetFrame> expanded =
             EnumerateDataSetFrames(framePath, fallbackPhysicalDt);
@@ -3836,11 +4204,26 @@ std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
 }
 
 long long LastNumericTag(const std::string& name) {
-    const std::regex numbers(R"((\d+))");
     long long tag = -1;
-    for (std::sregex_iterator it(name.begin(), name.end(), numbers), end;
-         it != end; ++it) {
-        tag = std::stoll((*it)[1].str());
+    std::size_t position = 0;
+    while (position < name.size()) {
+        if (!std::isdigit(static_cast<unsigned char>(name[position]))) {
+            ++position;
+            continue;
+        }
+        long long value = 0;
+        bool overflow = false;
+        while (position < name.size() &&
+               std::isdigit(static_cast<unsigned char>(name[position]))) {
+            const int digit = name[position] - '0';
+            if (value > (std::numeric_limits<long long>::max() - digit) / 10) {
+                overflow = true;
+            } else if (!overflow) {
+                value = value * 10 + digit;
+            }
+            ++position;
+        }
+        tag = overflow ? -1 : value;
     }
     return tag;
 }
@@ -3855,11 +4238,28 @@ std::vector<DataSetFrame> EnumerateFolder(const std::filesystem::path& folder,
     };
     std::vector<TaggedFrame> tagged;
     std::unordered_set<std::string> nek5000Stems;
+    std::vector<std::filesystem::path> pvdCollections;
     for (const auto& entry : std::filesystem::directory_iterator(folder)) {
-        if (entry.is_regular_file() &&
-            LowerExtension(entry.path()) == ".nek5000") {
-            nek5000Stems.insert(ToLower(entry.path().stem().string()));
+        if (!entry.is_regular_file()) {
+            continue;
         }
+        const std::string extension = LowerExtension(entry.path());
+        if (extension == ".nek5000") {
+            nek5000Stems.insert(ToLower(entry.path().stem().string()));
+        } else if (extension == ".pvd") {
+            pvdCollections.push_back(entry.path());
+        }
+    }
+    if (!pvdCollections.empty()) {
+        std::sort(pvdCollections.begin(), pvdCollections.end());
+        if (pvdCollections.size() != 1) {
+            throw std::runtime_error(
+                "Directory input contains multiple PVD collections; select one PVD file explicitly: " +
+                folder.string());
+        }
+        // An explicit collection is authoritative. Its referenced frame order
+        // and timestamps must not be mixed with incidental files beside it.
+        return EnumerateDataSetFrames(pvdCollections.front(), fallbackPhysicalDt);
     }
     for (const auto& entry : std::filesystem::directory_iterator(folder)) {
         if (!entry.is_regular_file()) {
@@ -5154,44 +5554,124 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const DataSetFrame& frame,
     throw std::runtime_error("Unsupported dataset frame kind.");
 }
 
-bool HasNek5000SpectralMetadata(vtkDataSet* dataSet) {
-    if (dataSet == nullptr || dataSet->GetFieldData() == nullptr) {
+namespace {
+
+bool TryGetNek5000SpectralMetadata(vtkDataSet* dataSet,
+                                   Nek5000SpectralMetadata* output,
+                                   std::string* errorMessage) {
+    const auto fail = [&](const std::string& message) {
+        if (errorMessage != nullptr) {
+            *errorMessage = message;
+        }
         return false;
+    };
+    if (dataSet == nullptr || dataSet->GetFieldData() == nullptr) {
+        return fail("field data is missing");
     }
-    vtkDataArray* dimensions =
-        dataSet->GetFieldData()->GetArray(kNek5000GllDimensionsField);
-    vtkDataArray* count =
-        dataSet->GetFieldData()->GetArray(kNek5000ElementCountField);
-    return dimensions != nullptr && dimensions->GetNumberOfComponents() == 3 &&
-           dimensions->GetNumberOfTuples() == 1 && count != nullptr &&
-           count->GetNumberOfTuples() == 1;
+    vtkFieldData* fieldData = dataSet->GetFieldData();
+    vtkDataArray* dimensions = fieldData->GetArray(kNek5000GllDimensionsField);
+    vtkDataArray* count = fieldData->GetArray(kNek5000ElementCountField);
+    vtkDataArray* ids = fieldData->GetArray(kNek5000ElementIdsField);
+    if (dimensions == nullptr || dimensions->GetNumberOfComponents() != 3 ||
+        dimensions->GetNumberOfTuples() != 1) {
+        return fail("GLL dimensions must contain exactly one three-component tuple");
+    }
+    if (count == nullptr || count->GetNumberOfComponents() != 1 ||
+        count->GetNumberOfTuples() != 1) {
+        return fail("element count must contain exactly one scalar tuple");
+    }
+    if (ids == nullptr || ids->GetNumberOfComponents() != 1) {
+        return fail("element ids must contain one scalar tuple per element");
+    }
+
+    std::array<int, 3> dimensionsValue{};
+    const std::array<int, 3> minimumDimensions = {2, 2, 1};
+    for (int axis = 0; axis < 3; ++axis) {
+        const double raw = dimensions->GetComponent(0, axis);
+        if (!std::isfinite(raw) || std::trunc(raw) != raw ||
+            raw < static_cast<double>(minimumDimensions[static_cast<std::size_t>(axis)]) ||
+            raw > static_cast<double>(std::numeric_limits<int>::max())) {
+            return fail("GLL dimensions must be finite in-range integers");
+        }
+        dimensionsValue[static_cast<std::size_t>(axis)] = static_cast<int>(raw);
+    }
+
+    const std::size_t nx = static_cast<std::size_t>(dimensionsValue[0]);
+    const std::size_t ny = static_cast<std::size_t>(dimensionsValue[1]);
+    const std::size_t nz = static_cast<std::size_t>(dimensionsValue[2]);
+    if (nx > std::numeric_limits<std::size_t>::max() / ny) {
+        return fail("GLL point count overflows size_t");
+    }
+    const std::size_t pointsPerPlane = nx * ny;
+    if (pointsPerPlane > std::numeric_limits<std::size_t>::max() / nz) {
+        return fail("GLL point count overflows size_t");
+    }
+    const std::size_t pointsPerElement = pointsPerPlane * nz;
+    const vtkIdType vtkPointCount = dataSet->GetNumberOfPoints();
+    if (vtkPointCount <= 0) {
+        return fail("canonical dataset has no points");
+    }
+    const std::size_t pointCount = static_cast<std::size_t>(vtkPointCount);
+    if (pointCount % pointsPerElement != 0) {
+        return fail("point count is not divisible by the GLL tensor size");
+    }
+    const std::size_t elementCount = pointCount / pointsPerElement;
+    if (elementCount == 0) {
+        return fail("element count is zero");
+    }
+    const double rawElementCount = count->GetComponent(0, 0);
+    if (!std::isfinite(rawElementCount) || std::trunc(rawElementCount) != rawElementCount ||
+        rawElementCount != static_cast<double>(elementCount)) {
+        return fail("element count is not the exact finite count implied by the points");
+    }
+    if (ids->GetNumberOfTuples() != static_cast<vtkIdType>(elementCount)) {
+        return fail("element id count does not match the element count");
+    }
+
+    Nek5000SpectralMetadata metadata;
+    metadata.nx = dimensionsValue[0];
+    metadata.ny = dimensionsValue[1];
+    metadata.nz = dimensionsValue[2];
+    metadata.elementCount = elementCount;
+    std::vector<int> elementIds;
+    if (output != nullptr) {
+        elementIds.reserve(elementCount);
+    }
+    std::unordered_set<int> uniqueIds;
+    uniqueIds.reserve(elementCount);
+    for (vtkIdType index = 0; index < ids->GetNumberOfTuples(); ++index) {
+        const double rawId = ids->GetComponent(index, 0);
+        if (!std::isfinite(rawId) || std::trunc(rawId) != rawId || rawId < 1.0 ||
+            rawId > static_cast<double>(std::numeric_limits<int>::max())) {
+            return fail("element ids must be finite positive in-range integers");
+        }
+        const int id = static_cast<int>(rawId);
+        if (!uniqueIds.insert(id).second) {
+            return fail("element ids must be unique");
+        }
+        if (output != nullptr) {
+            elementIds.push_back(id);
+        }
+    }
+    if (output != nullptr) {
+        metadata.elementIds = std::move(elementIds);
+        *output = std::move(metadata);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool HasNek5000SpectralMetadata(vtkDataSet* dataSet) {
+    return TryGetNek5000SpectralMetadata(dataSet, nullptr, nullptr);
 }
 
 Nek5000SpectralMetadata GetNek5000SpectralMetadata(vtkDataSet* dataSet) {
-    if (!HasNek5000SpectralMetadata(dataSet)) {
-        throw std::runtime_error("Dataset has no Streamcenter+ Nek5000 spectral metadata.");
-    }
     Nek5000SpectralMetadata metadata;
-    vtkDataArray* dimensions =
-        dataSet->GetFieldData()->GetArray(kNek5000GllDimensionsField);
-    metadata.nx = static_cast<int>(dimensions->GetComponent(0, 0));
-    metadata.ny = static_cast<int>(dimensions->GetComponent(0, 1));
-    metadata.nz = static_cast<int>(dimensions->GetComponent(0, 2));
-    metadata.elementCount = static_cast<std::size_t>(
-        dataSet->GetFieldData()->GetArray(kNek5000ElementCountField)
-            ->GetComponent(0, 0));
-    if (vtkDataArray* ids =
-            dataSet->GetFieldData()->GetArray(kNek5000ElementIdsField)) {
-        metadata.elementIds.resize(static_cast<std::size_t>(ids->GetNumberOfTuples()));
-        for (vtkIdType i = 0; i < ids->GetNumberOfTuples(); ++i) {
-            metadata.elementIds[static_cast<std::size_t>(i)] =
-                static_cast<int>(ids->GetComponent(i, 0));
-        }
-    }
-    if (metadata.nx < 2 || metadata.ny < 2 || metadata.nz < 1 ||
-        metadata.elementCount == 0 || metadata.pointCount() !=
-                                            static_cast<std::size_t>(dataSet->GetNumberOfPoints())) {
-        throw std::runtime_error("Dataset has inconsistent Nek5000 spectral metadata.");
+    std::string error;
+    if (!TryGetNek5000SpectralMetadata(dataSet, &metadata, &error)) {
+        throw std::runtime_error("Dataset has invalid Streamcenter+ Nek5000 spectral metadata: " +
+                                 error);
     }
     return metadata;
 }

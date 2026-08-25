@@ -2,6 +2,12 @@
 #include <streamcenterplus/io/DataSetReader.h>
 
 #include <vtkDataSet.h>
+#include <vtkDoubleArray.h>
+#include <vtkNew.h>
+#include <vtkPointData.h>
+#include <vtkPoints.h>
+#include <vtkStructuredGrid.h>
+#include <vtkXMLStructuredGridWriter.h>
 
 #include <algorithm>
 #include <array>
@@ -269,6 +275,51 @@ void ValidateSpectralBounds(const fs::path& descriptor) {
                 + scan.entry.xRange.toStdString());
 }
 
+void WriteStructuredSnapshot(const fs::path& path, double interiorXOffset) {
+    vtkNew<vtkStructuredGrid> grid;
+    grid->SetDimensions(3, 3, 3);
+    vtkNew<vtkPoints> points;
+    points->SetDataTypeToDouble();
+    points->SetNumberOfPoints(27);
+    vtkNew<vtkDoubleArray> velocity;
+    velocity->SetName("Velocity");
+    velocity->SetNumberOfComponents(3);
+    velocity->SetNumberOfTuples(27);
+    vtkIdType pointId = 0;
+    for (int k = 0; k < 3; ++k) {
+        for (int j = 0; j < 3; ++j) {
+            for (int i = 0; i < 3; ++i, ++pointId) {
+                const double x = static_cast<double>(i) +
+                    (i == 1 && j == 1 && k == 1 ? interiorXOffset : 0.0);
+                points->SetPoint(pointId, x, static_cast<double>(j), static_cast<double>(k));
+                velocity->SetTuple3(pointId, x, static_cast<double>(j), static_cast<double>(k));
+            }
+        }
+    }
+    grid->SetPoints(points);
+    grid->GetPointData()->AddArray(velocity);
+    vtkNew<vtkXMLStructuredGridWriter> writer;
+    writer->SetFileName(path.string().c_str());
+    writer->SetInputData(grid);
+    Require(writer->Write() == 1,
+            "Cannot write FlowData coordinate-validation fixture: " + path.string());
+}
+
+void ValidateCoordinateValidation(const fs::path& root) {
+    const fs::path directory = root / "flowdata-coordinate-validation";
+    fs::create_directories(directory);
+    WriteStructuredSnapshot(directory / "snapshot0.vts", 0.0);
+    WriteStructuredSnapshot(directory / "snapshot1.vts", 0.25);
+    const FlowDataScanResult checked = FlowDataInspector::scanFolder(
+        QString::fromStdWString(directory.wstring()), FlowDataKind::Raw, true);
+    Require(!checked.passed && checked.errorMessage.contains(QStringLiteral("grid coordinates differ")),
+            "Coordinate validation accepted an interior-node displacement with unchanged bounds.");
+    const FlowDataScanResult unchecked = FlowDataInspector::scanFolder(
+        QString::fromStdWString(directory.wstring()), FlowDataKind::Raw, false);
+    Require(unchecked.passed,
+            "Disabling coordinate validation unexpectedly rejected the valid field schema.");
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +330,7 @@ int main() {
         fs::create_directories(root);
         ValidateCanonicalFlowDataScan(CreateFixture(root));
         ValidateSpectralBounds(CreateCurvedFixture(root));
+        ValidateCoordinateValidation(root);
         std::cout << "FlowData Native Nek5000 canonical scan test passed.\n";
         return 0;
     } catch (const std::exception& error) {

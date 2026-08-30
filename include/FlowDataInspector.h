@@ -24,7 +24,10 @@ public:
     using CancellationCallback = std::function<bool()>;
 
     // Accepts either a supported data directory or one supported data file.
-    // This includes Tecplot ASCII (.dat) and binary (.plt) sources.
+    // This includes Tecplot ASCII (.dat) and binary (.plt) sources. Resampled
+    // sources always validate every frame's uniform grid, dimensions, and
+    // numeric point/cell array schema; coordinateCheck additionally compares
+    // the frame coordinates.
     static FlowDataScanResult scanFolder(const QString& folder,
                                          FlowDataKind dataKind,
                                          bool coordinateCheck,

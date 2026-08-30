@@ -1399,7 +1399,9 @@ bool sameCandidateFieldSet(const QStringList& lhs, const QStringList& rhs) {
            });
 }
 
-bool sameArraySchema(const QList<ArrayInfo>& lhs, const QList<ArrayInfo>& rhs) {
+bool sameArraySchema(const QList<ArrayInfo>& lhs,
+                     const QList<ArrayInfo>& rhs,
+                     bool requireSameTupleCount) {
     if (lhs.size() != rhs.size()) {
         return false;
     }
@@ -1411,6 +1413,7 @@ bool sameArraySchema(const QList<ArrayInfo>& lhs, const QList<ArrayInfo>& rhs) {
             if (!matched.at(index)
                 && left.name.compare(right.name, Qt::CaseSensitive) == 0
                 && left.components == right.components
+                && (!requireSameTupleCount || left.tuples == right.tuples)
                 && left.association == right.association) {
                 matched[index] = true;
                 found = true;
@@ -5328,8 +5331,11 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                })) {
         result.entry.fileType = QStringLiteral("vtkhdf series");
     }
+    const bool validateEveryFrame = coordinateCheck
+        || dataKind == FlowDataKind::Resampled;
     if (progress) {
-        progress(QStringLiteral("Validating flow data"), 1, coordinateCheck ? result.files.size() : 2);
+        progress(QStringLiteral("Validating flow data"), 1,
+                 validateEveryFrame ? result.files.size() : 2);
     }
     if (canceled()) {
         return result;
@@ -5348,7 +5354,8 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
             dims[index] = first.dims[index];
         }
     }
-    if (dataKind == FlowDataKind::Resampled && !first.uniformStructured) {
+    if (dataKind == FlowDataKind::Resampled
+        && (!first.uniformStructured || !first.hasDims)) {
         result.errorMessage = "Resampled flow data must be a uniform structured VTK dataset.";
         return result;
     }
@@ -5378,7 +5385,7 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
         return result;
     }
 
-    if (coordinateCheck) {
+    if (validateEveryFrame) {
         for (int index = 1; index < result.files.size(); ++index) {
             if (canceled()) {
                 return result;
@@ -5393,7 +5400,39 @@ FlowDataScanResult FlowDataInspector::scanFolder(const QString& folder,
                 result.errorMessage = frameError;
                 return result;
             }
-            if (!coordinatesEquivalent(first, frame)) {
+            if (dataKind == FlowDataKind::Resampled
+                && (!frame.uniformStructured || !frame.hasDims)) {
+                result.errorMessage = QString(
+                    "Every resampled flow data frame must be a uniform structured VTK dataset: %1")
+                                          .arg(result.files.at(index));
+                return result;
+            }
+            if (dataKind == FlowDataKind::Resampled
+                && (first.dims[0] != frame.dims[0]
+                    || first.dims[1] != frame.dims[1]
+                    || first.dims[2] != frame.dims[2])) {
+                result.errorMessage = QString(
+                    "Resampled flow data grid dimensions differ from the first frame: %1")
+                                          .arg(result.files.at(index));
+                return result;
+            }
+            if (dataKind == FlowDataKind::Resampled
+                && first.spatialDimension != frame.spatialDimension) {
+                result.errorMessage = QString(
+                    "Resampled flow data spatial dimension differs from the first frame: %1")
+                                          .arg(result.files.at(index));
+                return result;
+            }
+            if (dataKind == FlowDataKind::Resampled
+                && (!sameCandidateFieldSet(first.termCandidates,
+                                           frame.termCandidates)
+                    || !sameArraySchema(first.arrays, frame.arrays, true))) {
+                result.errorMessage = QString(
+                    "Resampled flow data field/component schema differs from the first frame: %1")
+                                          .arg(result.files.at(index));
+                return result;
+            }
+            if (coordinateCheck && !coordinatesEquivalent(first, frame)) {
                 result.errorMessage = QString("Snapshot grid coordinates differ from the first frame: %1")
                                           .arg(result.files.at(index));
                 return result;
@@ -5859,7 +5898,8 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
         } else {
             if (!sameCandidateFieldSet(firstFrame.termCandidates,
                                        frame.termCandidates)
-                || !sameArraySchema(firstFrame.arrays, frame.arrays)) {
+                || !sameArraySchema(firstFrame.arrays, frame.arrays,
+                                    dataKind == FlowDataKind::Resampled)) {
                 return reject(QStringLiteral(
                     "Converted PVD field/component schema differs from the first frame: %1")
                                   .arg(referencedFiles.at(index)));

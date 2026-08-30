@@ -1,12 +1,15 @@
 #include <FlowDataInspector.h>
 #include <streamcenterplus/io/DataSetReader.h>
 
+#include <vtkCellData.h>
 #include <vtkDataSet.h>
 #include <vtkDoubleArray.h>
+#include <vtkImageData.h>
 #include <vtkNew.h>
 #include <vtkPointData.h>
 #include <vtkPoints.h>
 #include <vtkStructuredGrid.h>
+#include <vtkXMLImageDataWriter.h>
 #include <vtkXMLStructuredGridWriter.h>
 
 #include <algorithm>
@@ -320,6 +323,161 @@ void ValidateCoordinateValidation(const fs::path& root) {
             "Disabling coordinate validation unexpectedly rejected the valid field schema.");
 }
 
+enum class ResampledSchemaVariant {
+    Complete,
+    MissingPressure,
+    VelocityTwoComponents,
+    PressureOnCells,
+};
+
+void WriteResampledSnapshot(const fs::path& path,
+                            const std::array<int, 3>& dimensions,
+                            ResampledSchemaVariant variant = ResampledSchemaVariant::Complete) {
+    vtkNew<vtkImageData> image;
+    image->SetDimensions(dimensions.data());
+    image->SetOrigin(0.0, 0.0, 0.0);
+    image->SetSpacing(1.0, 1.0, 1.0);
+
+    vtkNew<vtkDoubleArray> velocity;
+    velocity->SetName("Velocity");
+    velocity->SetNumberOfComponents(
+        variant == ResampledSchemaVariant::VelocityTwoComponents ? 2 : 3);
+    velocity->SetNumberOfTuples(image->GetNumberOfPoints());
+    for (int component = 0; component < velocity->GetNumberOfComponents(); ++component) {
+        velocity->FillComponent(component, static_cast<double>(component + 1));
+    }
+    image->GetPointData()->AddArray(velocity);
+
+    if (variant != ResampledSchemaVariant::MissingPressure) {
+        vtkNew<vtkDoubleArray> pressure;
+        pressure->SetName("Pressure");
+        pressure->SetNumberOfComponents(1);
+        if (variant == ResampledSchemaVariant::PressureOnCells) {
+            pressure->SetNumberOfTuples(image->GetNumberOfCells());
+            pressure->FillComponent(0, 2.0);
+            image->GetCellData()->AddArray(pressure);
+        } else {
+            pressure->SetNumberOfTuples(image->GetNumberOfPoints());
+            pressure->FillComponent(0, 2.0);
+            image->GetPointData()->AddArray(pressure);
+        }
+    }
+
+    vtkNew<vtkDoubleArray> cellMask;
+    cellMask->SetName("CellMask");
+    cellMask->SetNumberOfComponents(1);
+    cellMask->SetNumberOfTuples(image->GetNumberOfCells());
+    cellMask->FillComponent(0, 1.0);
+    image->GetCellData()->AddArray(cellMask);
+
+    vtkNew<vtkXMLImageDataWriter> writer;
+    writer->SetFileName(path.string().c_str());
+    writer->SetInputData(image);
+    Require(writer->Write() == 1,
+            "Cannot write ordinary resampled-series fixture: " + path.string());
+}
+
+void WriteLegacyResampledSnapshot(const fs::path& path,
+                                  vtkIdType pressureTuples) {
+    std::ofstream output(path);
+    Require(static_cast<bool>(output),
+            "Cannot create ordinary resampled legacy-VTK fixture: " + path.string());
+    output << "# vtk DataFile Version 3.0\n"
+           << "ordinary resampled tuple-count fixture\n"
+           << "ASCII\n"
+           << "DATASET STRUCTURED_POINTS\n"
+           << "DIMENSIONS 3 3 3\n"
+           << "ORIGIN 0 0 0\n"
+           << "SPACING 1 1 1\n"
+           << "POINT_DATA 27\n"
+           << "FIELD PointData 2\n"
+           << "Velocity 3 27 double\n";
+    for (vtkIdType tuple = 0; tuple < 27; ++tuple) {
+        output << "1 2 3\n";
+    }
+    output << "Pressure 1 " << pressureTuples << " double\n";
+    for (vtkIdType tuple = 0; tuple < pressureTuples; ++tuple) {
+        output << "2\n";
+    }
+    output << "CELL_DATA 8\n"
+           << "FIELD CellData 1\n"
+           << "CellMask 1 8 double\n";
+    for (vtkIdType tuple = 0; tuple < 8; ++tuple) {
+        output << "1\n";
+    }
+    Require(static_cast<bool>(output),
+            "Cannot finish ordinary resampled legacy-VTK fixture: " + path.string());
+}
+
+FlowDataScanResult ScanResampledSeries(const fs::path& directory,
+                                       bool coordinateCheck) {
+    return FlowDataInspector::scanFolder(
+        QString::fromStdWString(directory.wstring()),
+        FlowDataKind::Resampled,
+        coordinateCheck);
+}
+
+void RequireRejectedResampledSeries(const FlowDataScanResult& result,
+                                    const QString& diagnostic,
+                                    const std::string& message) {
+    Require(!result.passed && result.errorMessage.contains(diagnostic, Qt::CaseInsensitive),
+            message + " Diagnostic: " + result.errorMessage.toStdString());
+}
+
+void ValidateOrdinaryResampledSeries(const fs::path& root) {
+    const fs::path valid = root / "ordinary-resampled-valid";
+    fs::create_directories(valid);
+    WriteResampledSnapshot(valid / "snapshot0.vti", {3, 3, 3});
+    WriteResampledSnapshot(valid / "snapshot1.vti", {3, 3, 3});
+    Require(ScanResampledSeries(valid, false).passed,
+            "A stable ordinary resampled series was rejected.");
+
+    const fs::path nonUniform = root / "ordinary-resampled-nonuniform";
+    fs::create_directories(nonUniform);
+    WriteResampledSnapshot(nonUniform / "snapshot0.vti", {3, 3, 3});
+    WriteStructuredSnapshot(nonUniform / "snapshot1.vts", 0.25);
+    RequireRejectedResampledSeries(
+        ScanResampledSeries(nonUniform, false),
+        QStringLiteral("uniform structured"),
+        "An ordinary resampled series accepted a non-uniform later frame.");
+
+    const fs::path changedDimensions = root / "ordinary-resampled-dimensions";
+    fs::create_directories(changedDimensions);
+    WriteResampledSnapshot(changedDimensions / "snapshot0.vti", {3, 3, 3});
+    WriteResampledSnapshot(changedDimensions / "snapshot1.vti", {4, 3, 3});
+    RequireRejectedResampledSeries(
+        ScanResampledSeries(changedDimensions, false),
+        QStringLiteral("dimensions differ"),
+        "An ordinary resampled series accepted changed grid dimensions.");
+
+    const auto validateSchemaChange = [&](const std::string& fixtureName,
+                                          ResampledSchemaVariant variant) {
+        const fs::path directory = root / fixtureName;
+        fs::create_directories(directory);
+        WriteResampledSnapshot(directory / "snapshot0.vti", {3, 3, 3});
+        WriteResampledSnapshot(directory / "snapshot1.vti", {3, 3, 3}, variant);
+        RequireRejectedResampledSeries(
+            ScanResampledSeries(directory, false),
+            QStringLiteral("schema differs"),
+            "An ordinary resampled series accepted a later-frame field/component schema change.");
+    };
+    validateSchemaChange("ordinary-resampled-missing-field",
+                         ResampledSchemaVariant::MissingPressure);
+    validateSchemaChange("ordinary-resampled-components",
+                         ResampledSchemaVariant::VelocityTwoComponents);
+    validateSchemaChange("ordinary-resampled-association",
+                         ResampledSchemaVariant::PressureOnCells);
+
+    const fs::path changedTupleCount = root / "ordinary-resampled-array-tuples";
+    fs::create_directories(changedTupleCount);
+    WriteLegacyResampledSnapshot(changedTupleCount / "snapshot0.vtk", 27);
+    WriteLegacyResampledSnapshot(changedTupleCount / "snapshot1.vtk", 26);
+    RequireRejectedResampledSeries(
+        ScanResampledSeries(changedTupleCount, false),
+        QStringLiteral("schema differs"),
+        "An ordinary resampled series accepted a later-frame array tuple-count change.");
+}
+
 }  // namespace
 
 int main() {
@@ -331,6 +489,7 @@ int main() {
         ValidateCanonicalFlowDataScan(CreateFixture(root));
         ValidateSpectralBounds(CreateCurvedFixture(root));
         ValidateCoordinateValidation(root);
+        ValidateOrdinaryResampledSeries(root);
         std::cout << "FlowData Native Nek5000 canonical scan test passed.\n";
         return 0;
     } catch (const std::exception& error) {

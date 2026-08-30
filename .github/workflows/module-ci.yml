@@ -1,0 +1,61 @@
+name: Module CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - harveytan
+
+jobs:
+  linux-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg/archives
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          lfs: false
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: .cache/vcpkg/archives
+          key: module-vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'cmake/triplets/**') }}
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            ninja-build \
+            pkg-config \
+            python3 \
+            tar \
+            unzip \
+            zip
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          find . -maxdepth 3 -type f -name '*.sh' -print0 | xargs -0 -r bash -n
+
+      - name: Build CPU smoke
+        shell: bash
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          if bash ./install.sh --help 2>&1 | grep -q -- '--component'; then
+            bash ./install.sh --component all --build-mode cpu-only
+          else
+            bash ./install.sh
+          fi

@@ -9,6 +9,8 @@
 
 #include <vtkSmartPointer.h>
 
+#include <streamcenterplus/ClusterJob.h>
+
 class vtkDataSet;
 class vtkImageData;
 
@@ -126,6 +128,8 @@ struct Parameters {
     LinearParameters linear;
     IdwParameters idw;
     KrigingParameters kriging;
+
+    streamcenterplus::ClusterJobHints cluster;
 };
 
 struct FrameInfo {

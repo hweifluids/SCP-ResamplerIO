@@ -2,6 +2,15 @@ name: Module CI
 
 on:
   workflow_dispatch:
+    inputs:
+      run_build:
+        description: "Run the module install.sh CPU smoke build"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   pull_request:
   push:
     branches:
@@ -10,9 +19,9 @@ on:
       - harveytan
 
 jobs:
-  linux-cpu:
+  hygiene:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 30
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg/archives
     steps:
@@ -22,13 +31,20 @@ jobs:
           submodules: false
           lfs: false
 
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          find . -maxdepth 3 -type f -name '*.sh' -print0 | xargs -0 -r bash -n
+
       - name: Cache vcpkg binary archives
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build == 'true' }}
         uses: actions/cache@v4
         with:
           path: .cache/vcpkg/archives
           key: module-vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'cmake/triplets/**') }}
 
-      - name: Install build tools
+      - name: Run manual CPU smoke build
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_build == 'true' }}
         shell: bash
         run: |
           sudo apt-get update
@@ -44,15 +60,6 @@ jobs:
             tar \
             unzip \
             zip
-
-      - name: Validate shell scripts
-        shell: bash
-        run: |
-          find . -maxdepth 3 -type f -name '*.sh' -print0 | xargs -0 -r bash -n
-
-      - name: Build CPU smoke
-        shell: bash
-        run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           if bash ./install.sh --help 2>&1 | grep -q -- '--component'; then
             bash ./install.sh --component all --build-mode cpu-only

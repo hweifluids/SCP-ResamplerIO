@@ -11,6 +11,7 @@
 #include <vtkSmartPointer.h>
 #include <vtkStructuredGrid.h>
 #include <vtkUnstructuredGrid.h>
+#include <vtkVersionMacros.h>
 
 #include <algorithm>
 #include <array>
@@ -1302,10 +1303,24 @@ void ReadConnectivity(BinaryInput* input,
             sourceGrid == nullptr) {
             input->Fail("Tecplot shared connectivity is incompatible with its zone");
         }
-        if (sourceGrid->GetFaceLocations() != nullptr &&
-            sourceGrid->GetFaces() != nullptr) {
+        if (
+#if VTK_VERSION_NUMBER >= VTK_VERSION_CHECK(9, 5, 0)
+            sourceGrid->GetPolyhedronFaceLocations() != nullptr &&
+            sourceGrid->GetPolyhedronFaces() != nullptr
+#else
+            sourceGrid->GetFaceLocations() != nullptr &&
+            sourceGrid->GetFaces() != nullptr
+#endif
+        ) {
+#if VTK_VERSION_NUMBER >= VTK_VERSION_CHECK(9, 5, 0)
+            grid->SetPolyhedralCells(sourceGrid->GetCellTypesArray(),
+                                     sourceGrid->GetCells(),
+                                     sourceGrid->GetPolyhedronFaceLocations(),
+                                     sourceGrid->GetPolyhedronFaces());
+#else
             grid->SetCells(sourceGrid->GetCellTypesArray(), sourceGrid->GetCells(),
                            sourceGrid->GetFaceLocations(), sourceGrid->GetFaces());
+#endif
         } else {
             grid->SetCells(sourceGrid->GetCellTypesArray(), sourceGrid->GetCells());
         }

@@ -1,7 +1,7 @@
 #include <streamcenterplus/io/DataSetReader.h>
 #include <streamcenterplus_resample/Core.h>
 
-#include <hdf5.h>
+#include <vtk_hdf5.h>
 
 #include <vtkAppendFilter.h>
 #include <vtkDataArray.h>

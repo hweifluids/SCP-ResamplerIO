@@ -6,7 +6,7 @@ source "${module_root}/cmake/transactional-publish.sh"
 vcpkg_commit="42f37e46d37baf7b218966434b91116bddf73461"
 vcpkg_repository="https://github.com/microsoft/vcpkg.git"
 sdk_repository="https://github.com/hweifluids/SCP-SolverSDK.git"
-sdk_tag="v0.2.0"
+sdk_tag="63dee7dfef68c18a3e0de2293c62070334f3e953"
 sdk_version="0.2.0"
 architecture="$(uname -m | tr '[:upper:]' '[:lower:]')"
 build_dir="${module_root}/.build/linux-${architecture}"
@@ -121,9 +121,11 @@ if [[ ! -f "${sdk_sibling_root}/CMakeLists.txt" ]] &&
     exit 1
   fi
   mkdir -p "$(dirname -- "${sdk_local_root}")"
-  if ! git clone --depth 1 --branch "${sdk_tag}" --single-branch \
-       "${sdk_repository}" "${sdk_local_root}"; then
-    echo "Could not bootstrap SCP-SolverSDK from ${sdk_repository} tag ${sdk_tag}. The repository and tag must be published before detached installation can succeed." >&2
+  if ! { git init "${sdk_local_root}" &&
+         git -C "${sdk_local_root}" remote add origin "${sdk_repository}" &&
+         git -C "${sdk_local_root}" fetch --depth 1 origin "${sdk_tag}" &&
+         git -C "${sdk_local_root}" checkout --detach "${sdk_tag}"; }; then
+    echo "Could not bootstrap SCP-SolverSDK from ${sdk_repository} revision ${sdk_tag}. The revision must be published before detached installation can succeed." >&2
     exit 1
   fi
 fi
@@ -147,9 +149,9 @@ if [[ "${sdk_source_root}" == "${sdk_local_root}" ]]; then
     echo "The module-local SCP-SolverSDK checkout must use origin ${sdk_repository}: ${sdk_local_root}" >&2
     exit 1
   fi
-  checked_out_tag="$(git -C "${sdk_local_root}" describe --tags --exact-match 2>/dev/null || true)"
+  checked_out_tag="$(git -C "${sdk_local_root}" rev-parse HEAD 2>/dev/null || true)"
   if [[ "${checked_out_tag}" != "${sdk_tag}" ]]; then
-    echo "The module-local SCP-SolverSDK checkout must be exactly tag ${sdk_tag}: ${sdk_local_root}" >&2
+    echo "The module-local SCP-SolverSDK checkout must be exactly revision ${sdk_tag}: ${sdk_local_root}" >&2
     exit 1
   fi
 fi

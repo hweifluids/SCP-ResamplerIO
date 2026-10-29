@@ -38,7 +38,7 @@ $moduleRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $vcpkgCommit = "42f37e46d37baf7b218966434b91116bddf73461"
 $vcpkgRepository = "https://github.com/microsoft/vcpkg.git"
 $sdkRepository = "https://github.com/hweifluids/SCP-SolverSDK.git"
-$sdkTag = "v0.2.0"
+$sdkTag = "63dee7dfef68c18a3e0de2293c62070334f3e953"
 $sdkVersion = "0.2.0"
 $BuildDir = Join-Path $moduleRoot ".build\windows-x64"
 $InstallDir = Join-Path $moduleRoot "release"
@@ -152,11 +152,19 @@ if (-not (Test-Path -LiteralPath $sdkSource) -and
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sdkLocalRoot) | Out-Null
     try {
         Invoke-NativeCommand -Executable $git.Source `
-            -Arguments @("clone", "--depth", "1", "--branch", $sdkTag, "--single-branch", $sdkRepository, $sdkLocalRoot) `
+            -Arguments @("init", $sdkLocalRoot) -FailureMessage "Could not initialize SDK checkout."
+        Invoke-NativeCommand -Executable $git.Source `
+            -Arguments @("-C", $sdkLocalRoot, "remote", "add", "origin", $sdkRepository) `
+            -FailureMessage "Could not configure SDK origin."
+        Invoke-NativeCommand -Executable $git.Source `
+            -Arguments @("-C", $sdkLocalRoot, "fetch", "--depth", "1", "origin", $sdkTag) `
             -FailureMessage "Could not fetch SCP-SolverSDK $sdkTag."
+        Invoke-NativeCommand -Executable $git.Source `
+            -Arguments @("-C", $sdkLocalRoot, "checkout", "--detach", $sdkTag) `
+            -FailureMessage "Could not check out SCP-SolverSDK $sdkTag."
     }
     catch {
-        throw "Could not bootstrap SCP-SolverSDK from $sdkRepository tag $sdkTag. The repository and tag must be published before detached installation can succeed. Details: $($_.Exception.Message)"
+        throw "Could not bootstrap SCP-SolverSDK from $sdkRepository revision $sdkTag. The revision must be published before detached installation can succeed. Details: $($_.Exception.Message)"
     }
 }
 
@@ -179,9 +187,9 @@ if ([System.StringComparer]::OrdinalIgnoreCase.Equals($sdkSourceRoot, $sdkLocalR
     if ($LASTEXITCODE -ne 0 -or $actualSdkOrigin -ne $sdkRepository) {
         throw "The module-local SCP-SolverSDK checkout must use origin ${sdkRepository}: $sdkLocalRoot"
     }
-    $checkedOutTag = (& $git.Source -C $sdkLocalRoot describe --tags --exact-match 2>$null).Trim()
+    $checkedOutTag = (& $git.Source -C $sdkLocalRoot rev-parse HEAD 2>$null).Trim()
     if ($LASTEXITCODE -ne 0 -or $checkedOutTag -ne $sdkTag) {
-        throw "The module-local SCP-SolverSDK checkout must be exactly tag ${sdkTag}: $sdkLocalRoot"
+        throw "The module-local SCP-SolverSDK checkout must be exactly revision ${sdkTag}: $sdkLocalRoot"
     }
 }
 

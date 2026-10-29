@@ -93,15 +93,6 @@ its final selected axis is checked again, and one/two-frame or otherwise strict
 outputs omit the marker. PVD `timestep` and VTKHDF `Steps/Values` retain source
 times throughout.
 
-The complete solver regression can be run after `SCPResamplerIO.SafetyRegression`
-with `tests/EnSightSolverSmoke.py`. Pass `--raw-dft`, `--raw-mpod`, `--raw-tod`,
-and `--structured-dft` executable paths, the generated `quantized-encas` fixture
-directory as `--fixture-root`, its resampled `quantized-output/quantized.pvd` as
-`--structured-input`, and a repository-root `.tests/...` output directory as
-`--output-root`. It executes complete small jobs, wrong-dt controls, and
-unmarked nonuniform-PVD controls and saves each process output plus a JSON
-summary below that output directory.
-
 ### Two-zone `.scpm` manifests
 
 The reader and Resample tool also accept a lightweight `key=value` `.scpm`

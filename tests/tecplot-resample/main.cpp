@@ -4,6 +4,7 @@
 
 #include <vtkDataArray.h>
 #include <vtkCellData.h>
+#include <vtkCell.h>
 #include <vtkCellType.h>
 #include <vtkDataSet.h>
 #include <vtkImageData.h>
@@ -477,7 +478,8 @@ void WriteOrderedTecplot(const fs::path& path,
 void WriteFaceBasedTecplot(const fs::path& path,
                            int version,
                            bool littleEndian,
-                           int zoneType) {
+                           int zoneType,
+                           bool sharedPolyhedron = false) {
     Require((version == 112 || version == 191) &&
                 (zoneType == kTecplotZonePolygon ||
                  zoneType == kTecplotZonePolyhedron),
@@ -507,40 +509,43 @@ void WriteFaceBasedTecplot(const fs::path& path,
         WriteTecplotString(output, variable, littleEndian);
     }
 
-    WriteEndian<float>(output, version == 191 ? 298.0F : 299.0F, littleEndian);
-    WriteTecplotString(output, polyhedron ? "polyhedron" : "polygon", littleEndian);
-    WriteEndian<std::int32_t>(output, 0, littleEndian);   // parent zone
-    WriteEndian<std::int32_t>(output, -1, littleEndian);  // static strand
-    WriteEndian<double>(output, 0.0, littleEndian);       // solution time
-    WriteEndian<std::int32_t>(output, -1, littleEndian);  // default zone color
-    WriteEndian<std::int32_t>(output, zoneType, littleEndian);
-    WriteEndian<std::int32_t>(output, 1, littleEndian);  // explicit locations
-    for (const std::int32_t location : kV191VariableLocations) {
-        WriteEndian<std::int32_t>(output, location, littleEndian);
+    for (int zone = 0; zone < (sharedPolyhedron ? 2 : 1); ++zone) {
+        WriteEndian<float>(output, version == 191 ? 298.0F : 299.0F, littleEndian);
+        WriteTecplotString(output, polyhedron ? "polyhedron" : "polygon", littleEndian);
+        WriteEndian<std::int32_t>(output, 0, littleEndian);   // parent zone
+        WriteEndian<std::int32_t>(output, -1, littleEndian);  // static strand
+        WriteEndian<double>(output, 0.0, littleEndian);       // solution time
+        WriteEndian<std::int32_t>(output, -1, littleEndian);  // default zone color
+        WriteEndian<std::int32_t>(output, zoneType, littleEndian);
+        WriteEndian<std::int32_t>(output, 1, littleEndian);  // explicit locations
+        for (const std::int32_t location : kV191VariableLocations) {
+            WriteEndian<std::int32_t>(output, location, littleEndian);
+        }
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // no raw face neighbors
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // no misc face neighbors
+        WriteEndian<std::int32_t>(output, static_cast<std::int32_t>(points.size()),
+                                  littleEndian);
+        if (version == 191) {
+            WriteEndian<std::int64_t>(output, static_cast<std::int64_t>(faceCount),
+                                      littleEndian);
+            WriteEndian<std::int64_t>(output, static_cast<std::int64_t>(faceNodeCount),
+                                      littleEndian);
+        } else {
+            WriteEndian<std::int32_t>(output, static_cast<std::int32_t>(faceCount),
+                                      littleEndian);
+            WriteEndian<std::int32_t>(output,
+                                      static_cast<std::int32_t>(faceNodeCount),
+                                      littleEndian);
+        }
+        WriteEndian<std::int32_t>(output, hasBoundaryMap ? 2 : 0, littleEndian);
+        WriteEndian<std::int32_t>(output, hasBoundaryMap ? 1 : 0, littleEndian);
+        WriteEndian<std::int32_t>(output, 1, littleEndian);  // element count
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // ICellDim
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // JCellDim
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // KCellDim
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // no zone auxiliary data
+
     }
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // no raw face neighbors
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // no misc face neighbors
-    WriteEndian<std::int32_t>(output, static_cast<std::int32_t>(points.size()),
-                              littleEndian);
-    if (version == 191) {
-        WriteEndian<std::int64_t>(output, static_cast<std::int64_t>(faceCount),
-                                  littleEndian);
-        WriteEndian<std::int64_t>(output, static_cast<std::int64_t>(faceNodeCount),
-                                  littleEndian);
-    } else {
-        WriteEndian<std::int32_t>(output, static_cast<std::int32_t>(faceCount),
-                                  littleEndian);
-        WriteEndian<std::int32_t>(output,
-                                  static_cast<std::int32_t>(faceNodeCount),
-                                  littleEndian);
-    }
-    WriteEndian<std::int32_t>(output, hasBoundaryMap ? 2 : 0, littleEndian);
-    WriteEndian<std::int32_t>(output, hasBoundaryMap ? 1 : 0, littleEndian);
-    WriteEndian<std::int32_t>(output, 1, littleEndian);  // element count
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // ICellDim
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // JCellDim
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // KCellDim
-    WriteEndian<std::int32_t>(output, 0, littleEndian);  // no zone auxiliary data
 
     WriteEndian<float>(output, 357.0F, littleEndian);  // end-of-header marker
     WriteEndian<float>(output,  version == 191 ? 298.0F : 299.0F, littleEndian);
@@ -623,6 +628,19 @@ void WriteFaceBasedTecplot(const fs::path& path,
         for (int face = 0; face < 4; ++face) {
             WriteEndian<std::int32_t>(output, 0, littleEndian);
         }
+    }
+    if (sharedPolyhedron) {
+        Require(polyhedron, "Shared fixture requires polyhedral geometry.");
+        WriteEndian<float>(output, version == 191 ? 298.0F : 299.0F, littleEndian);
+        for (std::size_t variable = 0; variable < kV191VariableNames.size(); ++variable) {
+            WriteEndian<std::int32_t>(output, 1, littleEndian);
+        }
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // no passive variables
+        WriteEndian<std::int32_t>(output, 1, littleEndian);  // share every variable
+        for (std::size_t variable = 0; variable < kV191VariableNames.size(); ++variable) {
+            WriteEndian<std::int32_t>(output, 0, littleEndian);
+        }
+        WriteEndian<std::int32_t>(output, 0, littleEndian);  // share zone 0 connectivity
     }
     Require(static_cast<bool>(output), "Failed while writing face-based Tecplot fixture.");
 }
@@ -858,6 +876,27 @@ int main() {
                               kTecplotZonePolyhedron);
         WriteFaceBasedTecplot(polyhedronV191BigEndianPath, 191, false,
                               kTecplotZonePolyhedron);
+
+        for (const auto& format : {std::pair<int, bool>{112, true}, {191, false}}) {
+            const auto shared = polyDirectory / ("shared-polyhedron-" +
+                                                std::to_string(format.first) + ".plt");
+            WriteFaceBasedTecplot(shared, format.first, format.second,
+                                 kTecplotZonePolyhedron, true);
+            auto data = io::ReadDataSet(io::EnumerateDataSetFrames(shared).front());
+            Require(data && data->GetNumberOfPoints() == 16 && data->GetNumberOfCells() == 2,
+                    "Shared polyhedron lost a zone or point boundary.");
+            for (vtkIdType cellId = 0; cellId < 2; ++cellId) {
+                auto* cell = data->GetCell(cellId);
+                Require(cell && cell->GetCellType() == VTK_POLYHEDRON &&
+                            cell->GetNumberOfFaces() == 6 && cell->GetNumberOfPoints() == 8,
+                        "Shared polyhedron lost its face connectivity.");
+                for (int face = 0; face < 6; ++face) {
+                    Require(cell->GetFace(face)->GetNumberOfPoints() == 4,
+                            "Shared polyhedron face connectivity is incomplete.");
+                }
+            }
+            ValidateResampling(shared, true);
+        }
 
         ValidateDataSet(asciiPath);
         ValidateDataSet(binaryPath);

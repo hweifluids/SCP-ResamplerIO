@@ -1,7 +1,9 @@
 #include "streamcenterplus_resample/Core.h"
 #include "Integrity.h"
+#include "../EnSightGoldFixture.h"
 
 #include <vtkDataArray.h>
+#include <vtkCellType.h>
 #include <vtkDataSet.h>
 #include <vtkDoubleArray.h>
 #include <vtkImageData.h>
@@ -19,6 +21,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -448,6 +451,218 @@ void TestAtomicWriteFailure(const fs::path& root) {
     }
 }
 
+void TestEnSightGoldInputPaths(const fs::path& root) {
+    streamcenterplus::test::EnSightGoldFixtureOptions fixtureOptions;
+    fixtureOptions.includeBoundaryPart = true;
+    const fs::path descriptor = streamcenterplus::test::CreateTransientEnSightGoldFixture(
+        root / "encas-input", "region.EnCaS", fixtureOptions);
+    const std::vector<resample::FrameInfo> frames =
+        resample::EnumerateDataSetFrames(descriptor, 7.0);
+    const std::vector<resample::FrameInfo> directoryFrames =
+        resample::EnumerateDataSetFrames(descriptor.parent_path(), 7.0);
+    Require(frames.size() == 3 && directoryFrames.size() == 3,
+            "Resample file/directory inputs did not enumerate ENCAS native frames.");
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+        Require(frames[index].kind == resample::DataSetFrameKind::EnSightGoldTimeStep &&
+                    frames[index].readerTime.has_value() &&
+                    std::abs(frames[index].time -
+                             streamcenterplus::test::kEnSightGoldTimes[index]) < 1.0e-6 &&
+                    directoryFrames[index].time == frames[index].time,
+                "Resample replaced the EnSight native frame metadata.");
+    }
+
+    const std::array<double, 6> expectedBounds = {0.0, 1.0, 0.0, 1.0, 0.0, 1.0};
+    const resample::FrameInfo plainFrame{descriptor, 0.0};
+    Require(resample::ReadDataSetBounds(descriptor) == expectedBounds &&
+                resample::ReadDataSetBounds(plainFrame) == expectedBounds &&
+                resample::ReadDataSetBounds(frames.back()) == expectedBounds,
+            "Resample bounds reads did not dispatch ENCAS/static geometry correctly.");
+    const auto requirePressure = [&](vtkDataSet* data, double expected) {
+        Require(data != nullptr, "Resample did not produce an EnSight data set.");
+        vtkDataArray* pressure = data->GetPointData()->GetArray("pressure");
+        Require(pressure != nullptr && pressure->GetNumberOfTuples() > 0 &&
+                    std::abs(pressure->GetComponent(0, 0) - expected) < 1.0e-10,
+                "Resample read the wrong EnSight variable time step.");
+    };
+    vtkSmartPointer<vtkDataSet> first = resample::ReadDataSet(descriptor);
+    Require(first->GetNumberOfPoints() == 8 && first->GetNumberOfCells() == 1,
+            "Resample retained separate EnSight boundary parts beside volume parts.");
+    requirePressure(first, 0.0);
+    requirePressure(resample::ReadDataSet(plainFrame), 0.0);
+    requirePressure(resample::ReadDataSet(frames.back()), 20.0);
+
+    const fs::path output = root / "encas-output";
+    const resample::Parameters params = BasicParameters(descriptor, output, "encas");
+    Require(resample::RunSolver(params) == 0,
+            "Transient EnSight Gold resampling failed.");
+    const std::vector<resample::FrameInfo> resultFrames =
+        resample::EnumerateDataSetFrames(output / "encas.pvd");
+    Require(resultFrames.size() == 3,
+            "EnSight resampling did not publish all variable frames.");
+    for (std::size_t index = 0; index < resultFrames.size(); ++index) {
+        Require(std::abs(resultFrames[index].time - frames[index].time) < 1.0e-10,
+                "Resampled PVD changed the native EnSight timestamps.");
+        requirePressure(resample::ReadDataSet(resultFrames[index]), 10.0 * index);
+    }
+}
+
+void TestEnSightTimeProvenance(const fs::path& root) {
+    const fs::path descriptor =
+        streamcenterplus::test::CreateQuantizedEnSightGoldFixture(root / "quantized-encas");
+    resample::Parameters params = BasicParameters(descriptor, root / "quantized-output", "quantized");
+    Require(resample::RunSolver(params) == 0, "Quantized EnSight resampling failed.");
+    const fs::path pvd = params.outputDir / "quantized.pvd";
+    const auto frames = resample::EnumerateDataSetFrames(pvd);
+    Require(frames.size() == 8 && frames.front().time == 4.25700 &&
+                frames[2].time == 4.25901 && frames.back().time == 4.26401 &&
+                frames.front().ensightTime.has_value(),
+            "Resample output dropped original EnSight times or validated time provenance.");
+    Require(ReadText(pvd).find(streamcenterplus::ensight_time::kTimeQuantumAttribute) !=
+                std::string::npos,
+            "Quantized EnSight Resample PVD did not publish its decimal precision.");
+    params.solverStatus = "error";
+    Require(resample::RunSolver(params) == 0 &&
+                resample::EnumerateDataSetFrames(pvd).front().ensightTime.has_value(),
+            "Resample resume dropped EnSight time provenance.");
+    params.outputDir = root / "quantized-cropped-output";
+    params.outputBasename = "cropped";
+    params.solverStatus = "unsolved";
+    params.frameRange.start = 2;
+    params.frameRange.end = 3;
+    Require(resample::RunSolver(params) == 0, "Two-frame EnSight selection failed to resample.");
+    const fs::path cropped = params.outputDir / "cropped.pvd";
+    Require(ReadText(cropped).find(streamcenterplus::ensight_time::kTimeQuantumAttribute) ==
+                std::string::npos &&
+                resample::EnumerateDataSetFrames(cropped).front().time == 4.25901,
+            "Strict two-frame output retained stale EnSight approximation metadata or changed times.");
+}
+
+void WriteCompositeVtuBlock(const fs::path& path, int frame, bool boundary) {
+    const std::size_t pointCount = boundary ? 4 : 8;
+    std::ostringstream xml;
+    xml << "<?xml version=\"1.0\"?>\n"
+        << "<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n"
+        << "<UnstructuredGrid><Piece NumberOfPoints=\"" << pointCount
+        << "\" NumberOfCells=\"1\"><PointData>\n";
+    const auto scalar = [&](const char* name, int component) {
+        xml << "<DataArray type=\"Float64\" Name=\"" << name << "\" format=\"ascii\">";
+        for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+            const auto& point = streamcenterplus::test::kEnSightGoldPoints[pointIndex];
+            xml << (component < 0 ? 10.0 * frame + point[0] + 2.0 * point[1] + 3.0 * point[2]
+                                 : 100.0 * frame + 10.0 * component + point[component]) << ' ';
+        }
+        xml << "</DataArray>\n";
+    };
+    scalar("pressure", -1);
+    scalar("x_velocity", 0);
+    scalar("y_velocity", 1);
+    scalar("z_velocity", 2);
+    xml << "<DataArray type=\"Float64\" Name=\"velocity\" NumberOfComponents=\"3\" format=\"ascii\">";
+    for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        for (int component = 0; component < 3; ++component) {
+            xml << 100.0 * frame + 10.0 * component +
+                       streamcenterplus::test::kEnSightGoldPoints[pointIndex][component] << ' ';
+        }
+    }
+    xml << "</DataArray></PointData><CellData/><Points>"
+        << "<DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";
+    for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        for (double coordinate : streamcenterplus::test::kEnSightGoldPoints[pointIndex]) {
+            xml << coordinate << ' ';
+        }
+    }
+    xml << "</DataArray></Points><Cells>"
+        << "<DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">";
+    for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        xml << pointIndex << ' ';
+    }
+    xml << "</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">"
+        << pointCount << "</DataArray>"
+        << "<DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">"
+        << (boundary ? VTK_QUAD : VTK_HEXAHEDRON)
+        << "</DataArray></Cells></Piece></UnstructuredGrid></VTKFile>\n";
+    WriteText(path, xml.str());
+}
+
+void TestPvdVtmCompositeInput(const fs::path& root) {
+    const fs::path input = root / "pvd-vtm-input";
+    const fs::path collection = input / "series.pvd";
+    const std::array<double, 3> times = {4.257, 4.258, 4.25901};
+    std::vector<std::pair<double, fs::path>> entries;
+    for (int frame = 0; frame < 3; ++frame) {
+        const std::string prefix = "frame_" + std::to_string(frame);
+        const fs::path volumeName = prefix + "_volume.vtu";
+        const fs::path boundaryName = prefix + "_boundary.vtu";
+        const fs::path compositeName = prefix + ".VtM";
+        WriteCompositeVtuBlock(input / volumeName, frame, false);
+        WriteCompositeVtuBlock(input / boundaryName, frame, true);
+        WriteText(input / compositeName,
+            "<?xml version=\"1.0\"?>\n"
+            "<VTKFile type=\"vtkMultiBlockDataSet\" version=\"1.0\" byte_order=\"LittleEndian\">"
+            "<vtkMultiBlockDataSet><DataSet index=\"0\" name=\"volume\" file=\"" +
+            volumeName.generic_string() + "\"/><DataSet index=\"1\" name=\"boundary\" file=\"" +
+            boundaryName.generic_string() + "\"/></vtkMultiBlockDataSet></VTKFile>\n");
+        entries.push_back({times[static_cast<std::size_t>(frame)], compositeName});
+    }
+    resample::WritePvd(collection, entries, 1.0e-5);
+    const auto frames = resample::EnumerateDataSetFrames(collection);
+    Require(frames.size() == 3 && frames.front().ensightTime.has_value(),
+            "PVD/VTM discovery lost its frame times or EnSight time provenance.");
+    const std::array<double, 6> expectedBounds = {0.0, 1.0, 0.0, 1.0, 0.0, 1.0};
+    Require(resample::ReadDataSetBounds(frames.front()) == expectedBounds &&
+                resample::ReadDataSetBounds(frames.front().path) == expectedBounds,
+            "PVD/VTM bounds did not use the shared composite reader.");
+    Require(resample::ReadDataSet(frames.front().path)->GetNumberOfCells() == 2,
+            "Direct VTM input did not dispatch through the shared composite reader.");
+    const std::array<const char*, 3> componentNames = {"x_velocity", "y_velocity", "z_velocity"};
+    for (std::size_t frame = 0; frame < frames.size(); ++frame) {
+        Require(frames[frame].time == times[frame], "PVD/VTM input changed an original time.");
+        vtkSmartPointer<vtkDataSet> data = resample::ReadDataSet(frames[frame]);
+        Require(data->GetNumberOfPoints() == 12 && data->GetNumberOfCells() == 2 &&
+                    data->GetCellType(0) == VTK_HEXAHEDRON && data->GetCellType(1) == VTK_QUAD,
+                "Generic VTM must preserve volume and boundary blocks without EnSight filtering.");
+        for (const char* name : {"pressure", "x_velocity", "y_velocity", "z_velocity", "velocity"}) {
+            vtkDataArray* array = data->GetPointData()->GetArray(name);
+            Require(array != nullptr && array->GetNumberOfTuples() == 12 &&
+                        array->GetNumberOfComponents() == (std::string(name) == "velocity" ? 3 : 1),
+                    "PVD/VTM assembly dropped or truncated an original field.");
+        }
+        vtkDataArray* pressure = data->GetPointData()->GetArray("pressure");
+        vtkDataArray* velocity = data->GetPointData()->GetArray("velocity");
+        for (vtkIdType pointId = 0; pointId < data->GetNumberOfPoints(); ++pointId) {
+            double point[3] = {};
+            data->GetPoint(pointId, point);
+            Require(std::abs(pressure->GetComponent(pointId, 0) -
+                             (10.0 * frame + point[0] + 2.0 * point[1] + 3.0 * point[2])) < 1.0e-12,
+                    "PVD/VTM pressure values were changed while appending blocks.");
+            for (int component = 0; component < 3; ++component) {
+                vtkDataArray* scalar = data->GetPointData()->GetArray(componentNames[component]);
+                const double expected = 100.0 * frame + 10.0 * component + point[component];
+                Require(std::abs(velocity->GetComponent(pointId, component) -
+                                 expected) < 1.0e-12 &&
+                            std::abs(scalar->GetComponent(pointId, 0) - expected) < 1.0e-12,
+                        "PVD/VTM velocity values were changed while appending blocks.");
+            }
+        }
+    }
+    const fs::path output = root / "pvd-vtm-output";
+    const auto params = BasicParameters(collection, output, "composite");
+    Require(resample::RunSolver(params) == 0, "PVD referencing multi-block VTM frames failed to resample.");
+    const auto resultFrames = resample::EnumerateDataSetFrames(output / "composite.pvd");
+    Require(resultFrames.size() == 3 && resultFrames.front().ensightTime.has_value(),
+            "PVD/VTM resampling lost frame count or validated time provenance.");
+    for (std::size_t frame = 0; frame < resultFrames.size(); ++frame) {
+        vtkSmartPointer<vtkDataSet> image = resample::ReadDataSet(resultFrames[frame]);
+        vtkDataArray* pressure = image->GetPointData()->GetArray("pressure");
+        vtkDataArray* velocity = image->GetPointData()->GetArray("velocity");
+        Require(resultFrames[frame].time == times[frame] && image->GetNumberOfPoints() == 27 &&
+                    pressure != nullptr && velocity != nullptr &&
+                    std::abs(pressure->GetComponent(0, 0) - 10.0 * frame) < 1.0e-12 &&
+                    std::abs(velocity->GetComponent(0, 0) - 100.0 * frame) < 1.0e-12,
+                "PVD/VTM output changed original times or resampled field values.");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -479,6 +694,9 @@ int main(int argc, char** argv) {
         TestInvalidInputPreservesOutputs(root);
         TestContentBoundResumeAndOwnedCleanup(root);
         TestAtomicWriteFailure(root);
+        TestEnSightGoldInputPaths(root);
+        TestEnSightTimeProvenance(root);
+        TestPvdVtmCompositeInput(root);
         std::cout << "Resampler safety regression tests passed.\n";
         return 0;
     } catch (const std::exception& exception) {

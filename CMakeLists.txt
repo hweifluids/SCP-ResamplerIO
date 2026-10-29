@@ -94,6 +94,7 @@ target_include_directories(SCP_ResamplerReaders PUBLIC
 )
 target_link_libraries(SCP_ResamplerReaders PUBLIC
   SCP::SolverSDK
+  VTK::hdf5
   ${VTK_LIBRARIES}
 )
 if(WIN32)
@@ -175,6 +176,7 @@ target_link_libraries(SCP_ResamplerIO PUBLIC
 
 if(WIN32)
   target_compile_definitions(SCP_ResamplerIO PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(SCP_ResamplerIO PRIVATE bcrypt)
 endif()
 if(MSVC)
   target_compile_options(SCP_ResamplerIO PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
@@ -298,6 +300,16 @@ if(SCP_RESAMPLER_IO_BUILD_TESTS AND BUILD_TESTING)
       "${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}/safety-regression"
   )
   set_tests_properties(SCPResamplerIO.SafetyRegression PROPERTIES TIMEOUT 180)
+
+  if(TARGET streamcenterplus_resample_solver)
+    add_test(NAME SCPResamplerIO.ResampleCliRegression
+      COMMAND "${CMAKE_COMMAND}"
+        "-DRESAMPLE_EXECUTABLE=$<TARGET_FILE:streamcenterplus_resample_solver>"
+        "-DFIXTURE_ROOT=${SCP_RESAMPLER_IO_TEST_OUTPUT_ROOT}/cli-regression"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ResampleCliRegression.cmake"
+    )
+    set_tests_properties(SCPResamplerIO.ResampleCliRegression PROPERTIES TIMEOUT 120)
+  endif()
 
   add_executable(scp_resampler_io_tecplot_resample
     tests/tecplot-resample/main.cpp

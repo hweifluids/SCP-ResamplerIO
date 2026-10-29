@@ -166,8 +166,6 @@ VtkSmpConfiguration ConfigureVtkSmpForMaxConcurrency() {
     }
 
     vtkSMPTools::Initialize(config.requestedThreadCount);
-    vtkMultiThreader::SetGlobalMaximumNumberOfThreads(config.requestedThreadCount);
-    vtkMultiThreader::SetGlobalDefaultNumberOfThreads(config.requestedThreadCount);
 
     config.backend = vtkSMPTools::GetBackend() != nullptr ? vtkSMPTools::GetBackend() : "unknown";
     config.estimatedThreadCount = std::max(1, vtkSMPTools::GetEstimatedNumberOfThreads());
@@ -177,12 +175,15 @@ VtkSmpConfiguration ConfigureVtkSmpForMaxConcurrency() {
     }
     if (config.requestedThreadCount > 1 && config.estimatedThreadCount < config.requestedThreadCount) {
         std::ostringstream message;
-        message << "VTK SMP backend " << config.backend << " exposes only "
+        message << "[Warning] VTK SMP backend " << config.backend << " exposes "
                 << config.estimatedThreadCount << " worker threads after requesting "
-                << config.requestedThreadCount << ". Rebuild VTK with a backend that can use all active "
-                << "logical processors, such as TBB.";
-        throw std::runtime_error(message.str());
+                << config.requestedThreadCount << ". Continuing with the available workers; "
+                << "the hardware/VTK thread limit affects throughput, not resampling correctness.\n";
+        std::cerr << message.str();
     }
+    const int availableThreads = std::min(config.requestedThreadCount, config.estimatedThreadCount);
+    vtkMultiThreader::SetGlobalMaximumNumberOfThreads(availableThreads);
+    vtkMultiThreader::SetGlobalDefaultNumberOfThreads(availableThreads);
     return config;
 }
 
@@ -1595,6 +1596,14 @@ FrameInputIdentity ComputeFrameInputIdentityFromDataSet(const Parameters& params
     if (frame.readerTime.has_value()) {
         sourceText << "|reader_time=" << std::setprecision(17) << *frame.readerTime;
     }
+    if (frame.ensightTime.has_value()) {
+        const auto& axis = *frame.ensightTime;
+        sourceText << "|ensight_quantum=" << std::setprecision(17) << axis.quantum
+                   << "|ensight_interval=" << axis.interval
+                   << "|ensight_origin=" << axis.origin
+                   << "|ensight_count=" << axis.frameCount
+                   << "|ensight_index=" << axis.frameIndex;
+    }
     if (!frame.coordinatePath.empty()) {
         sourceText << "|coordinate_path=" <<
             std::filesystem::absolute(frame.coordinatePath).lexically_normal().generic_string();
@@ -2725,7 +2734,19 @@ int RunSolver(const Parameters& unvalidatedParams) {
     LogStageFinished("Frame resampling", resampleStage, "frames=" + std::to_string(results.size()));
 
     const auto writeStage = LogStageStarted("Result writing", outputLayout.root.string());
-    WritePvd(outputLayout.pvd, pvdEntries);
+    std::optional<double> timeQuantum;
+    std::vector<double> sourceTimes;
+    std::vector<ensight_time::TimeFrameProvenance> timeProvenance;
+    for (const FrameInfo& frame : sequence.frames) {
+        sourceTimes.push_back(frame.time);
+        if (frame.ensightTime.has_value()) {
+            timeProvenance.push_back(*frame.ensightTime);
+        }
+    }
+    if (ensight_time::ValidatedTimeStep(sourceTimes, timeProvenance).has_value()) {
+        timeQuantum = timeProvenance.front().quantum;
+    }
+    WritePvd(outputLayout.pvd, pvdEntries, timeQuantum);
     manifest.pvdChecksum = integrity::Sha256File(outputLayout.pvd);
     manifest.state = "in_progress";
     WriteResumeManifest(outputLayout, manifest);

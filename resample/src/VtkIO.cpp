@@ -47,17 +47,18 @@ std::string ToLower(std::string value) {
 bool IsSupportedDataFile(const std::filesystem::path& path) {
     const std::string ext = ToLower(streamcenterplus::vtkhdf::Extension(path));
     return ext == ".vtk" || ext == ".vti" || ext == ".vtr" ||
-           ext == ".vts" || ext == ".vtu" || ext == ".vtp" ||
+           ext == ".vts" || ext == ".vtu" || ext == ".vtp" || ext == ".vtm" ||
            ext == ".vtkhdf" || ext == ".nek5000" || ext == ".nek" ||
-           ext == ".case" || ext == ".foam" || ext == ".scpm" ||
+           ext == ".case" || ext == ".encas" || ext == ".foam" || ext == ".scpm" ||
            ext == ".dat" || ext == ".plt";
 }
 
 bool RequiresSharedDataSetReader(const FrameInfo& frame,
                                  const std::string& extension) {
     return frame.kind != DataSetFrameKind::File ||
+           extension == ".vtm" ||
            extension == ".nek5000" || extension == ".nek" ||
-           extension == ".case" || extension == ".foam" ||
+           extension == ".case" || extension == ".encas" || extension == ".foam" ||
            extension == ".scpm" || extension == ".dat" ||
            extension == ".plt";
 }
@@ -66,7 +67,7 @@ bool RequiresEnumeratedFrame(const FrameInfo& frame,
                              const std::string& extension) {
     return frame.kind == DataSetFrameKind::File && !frame.readerTime.has_value() &&
            (extension == ".nek5000" || extension == ".nek" ||
-            extension == ".case" || extension == ".foam" ||
+            extension == ".case" || extension == ".encas" || extension == ".foam" ||
             extension == ".scpm");
 }
 
@@ -95,6 +96,7 @@ streamcenterplus::io::DataSetFrame ToIoFrame(const FrameInfo& frame) {
     out.sourceIndex = frame.sourceIndex;
     out.coordinateSourceIndex = frame.coordinateSourceIndex;
     out.multiZoneBackgroundIndex = frame.multiZoneBackgroundIndex;
+    out.ensightTime = frame.ensightTime;
     switch (frame.kind) {
     case DataSetFrameKind::File:
         out.kind = streamcenterplus::io::DataSetFrameKind::File;
@@ -403,6 +405,7 @@ std::vector<FrameInfo> EnumerateDataSetFrames(const std::filesystem::path& sourc
         frame.sourceIndex = shared.sourceIndex;
         frame.coordinateSourceIndex = shared.coordinateSourceIndex;
         frame.multiZoneBackgroundIndex = shared.multiZoneBackgroundIndex;
+        frame.ensightTime = shared.ensightTime;
         frames.push_back(std::move(frame));
     }
     return frames;
@@ -486,7 +489,8 @@ std::array<double, 6> ReadDataSetBounds(const std::filesystem::path& filePath) {
     const std::string extension =
         ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (extension == ".nek5000" || extension == ".nek" ||
-        extension == ".case" || extension == ".foam" || extension == ".scpm") {
+        extension == ".case" || extension == ".encas" ||
+        extension == ".foam" || extension == ".scpm") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSetBounds(frames.front());
     }
@@ -554,7 +558,8 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(const std::filesystem::path& filePath) {
     const std::string extension =
         ToLower(streamcenterplus::vtkhdf::Extension(filePath));
     if (extension == ".nek5000" || extension == ".nek" ||
-        extension == ".case" || extension == ".foam" || extension == ".scpm") {
+        extension == ".case" || extension == ".encas" ||
+        extension == ".foam" || extension == ".scpm") {
         const std::vector<FrameInfo> frames = EnumerateDataSetFrames(filePath);
         return ReadDataSet(frames.front());
     }
@@ -715,7 +720,21 @@ void WriteVti(const std::filesystem::path& outputPath, vtkImageData* image) {
 }
 
 void WritePvd(const std::filesystem::path& outputPath,
-              const std::vector<std::pair<double, std::filesystem::path>>& frames) {
+              const std::vector<std::pair<double, std::filesystem::path>>& frames,
+              std::optional<double> ensightTimeQuantum) {
+    if (ensightTimeQuantum.has_value()) {
+        std::vector<double> times;
+        for (const auto& frame : frames) {
+            times.push_back(frame.first);
+        }
+        const auto assessment = ensight_time::AssessTimeAxis(times, *ensightTimeQuantum);
+        if (!assessment.valid) {
+            throw std::runtime_error("Output EnSight PVD time axis exceeds its decimal resolution.");
+        }
+        if (!assessment.approximate) {
+            ensightTimeQuantum.reset();
+        }
+    }
     std::filesystem::create_directories(outputPath.parent_path());
     const std::filesystem::path temporary = integrity::TemporarySibling(outputPath);
     try {
@@ -724,7 +743,12 @@ void WritePvd(const std::filesystem::path& outputPath,
             throw std::runtime_error("Failed to open temporary PVD file: " + temporary.string());
         }
         output << "<?xml version=\"1.0\"?>\n";
-        output << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+        output << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\"";
+        if (ensightTimeQuantum.has_value()) {
+            output << ' ' << ensight_time::kTimeQuantumAttribute << "=\""
+                   << std::setprecision(17) << *ensightTimeQuantum << '"';
+        }
+        output << ">\n";
         output << "  <Collection>\n";
         for (const auto& frame : frames) {
             output << "    <DataSet timestep=\"" << std::setprecision(17) << frame.first

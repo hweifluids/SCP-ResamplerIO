@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <vtkSmartPointer.h>
+#include <streamcenterplus/EnSightTimePolicy.h>
 
 class vtkDataSet;
 class vtkImageData;
@@ -137,6 +138,7 @@ struct FrameInfo {
     int sourceIndex = 0;
     int coordinateSourceIndex = -1;
     int multiZoneBackgroundIndex = -1;
+    std::optional<ensight_time::TimeFrameProvenance> ensightTime;
 };
 
 struct SequenceInfo {
@@ -193,7 +195,8 @@ vtkSmartPointer<vtkImageData> ResampleFrame(vtkDataSet* preparedInput,
                                             const std::array<double, 6>& bounds);
 void WriteVti(const std::filesystem::path& outputPath, vtkImageData* image);
 void WritePvd(const std::filesystem::path& outputPath,
-              const std::vector<std::pair<double, std::filesystem::path>>& frames);
+              const std::vector<std::pair<double, std::filesystem::path>>& frames,
+              std::optional<double> ensightTimeQuantum = std::nullopt);
 void WriteTextFile(const std::filesystem::path& outputPath, const std::string& text);
 
 std::string VtkSmpRuntimeSummary();

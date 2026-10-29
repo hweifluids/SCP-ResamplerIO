@@ -1,8 +1,11 @@
 #include <streamcenterplus/io/DataSetReader.h>
+#include "../EnSightGoldFixture.h"
+#include <streamcenterplus/EnSightHdfTimeMetadata.h>
 
 #include <vtkDataArray.h>
 #include <vtkDataSet.h>
 #include <vtkCellData.h>
+#include <vtkCellType.h>
 #include <vtkDoubleArray.h>
 #include <vtkFieldData.h>
 #include <vtkIntArray.h>
@@ -1284,6 +1287,8 @@ fs::path CreateEnSightFixture(const fs::path& root) {
 }
 
 void ValidateEnSight(const fs::path& casePath) {
+    Require(io::IsSupportedDataSource(casePath),
+            "EnSight Gold descriptor extension was not recognized.");
     const std::vector<io::DataSetFrame> frames =
         io::EnumerateDataSetFrames(casePath);
     Require(frames.size() == 1 &&
@@ -1296,6 +1301,248 @@ void ValidateEnSight(const fs::path& casePath) {
     Require(data->GetPointData()->GetArray("Velocity") != nullptr &&
                 data->GetPointData()->GetArray("Pressure") != nullptr,
             "EnSight Gold point variables were not read.");
+    Require(io::ReadDataSet(casePath)->GetNumberOfCells() == 1,
+            "Direct EnSight Gold descriptor read bypassed native enumeration.");
+}
+
+void ValidateTransientEnSight(const fs::path& source) {
+    Require(io::IsSupportedDataSource(source),
+            "Transient EnSight Gold source or directory was not recognized.");
+    const std::vector<io::DataSetFrame> frames =
+        io::EnumerateDataSetFrames(source, 7.0);
+    Require(frames.size() == streamcenterplus::test::kEnSightGoldTimes.size(),
+            "Static geometry and transient variable time sets must expose three frames.");
+    const std::array<const char*, 3> components = {
+        "x_velocity", "y_velocity", "z_velocity"};
+    for (std::size_t frame = 0; frame < frames.size(); ++frame) {
+        const io::DataSetFrame& sourceFrame = frames[frame];
+        Require(sourceFrame.kind == io::DataSetFrameKind::EnSightGoldTimeStep &&
+                    sourceFrame.readerTime.has_value() &&
+                    sourceFrame.sourceIndex == static_cast<int>(frame) &&
+                    NearlyEqual(sourceFrame.time,
+                                streamcenterplus::test::kEnSightGoldTimes[frame],
+                                1.0e-7) &&
+                    sourceFrame.time == *sourceFrame.readerTime,
+                "EnSight Gold native frame time or source index was replaced.");
+        vtkSmartPointer<vtkDataSet> data = io::ReadDataSet(sourceFrame);
+        Require(data != nullptr && data->GetNumberOfPoints() == 8 &&
+                    data->GetNumberOfCells() == 1,
+                "One-step EnSight geometry was not retained for every variable frame.");
+        vtkDataArray* pressure = data->GetPointData()->GetArray("pressure");
+        vtkDataArray* velocity = data->GetPointData()->GetArray("velocity");
+        Require(pressure != nullptr && pressure->GetNumberOfComponents() == 1 &&
+                    pressure->GetNumberOfTuples() == 8 && velocity != nullptr &&
+                    velocity->GetNumberOfComponents() == 3 &&
+                    velocity->GetNumberOfTuples() == 8,
+                "Transient Fluent pressure/velocity arrays are incomplete.");
+        for (vtkIdType pointIndex = 0; pointIndex < 8; ++pointIndex) {
+            const auto& expectedPoint = streamcenterplus::test::kEnSightGoldPoints[
+                static_cast<std::size_t>(pointIndex)];
+            double actualPoint[3] = {};
+            data->GetPoint(pointIndex, actualPoint);
+            Require(NearlyEqual(pressure->GetComponent(pointIndex, 0),
+                                10.0 * frame + expectedPoint[0] +
+                                    2.0 * expectedPoint[1] + 3.0 * expectedPoint[2]),
+                    "EnSight transient pressure did not advance with the native frame.");
+            for (std::size_t component = 0; component < 3; ++component) {
+                vtkDataArray* scalar = data->GetPointData()->GetArray(components[component]);
+                const double expected =
+                    100.0 * frame + 10.0 * component + expectedPoint[component];
+                Require(NearlyEqual(actualPoint[component], expectedPoint[component]) &&
+                            NearlyEqual(velocity->GetComponent(
+                                            pointIndex, static_cast<int>(component)), expected) &&
+                            scalar != nullptr && scalar->GetNumberOfComponents() == 1 &&
+                            scalar->GetNumberOfTuples() == 8 &&
+                            NearlyEqual(scalar->GetComponent(pointIndex, 0), expected),
+                        "EnSight geometry or scalar/vector velocity values are incorrect.");
+            }
+        }
+    }
+}
+
+void ValidateEnSightDescriptorVariants(const fs::path& root) {
+    const fs::path staticCase = CreateEnSightFixture(root);
+    ValidateEnSight(staticCase);
+    const fs::path staticEncas = staticCase.parent_path() / "tiny.ENCAS";
+    fs::copy_file(staticCase, staticEncas);
+    ValidateEnSight(staticEncas);
+
+    const fs::path onlyEncas =
+        streamcenterplus::test::CreateTransientEnSightGoldFixture(root / "only-encas");
+    ValidateTransientEnSight(onlyEncas);
+    ValidateTransientEnSight(onlyEncas.parent_path());
+    const fs::path mixedDirectory = root / "mixed-ensight";
+    const fs::path casePath = streamcenterplus::test::CreateTransientEnSightGoldFixture(
+        mixedDirectory, "region0.CaSe");
+    const fs::path encasPath = streamcenterplus::test::CreateTransientEnSightGoldFixture(
+        mixedDirectory, "region1.EnCaS");
+    ValidateTransientEnSight(casePath);
+    ValidateTransientEnSight(encasPath);
+    Require(io::IsSupportedDataSource(mixedDirectory),
+            "Mixed CASE/ENCAS directory was not recognized.");
+    const std::vector<io::DataSetFrame> mixed =
+        io::EnumerateDataSetFrames(mixedDirectory, 7.0);
+    Require(mixed.size() == 6,
+            "Mixed CASE/ENCAS directory must enumerate both native sequences.");
+    for (std::size_t index = 0; index < mixed.size(); ++index) {
+        Require(mixed[index].path.filename() ==
+                    (index < 3 ? casePath.filename() : encasPath.filename()) &&
+                    mixed[index].sourceIndex == static_cast<int>(index % 3) &&
+                    mixed[index].readerTime.has_value() &&
+                    NearlyEqual(mixed[index].time,
+                                streamcenterplus::test::kEnSightGoldTimes[index % 3],
+                                1.0e-7),
+                "Mixed EnSight descriptor order or native times were changed.");
+    }
+}
+
+void ValidateEnSightPartSelection(const fs::path& root) {
+    streamcenterplus::test::EnSightGoldFixtureOptions options;
+    options.includeBoundaryPart = true;
+    const fs::path volumeAndBoundary =
+        streamcenterplus::test::CreateTransientEnSightGoldFixture(
+            root / "ensight-volume-boundary", "region.encas", options);
+    ValidateTransientEnSight(volumeAndBoundary);
+    vtkSmartPointer<vtkDataSet> volume = io::ReadDataSet(volumeAndBoundary);
+    vtkDataArray* sourceIds = volume->GetCellData()->GetArray("SCP_SourceBlockId");
+    Require(sourceIds != nullptr && sourceIds->GetComponent(0, 0) == 1.0,
+            "EnSight volume assembly did not retain the original nonempty part ordinal.");
+    io::ReadOptions allParts;
+    allParts.includeEnSightBoundaryParts = true;
+    vtkSmartPointer<vtkDataSet> combined = io::ReadDataSet(volumeAndBoundary, allParts);
+    Require(combined->GetNumberOfPoints() == 16 && combined->GetNumberOfCells() == 2 &&
+                combined->GetCellType(0) == VTK_QUAD &&
+                combined->GetCellType(1) == VTK_HEXAHEDRON,
+            "Explicit EnSight boundary inclusion must preserve the mixed source parts.");
+    io::ReadOptions noSourceIds;
+    noSourceIds.attachSourceBlockIds = false;
+    Require(io::ReadDataSet(volumeAndBoundary, noSourceIds)->GetCellData()->GetArray(
+                "SCP_SourceBlockId") == nullptr,
+            "EnSight import options unexpectedly added a source-block array.");
+
+    options.volumePartCount = 0;
+    const fs::path surfaceOnly =
+        streamcenterplus::test::CreateTransientEnSightGoldFixture(
+            root / "ensight-surface-only", "region.case", options);
+    ValidateTransientEnSight(surfaceOnly);
+    Require(io::ReadDataSet(surfaceOnly)->GetCellType(0) == VTK_QUAD,
+            "Pure two-dimensional EnSight sources must remain readable.");
+
+    options.volumePartCount = 2;
+    const fs::path multipleVolumes =
+        streamcenterplus::test::CreateTransientEnSightGoldFixture(
+            root / "ensight-multiple-volumes", "region.EnCaS", options);
+    vtkSmartPointer<vtkDataSet> volumes = io::ReadDataSet(multipleVolumes);
+    sourceIds = volumes->GetCellData()->GetArray("SCP_SourceBlockId");
+    Require(volumes->GetNumberOfPoints() == 16 && volumes->GetNumberOfCells() == 2 &&
+                sourceIds != nullptr && sourceIds->GetComponent(0, 0) == 1.0 &&
+                sourceIds->GetComponent(1, 0) == 2.0,
+            "EnSight must assemble every volume part without merging point boundaries.");
+
+    options.volumePartCount = 1;
+    options.mixBoundaryCellIntoVolume = true;
+    const fs::path mixedCells = streamcenterplus::test::CreateTransientEnSightGoldFixture(
+        root / "ensight-mixed-cell-dimensions", "region.encas", options);
+    vtkSmartPointer<vtkDataSet> mixed = io::ReadDataSet(mixedCells);
+    Require(mixed->GetNumberOfPoints() == 8 && mixed->GetNumberOfCells() == 2 &&
+                mixed->GetCellType(0) == VTK_QUAD &&
+                mixed->GetCellType(1) == VTK_HEXAHEDRON,
+            "EnSight part dimensionality must inspect every cell type and retain mixed parts.");
+}
+
+void ValidateEnSightTimeProvenance(const fs::path& root) {
+    Require(NearlyEqual(streamcenterplus::ensight_time::DecimalTimeQuantum(
+                            {"0", "4.25700E+00"}), 1.0e-5) &&
+                streamcenterplus::ensight_time::DecimalTimeQuantum({"4.2junk"}) == 0.0,
+            "EnSight decimal quantum must use the finest valid source token precision.");
+    const fs::path descriptor =
+        streamcenterplus::test::CreateQuantizedEnSightGoldFixture(root / "quantized-encas");
+    const auto frames = io::EnumerateDataSetFrames(descriptor);
+    const double expectedDt = (4.26401 - 4.25700) / 7.0;
+    Require(frames.size() == 8 && frames.front().time == 4.25700 &&
+                frames[2].time == 4.25901 && frames.back().time == 4.26401 &&
+                frames.front().readerTime == frames.front().time,
+            "Native EnSight enumeration rounded decimal times or added the static geometry time.");
+    const auto interval = io::ValidatedEnSightTimeStep(frames);
+    Require(interval.has_value() && NearlyEqual(*interval, expectedDt) &&
+                frames.front().ensightTime.has_value() &&
+                NearlyEqual(frames.front().ensightTime->quantum, 1.0e-5),
+            "Native EnSight decimal precision was not validated on its complete source axis.");
+    Require(io::ValidatedEnSightTimeStep({frames[3]}) == interval &&
+                io::ValidatedEnSightTimeStep({frames[2], frames[3]}) == interval,
+            "EnSight one/two-frame selection changed the validated full-axis physical dt.");
+    const auto strided = io::ValidatedEnSightTimeStep({frames[1], frames[3], frames[5]});
+    Require(strided.has_value() && NearlyEqual(*strided, 2.0 * expectedDt) &&
+                !io::ValidatedEnSightTimeStep({frames[0], frames[1], frames[3]}).has_value(),
+            "EnSight provenance did not distinguish a regular stride from an irregular selection.");
+    auto tampered = frames;
+    tampered[2].time += 0.0001;
+    Require(!io::ValidatedEnSightTimeStep(tampered).has_value(),
+            "EnSight provenance accepted times outside the original validated axis.");
+    Require(!streamcenterplus::ensight_time::AssessTimeAxis({0.0, 0.001, 0.0021}, 1.0e-5).valid &&
+                !streamcenterplus::ensight_time::AssessTimeAxis({0.0, 0.001, 0.00201}, 0.001).valid,
+            "EnSight time policy accepted genuinely irregular/coarsely quantized sampling.");
+    const std::string spoof =
+        "<VTKFile type=\"Collection\" note=\" streamcenterplus_ensight_time_quantum='0.00001' \">";
+    Require(!streamcenterplus::ensight_time::PvdTimeQuantum(spoof).has_value() &&
+                streamcenterplus::ensight_time::PvdTimeQuantum(
+                    "<!-- <VTKFile streamcenterplus_ensight_time_quantum='1'/> -->"
+                    "<VTKFile note='>' streamcenterplus_ensight_time_quantum='0.00001'>") ==
+                    std::optional<double>(0.00001),
+            "PVD time provenance parser accepted quoted/commented spoofing or truncated a quoted root.");
+    vtkSmartPointer<vtkDataSet> last = io::ReadDataSet(frames.back());
+    Require(last->GetPointData()->GetArray("pressure")->GetComponent(0, 0) == 70.0,
+            "EnSight decimal reader time did not select the last transient variable file.");
+}
+
+void ValidateEnSightHdfMetadataContract(const fs::path& root) {
+    const fs::path directory = root / "hdf-time-contract";
+    fs::create_directories(directory);
+    for (const std::string kind : {"float64", "float32", "vector", "string"}) {
+        const fs::path path = directory / (kind + ".vtkhdf");
+        const hid_t file = H5Fcreate(path.generic_string().c_str(), H5F_ACC_TRUNC,
+                                     H5P_DEFAULT, H5P_DEFAULT);
+        Require(file >= 0, "Cannot create HDF time-metadata contract fixture.");
+        const hid_t group = H5Gcreate2(file, "/VTKHDF", H5P_DEFAULT,
+                                       H5P_DEFAULT, H5P_DEFAULT);
+        const hsize_t one = 1;
+        const hid_t space = kind == "vector" ? H5Screate_simple(1, &one, nullptr)
+                                               : H5Screate(H5S_SCALAR);
+        hid_t type = kind == "float32" ? H5Tcopy(H5T_IEEE_F32LE)
+                                        : kind == "string" ? H5Tcopy(H5T_C_S1)
+                                                           : H5Tcopy(H5T_IEEE_F64LE);
+        if (kind == "string") {
+            H5Tset_size(type, 8);
+        }
+        const hid_t attribute = H5Acreate2(group,
+            streamcenterplus::ensight_time::kTimeQuantumAttribute,
+            type, space, H5P_DEFAULT, H5P_DEFAULT);
+        const double quantum = 1.0e-5;
+        const char text[8] = "0.00001";
+        Require(attribute >= 0 && H5Awrite(attribute,
+                    kind == "string" ? type : H5T_NATIVE_DOUBLE,
+                    kind == "string" ? static_cast<const void*>(text)
+                                       : static_cast<const void*>(&quantum)) >= 0,
+                "Cannot write HDF time-metadata contract fixture.");
+        H5Aclose(attribute);
+        H5Tclose(type);
+        H5Sclose(space);
+        H5Gclose(group);
+        H5Fclose(file);
+        bool rejected = false;
+        std::optional<double> read;
+        try {
+            read = streamcenterplus::vtkhdf::EnSightTimeQuantum(path);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        Require(rejected == (kind != "float64"),
+                "HDF time provenance must accept only a scalar float64 attribute: " + kind);
+        if (!rejected) {
+            Require(read.has_value() && *read == quantum,
+                    "Scalar float64 HDF time quantum was changed.");
+        }
+    }
 }
 
 void WriteFoamHeader(std::ofstream& file,
@@ -1416,7 +1663,10 @@ int main() {
         ValidateCurvedNekMetrics();
         ValidateConservativeCurvedNekBounds();
         ValidateCellFreeElementBvh();
-        ValidateEnSight(CreateEnSightFixture(root));
+        ValidateEnSightDescriptorVariants(root);
+        ValidateEnSightPartSelection(root);
+        ValidateEnSightTimeProvenance(root);
+        ValidateEnSightHdfMetadataContract(root);
         ValidateOpenFoam(CreateOpenFoamFixture(root));
         std::cout << "Native reader tests passed: Nek5000, EnSight Gold, OpenFOAM.\n";
         return 0;

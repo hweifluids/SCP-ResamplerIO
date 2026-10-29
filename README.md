@@ -28,6 +28,10 @@ the manifest are published through same-directory temporary files and atomic
 replacement.
 
 Kriging uses a dense local system and therefore accepts at most 1024 neighbors.
+The Resample CLI requests the machine's active logical processor count from
+VTK's available parallel SMP backend. If hardware or the VTK build exposes a
+smaller worker pool, it reports that limit and proceeds with the available
+workers. This changes throughput without changing resampling correctness.
 PVD `file` attributes are XML-entity decoded, explicit `timestep` values must
 be complete finite numbers, comments/CDATA are not treated as collection
 entries, and recursive PVD references are rejected. When a normal frame
@@ -37,13 +41,66 @@ Directories containing multiple PVD collections must select one explicitly.
 
 ## Format boundary
 
-- **VTK:** scans legacy/XML VTK datasets, PVD collections, and VTKHDF time steps. The resampler accepts VTK datasets and writes uniform `vtkImageData` frames as VTI plus a PVD collection.
+- **VTK:** scans legacy/XML VTK datasets, PVD collections, and VTKHDF time steps. PVD entries can reference `.vtm` multi-block frames; Resample uses the shared composite reader to append their blocks while retaining separate point boundaries and common fields. Generic VTM volume and boundary blocks remain present; the EnSight-specific volume-part selection applies only to direct EnSight reads. The resampler writes uniform `vtkImageData` frames as VTI plus a PVD collection.
 - **Tecplot:** accepts ASCII `.dat` and classic binary `.plt` sources, including `ORDERED` zones (loaded as `vtkStructuredGrid`), fixed finite-element line, triangle, quadrilateral, tetrahedron, and brick zones, plus face-based `FEPOLYGON` and `FEPOLYHEDRON` zones (loaded as VTK polygon/polyhedron cells). Each file is exposed through the same single-file frame API used by the raw solvers and can be passed directly to the Resample tool or `FlowDataInspector::scanFolder`; folders are ordered as normal frame series. Classic `.plt` supports its documented v112/v191 layouts, byte order, nodal/cell variables, shared variables/connectivity, and shared face maps. Tecplot subzone `.szplt` and solution-only `.plt` files are intentionally not supported.
 - **Nek5000:** accepts `.nek5000` and `.nek` descriptors and reads the referenced `#std` field files directly, without an intermediate VTU. Standard `visnek` file templates with one, two, or three integer conversions are supported, including multi-output-directory layouts such as `A%01d/case%01d.f%05d`. The reader supports 4/8-byte words, either endian, 2-D/3-D and anisotropic GLL dimensions, multi-file element maps, mesh-bearing or mesh-reusing frames, velocity, pressure, temperature, and passive scalars. Header dimensions, element/file counts, offsets, file extent, and all allocation arithmetic are checked before allocation; explicit resource ceilings reject unreasonable headers while retaining the fixed large integration corpus. Sparse positive global element IDs are supported and duplicates are rejected across pieces. Values remain element-local `double` GLL nodal values; coincident interface nodes are intentionally not merged, and elements are returned in canonical global-ID order across pieces and frames. The output can carry reference GLL weights, the signed mapping Jacobian, physical quadrature weights `w_r w_s w_t |J|`, global spectral-element IDs, and tensor dimensions. `ComputeNek5000SpectralGradient` differentiates in reference space with the GLL derivative matrices and transforms with the inverse physical Jacobian (or the 2-D tangent metric). `Nek5000SpectralPointEvaluator` inverts the curved element mapping with Newton iteration and evaluates the tensor-product GLL polynomial. Its BVH uses conservative bounds for the complete high-order mapping, including curved regions outside the GLL-node box; `bounds()` exposes the resulting global physical box. The Resample solver automatically uses this spectral interpolation path for Nek data instead of interpolating the visualization-only linear subcells.
 - **OpenFOAM:** opens reconstructed or decomposed cases and their native time sequence directly through `vtkPOpenFOAMReader`; only the internal volume mesh is assembled for analysis.
-- **EnSight Gold:** opens ASCII or binary Gold `.case` sources and their native time sequence directly through `vtkGenericEnSightReader`.
+- **EnSight Gold:** opens ASCII or binary Gold `.case` and Fluent `.encas` descriptors and their native time sequence directly through `vtkGenericEnSightReader`. Extensions are case-insensitive. Single descriptors, directories containing only `.encas`, and mixed `.case`/`.encas` frame directories use the same native enumeration path. A one-step geometry time set can be shared by transient variable time sets; source timestamps, including nonuniform times, are retained.
 
 Nek5000 parsing and spectral-element numerics are implemented in this module. EnSight Gold and OpenFOAM parsing use the corresponding readers from the pinned VTK dependency. Composite parts are retained as separate point sets while being assembled, and `SCP_SourceBlockId` records their source block.
+
+For EnSight sources containing three-dimensional volume parts together with
+separate boundary parts, analysis and GUI conversion assemble the volume parts.
+A part is identified by the maximum dimension of all of its cell types, rather
+than its VTK class or its first cell. Every volume part is retained with separate
+point boundaries; a pure surface source retains every part. Cells of different
+dimensions within one retained part remain together. C++ consumers that need all
+original parts can set `ReadOptions::includeEnSightBoundaryParts=true`.
+`CollapseEnSightGoldDataObject` exposes this assembly rule to import/conversion
+consumers; `attachSourceBlockIds=false` suppresses the diagnostic array.
+
+All current unstructured/raw solvers use `SCP::ResamplerReaders`: FTLE, FSLE,
+DFT, DMD, fdSPOD, tdSPOD, TOD, KPOD, mPOD, WaveletPOD, MD, Liutex, and VORT.
+Their descriptor and directory inputs inherit the EnSight support above.
+Structured solvers, including LWHA, consume the structured VTI/PVD sequence
+produced by the Resample tool or GUI conversion.
+
+EnSight decimal export times remain their original double values; native
+enumeration reads the primary volume time set rather than VTK's pipeline time-set
+union. A separate one-step geometry time set does not add a variable frame.
+When the complete axis fails the ordinary uniform-time test, its declared
+decimal resolution can establish approximately uniform sampling: the finest
+token quantum must be at most 1.1% of the endpoint-derived interval, every
+timestamp must lie within one quantum of that axis, and neighboring intervals
+within two quanta. This rule is shared with GUI import through the Qt-free
+`streamcenterplus/EnSightTimePolicy.h` SDK header.
+
+Only a complete axis that passes this bounded fallback receives
+`DataSetFrame::ensightTime` provenance. It records the full source origin,
+interval, quantum, frame count, and ordinal, so contiguous or regular-stride
+selections retain the validated interval (multiplied by the stride) without
+changing any timestamp. RAW DFT, mPOD, and TOD and structured DFT use this
+provenance for their time checks; configured `physical_dt`/`F_S` must still match
+the effective interval. Other formats keep their established strict checks.
+
+GUI/Python conversion and Resample write
+`streamcenterplus_ensight_time_quantum` on a PVD `VTKFile` root or, for the Python
+VTKHDF converter, as a scalar float64 attribute on `/VTKHDF`. Readers validate
+the entire stored time axis before adopting that marker. A marker on an already
+strict axis, an excessive quantum, or invalid HDF attribute shape/type is
+rejected. Resample carries provenance through its input identity and output PVD;
+its final selected axis is checked again, and one/two-frame or otherwise strict
+outputs omit the marker. PVD `timestep` and VTKHDF `Steps/Values` retain source
+times throughout.
+
+The complete solver regression can be run after `SCPResamplerIO.SafetyRegression`
+with `tests/EnSightSolverSmoke.py`. Pass `--raw-dft`, `--raw-mpod`, `--raw-tod`,
+and `--structured-dft` executable paths, the generated `quantized-encas` fixture
+directory as `--fixture-root`, its resampled `quantized-output/quantized.pvd` as
+`--structured-input`, and a repository-root `.tests/...` output directory as
+`--output-root`. It executes complete small jobs, wrong-dt controls, and
+unmarked nonuniform-PVD controls and saves each process output plus a JSON
+summary below that output directory.
 
 ### Two-zone `.scpm` manifests
 

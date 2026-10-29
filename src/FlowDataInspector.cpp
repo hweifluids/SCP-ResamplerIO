@@ -3,6 +3,7 @@
 #include "streamcenterplus_resample/Core.h"
 
 #include <streamcenterplus/io/DataSetReader.h>
+#include <streamcenterplus/EnSightTimePolicy.h>
 #include <streamcenterplus/VtkHdfIO.h>
 
 #include <vtkAbstractArray.h>
@@ -64,9 +65,141 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <bcrypt.h>
 #endif
 
 namespace {
+
+class StreamingFileSha256 {
+public:
+    explicit StreamingFileSha256(QString sourcePath)
+        : sourcePath_(std::move(sourcePath)), fallback_(QCryptographicHash::Sha256) {
+#ifdef Q_OS_WIN
+        // The bundled Qt backend hashes large files in software. CNG keeps
+        // exactly the same streaming SHA-256 contract with the platform's
+        // accelerated implementation. Fall back only before any bytes enter
+        // the native hash; a later backend failure must reject the operation.
+        if (BCryptOpenAlgorithmProvider(&algorithm_, BCRYPT_SHA256_ALGORITHM,
+                                         nullptr, 0) < 0) {
+            return;
+        }
+        DWORD objectBytes = 0;
+        DWORD digestBytes = 0;
+        DWORD returnedBytes = 0;
+        if (BCryptGetProperty(algorithm_, BCRYPT_OBJECT_LENGTH,
+                              reinterpret_cast<PUCHAR>(&objectBytes), sizeof(objectBytes),
+                              &returnedBytes, 0) < 0
+            || BCryptGetProperty(algorithm_, BCRYPT_HASH_LENGTH,
+                                 reinterpret_cast<PUCHAR>(&digestBytes), sizeof(digestBytes),
+                                 &returnedBytes, 0) < 0
+            || objectBytes == 0 || objectBytes > 1024 * 1024 || digestBytes != 32) {
+            releaseNative();
+            return;
+        }
+        nativeObject_.resize(static_cast<qsizetype>(objectBytes));
+        if (BCryptCreateHash(algorithm_, &nativeHash_,
+                             reinterpret_cast<PUCHAR>(nativeObject_.data()), objectBytes,
+                             nullptr, 0, 0) < 0) {
+            releaseNative();
+            return;
+        }
+        useNative_ = true;
+#endif
+    }
+
+    ~StreamingFileSha256() {
+#ifdef Q_OS_WIN
+        releaseNative();
+#endif
+    }
+
+    StreamingFileSha256(const StreamingFileSha256&) = delete;
+    StreamingFileSha256& operator=(const StreamingFileSha256&) = delete;
+
+    bool addData(const QByteArray& bytes, QString* errorMessage) {
+        if (!failure_.isEmpty()) {
+            return reportFailure(errorMessage);
+        }
+#ifdef Q_OS_WIN
+        if (useNative_) {
+            const char* cursor = bytes.constData();
+            qsizetype remaining = bytes.size();
+            while (remaining > 0) {
+                const ULONG count = static_cast<ULONG>(std::min<quint64>(
+                    static_cast<quint64>(remaining), std::numeric_limits<ULONG>::max()));
+                const NTSTATUS status = BCryptHashData(nativeHash_,
+                    reinterpret_cast<PUCHAR>(const_cast<char*>(cursor)), count, 0);
+                if (status < 0) {
+                    failure_ = QStringLiteral("SHA-256 update failed for %1 (CNG status 0x%2).")
+                                   .arg(sourcePath_, QString::number(static_cast<quint32>(status), 16));
+                    return reportFailure(errorMessage);
+                }
+                cursor += count;
+                remaining -= count;
+            }
+            return true;
+        }
+#endif
+        fallback_.addData(bytes);
+        return true;
+    }
+
+    bool result(QByteArray* digest, QString* errorMessage) {
+        if (!failure_.isEmpty()) {
+            return reportFailure(errorMessage);
+        }
+#ifdef Q_OS_WIN
+        if (useNative_) {
+            digest->resize(32);
+            const NTSTATUS status = BCryptFinishHash(nativeHash_,
+                reinterpret_cast<PUCHAR>(digest->data()), static_cast<ULONG>(digest->size()), 0);
+            if (status < 0) {
+                digest->clear();
+                failure_ = QStringLiteral("SHA-256 finalization failed for %1 (CNG status 0x%2).")
+                               .arg(sourcePath_, QString::number(static_cast<quint32>(status), 16));
+                return reportFailure(errorMessage);
+            }
+            return true;
+        }
+#endif
+        *digest = fallback_.result();
+        if (digest->size() != 32) {
+            digest->clear();
+            failure_ = QStringLiteral("SHA-256 finalization failed for %1.").arg(sourcePath_);
+            return reportFailure(errorMessage);
+        }
+        return true;
+    }
+
+private:
+    bool reportFailure(QString* errorMessage) const {
+        if (errorMessage != nullptr) {
+            *errorMessage = failure_;
+        }
+        return false;
+    }
+
+#ifdef Q_OS_WIN
+    void releaseNative() {
+        if (nativeHash_ != nullptr) {
+            BCryptDestroyHash(nativeHash_);
+            nativeHash_ = nullptr;
+        }
+        if (algorithm_ != nullptr) {
+            BCryptCloseAlgorithmProvider(algorithm_, 0);
+            algorithm_ = nullptr;
+        }
+    }
+
+    BCRYPT_ALG_HANDLE algorithm_ = nullptr;
+    BCRYPT_HASH_HANDLE nativeHash_ = nullptr;
+    QByteArray nativeObject_;
+    bool useNative_ = false;
+#endif
+    QString sourcePath_;
+    QString failure_;
+    QCryptographicHash fallback_;
+};
 
 bool isFileSystemReparsePoint(const QString& path) {
 #ifdef Q_OS_WIN
@@ -503,6 +636,11 @@ vtkSmartPointer<vtkDataSet> readOpenFoamVolumeAtTime(vtkOpenFOAMReader* reader,
     return extractOpenFoamVolume(output, errorMessage);
 }
 
+bool isEnSightGoldCaseSuffix(const QString& suffix) {
+    return suffix.compare(QStringLiteral("case"), Qt::CaseInsensitive) == 0
+        || suffix.compare(QStringLiteral("encas"), Qt::CaseInsensitive) == 0;
+}
+
 bool prepareEnSightGoldReader(vtkGenericEnSightReader* reader,
                               const QString& casePath,
                               QString* errorMessage) {
@@ -521,9 +659,9 @@ bool prepareEnSightGoldReader(vtkGenericEnSightReader* reader,
         }
         return false;
     }
-    if (caseInfo.suffix().compare(QStringLiteral("case"), Qt::CaseInsensitive) != 0) {
+    if (!isEnSightGoldCaseSuffix(caseInfo.suffix())) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("EnSight Gold import expects a *.case file.");
+            *errorMessage = QStringLiteral("EnSight Gold import expects a *.case or *.encas file.");
         }
         return false;
     }
@@ -537,7 +675,7 @@ bool prepareEnSightGoldReader(vtkGenericEnSightReader* reader,
     if (version != vtkGenericEnSightReader::ENSIGHT_GOLD
         && version != vtkGenericEnSightReader::ENSIGHT_GOLD_BINARY) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("The selected *.case file is not an EnSight Gold case.");
+            *errorMessage = QStringLiteral("The selected file is not an EnSight Gold case.");
         }
         return false;
     }
@@ -617,66 +755,79 @@ double inferredTimeInterval(const QVector<double>& timeValues) {
     return positiveSteps.at(positiveSteps.size() / 2);
 }
 
-bool uniformTimeInterval(const QVector<double>& timeValues,
+const QString kEnSightTimeQuantumAttribute =
+    QString::fromLatin1(streamcenterplus::ensight_time::kTimeQuantumAttribute);
+
+void appendScanWarning(QString* warning, const QString& message) {
+    QString combined = *warning;
+    if (!warning->isEmpty()) {
+        combined += QLatin1Char(' ');
+    }
+    combined += message;
+    // Scan responses deliberately reject C0 controls. Keep readable sentence
+    // boundaries when combining warnings, including legacy multiline text.
+    for (QChar& character : combined) {
+        if (character.unicode() < 0x20) {
+            character = QLatin1Char(' ');
+        }
+    }
+    *warning = combined.simplified();
+}
+
+bool enSightTimeInterval(const QVector<double>& timeValues,
+                         double declaredQuantum,
                          double* interval,
-                         QString* errorMessage) {
-    if (interval == nullptr) {
-        return false;
-    }
-    if (timeValues.size() <= 1) {
-        *interval = 1.0;
-        return true;
-    }
-    const double firstStep = timeValues.at(1) - timeValues.at(0);
-    if (!std::isfinite(firstStep) || firstStep <= 0.0) {
+                         bool* approximate,
+                         QString* warningMessage,
+                         QString* errorMessage,
+                         const QString& axisLabel = QStringLiteral("EnSight")) {
+    const std::vector<double> nativeTimes(timeValues.cbegin(), timeValues.cend());
+    const auto assessment = streamcenterplus::ensight_time::AssessTimeAxis(
+        nativeTimes, declaredQuantum);
+    *approximate = assessment.approximate;
+    if (!assessment.valid) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("EnSight timesteps must be finite and strictly increasing.");
+            const bool increasing = std::adjacent_find(
+                nativeTimes.cbegin(), nativeTimes.cend(),
+                [](double previous, double current) {
+                    return !std::isfinite(previous) || !std::isfinite(current)
+                        || !(current > previous);
+                }) == nativeTimes.cend();
+            *errorMessage = increasing
+                ? QStringLiteral("%1 uses a non-uniform time axis that cannot be represented by one dt value.")
+                      .arg(axisLabel)
+                : QStringLiteral("%1 timesteps must be finite and strictly increasing.")
+                      .arg(axisLabel);
         }
         return false;
     }
-    for (qsizetype index = 2; index < timeValues.size(); ++index) {
-        const double current = timeValues.at(index);
-        const double previous = timeValues.at(index - 1);
-        const double expected = std::fma(static_cast<double>(index),
-                                         firstStep, timeValues.first());
-        const double magnitude = std::max(std::abs(current), std::abs(expected));
-        const double tolerance = std::abs(firstStep)
-                * static_cast<double>(index) * 1.0e-10
-            + std::numeric_limits<double>::epsilon() * magnitude * 8.0
-            + std::numeric_limits<double>::denorm_min() * 16.0;
-        if (!std::isfinite(current) || !(current > previous)
-            || !std::isfinite(expected)
-            || std::abs(current - expected) > tolerance) {
-            if (errorMessage != nullptr) {
-                *errorMessage = QStringLiteral("EnSight uses a non-uniform time axis that cannot be represented by one dt value.");
-            }
-            return false;
-        }
+    *interval = assessment.interval;
+    if (assessment.approximate && warningMessage != nullptr) {
+        appendScanWarning(warningMessage, QStringLiteral(
+            "%1 uses an approximately uniform time axis within its declared decimal export resolution %2. "
+            "The effective dt is %3 (maximum timestamp residual %4). Original frame times are preserved; no temporal interpolation was performed.")
+            .arg(axisLabel, formatMachineDouble(declaredQuantum),
+                 formatMachineDouble(assessment.interval),
+                 formatMachineDouble(assessment.maximumResidual)));
     }
-    *interval = firstStep;
     return true;
 }
 
 vtkSmartPointer<vtkDataSet> extractEnSightGoldVolume(vtkDataObject* output, QString* errorMessage) {
-    QList<vtkSmartPointer<vtkDataSet>> dataSets;
-    collectVolumeDataSets(output, &dataSets);
-    if (dataSets.isEmpty()) {
+    streamcenterplus::io::ReadOptions options;
+    options.attachSourceBlockIds = false;
+    vtkSmartPointer<vtkDataSet> retained;
+    try {
+        retained = streamcenterplus::io::CollapseEnSightGoldDataObject(output, options);
+    } catch (const std::exception& error) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("The EnSight Gold reader did not produce any volume dataset.");
+            *errorMessage = QStringLiteral("Cannot assemble the EnSight Gold volume parts: %1")
+                                .arg(QString::fromLocal8Bit(error.what()));
         }
         return nullptr;
     }
-
-    auto append = vtkSmartPointer<vtkAppendFilter>::New();
-    append->MergePointsOn();
-    for (const vtkSmartPointer<vtkDataSet>& dataSet : std::as_const(dataSets)) {
-        append->AddInputData(dataSet);
-    }
-    append->Update();
-
-    auto retained = vtkSmartPointer<vtkUnstructuredGrid>::New();
-    retained->ShallowCopy(append->GetOutput());
-    if (retained->GetNumberOfPoints() <= 0 || retained->GetNumberOfCells() <= 0) {
+    if (retained == nullptr || retained->GetNumberOfPoints() <= 0
+        || retained->GetNumberOfCells() <= 0) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("The EnSight Gold volume dataset is empty.");
         }
@@ -739,7 +890,8 @@ bool writeUnstructuredFrame(vtkDataSet* dataSet, const QString& filePath, QStrin
 bool writePvdFile(const QString& pvdPath,
                   const QVector<double>& timeValues,
                   const QStringList& relativeFramePaths,
-                  QString* errorMessage) {
+                  QString* errorMessage,
+                  double enSightTimeQuantum = 0.0) {
     if (timeValues.size() != relativeFramePaths.size() || timeValues.isEmpty()) {
         if (errorMessage != nullptr) {
             *errorMessage = QStringLiteral("Internal error: inconsistent PVD frame list.");
@@ -761,6 +913,10 @@ bool writePvdFile(const QString& pvdPath,
     xml.writeAttribute(QStringLiteral("type"), QStringLiteral("Collection"));
     xml.writeAttribute(QStringLiteral("version"), QStringLiteral("0.1"));
     xml.writeAttribute(QStringLiteral("byte_order"), QStringLiteral("LittleEndian"));
+    if (enSightTimeQuantum > 0.0) {
+        xml.writeAttribute(kEnSightTimeQuantumAttribute,
+                           formatMachineDouble(enSightTimeQuantum));
+    }
     xml.writeStartElement(QStringLiteral("Collection"));
     for (int index = 0; index < timeValues.size(); ++index) {
         xml.writeEmptyElement(QStringLiteral("DataSet"));
@@ -1891,12 +2047,6 @@ bool sameSourcePath(const QString& lhs, const QString& rhs) {
                                             fileSystemPathCaseSensitivity()) == 0;
 }
 
-bool containsSourcePath(const QStringList& paths, const QString& candidate) {
-    return std::any_of(paths.cbegin(), paths.cend(), [&](const QString& path) {
-        return sameSourcePath(path, candidate);
-    });
-}
-
 QString sourcePathIdentityKey(const QString& path) {
     const QString identity = sourcePathIdentity(path);
     return fileSystemPathCaseSensitivity() == Qt::CaseInsensitive
@@ -1949,7 +2099,7 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
     qint64 aggregatePathBytes = 0;
     if (sources.isEmpty()) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("Select at least one EnSight Gold *.case file or a folder containing *.case files.");
+            *errorMessage = QStringLiteral("Select at least one EnSight Gold *.case or *.encas file, or a folder containing these files.");
         }
         return caseFiles;
     }
@@ -1976,7 +2126,7 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
             QSet<QString> directoryIdentities;
             bool foundCaseEntry = false;
             QDirIterator iterator(info.absoluteFilePath(),
-                                  {QStringLiteral("*.case")},
+                                  {QStringLiteral("*.case"), QStringLiteral("*.encas")},
                                   QDir::Files | QDir::NoDotAndDotDot | QDir::Readable,
                                   QDirIterator::NoIteratorFlags);
             while (iterator.hasNext()) {
@@ -2012,7 +2162,7 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
             }
             if (!foundCaseEntry) {
                 if (errorMessage != nullptr) {
-                    *errorMessage = QString("No EnSight Gold case files (*.case) were found in folder: %1")
+                    *errorMessage = QString("No EnSight Gold case files (*.case, *.encas) were found in folder: %1")
                                         .arg(info.absoluteFilePath());
                 }
                 caseFiles.clear();
@@ -2024,9 +2174,9 @@ QStringList collectEnSightGoldCaseFiles(const QStringList& sources, QString* err
             continue;
         }
 
-        if (!info.isFile() || info.suffix().compare(QStringLiteral("case"), Qt::CaseInsensitive) != 0) {
+        if (!info.isFile() || !isEnSightGoldCaseSuffix(info.suffix())) {
             if (errorMessage != nullptr) {
-                *errorMessage = QString("EnSight Gold import expects *.case files or folders containing *.case files: %1")
+                *errorMessage = QString("EnSight Gold import expects *.case or *.encas files, or folders containing these files: %1")
                                     .arg(source);
             }
             caseFiles.clear();
@@ -2059,6 +2209,7 @@ struct EnSightGoldTimeSet {
     qint64 filenameIncrement = 0;
     QVector<qint64> filenameNumbers;
     QVector<double> timeValues;
+    QStringList timeTokens;
 };
 
 struct EnSightGoldFileChunk {
@@ -2109,6 +2260,7 @@ struct EnSightGoldConstantPerCase {
 struct EnSightGoldCaseSource {
     QString path;
     QVector<double> timeValues;
+    double timeQuantum = 0.0;
     QList<ArrayInfo> arrays;
     QHash<int, EnSightGoldTimeSet> timeSets;
     QHash<int, EnSightGoldFileSet> fileSets;
@@ -2915,18 +3067,29 @@ bool parseEnSightGoldIntegerList(const QString& inlineValues,
     return false;
 }
 
+double enSightGoldDecimalTimeQuantum(const QStringList& tokens) {
+    std::vector<std::string> nativeTokens;
+    nativeTokens.reserve(static_cast<std::size_t>(tokens.size()));
+    for (const QString& token : tokens) {
+        nativeTokens.push_back(token.toStdString());
+    }
+    return streamcenterplus::ensight_time::DecimalTimeQuantum(nativeTokens);
+}
+
 bool parseEnSightGoldDoubleList(const QString& inlineValues,
                                 int expectedCount,
                                 const QVector<EnSightGoldCaseLine>& lines,
                                 int* lineIndex,
                                 QVector<double>* values,
+                                QStringList* originalTokens,
                                 QString* errorMessage,
                                 const QString& label) {
-    if (lineIndex == nullptr || values == nullptr || expectedCount <= 0
+    if (lineIndex == nullptr || values == nullptr || originalTokens == nullptr || expectedCount <= 0
         || expectedCount > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
         return false;
     }
     values->clear();
+    originalTokens->clear();
     QString current = inlineValues;
     while (true) {
         QStringList tokens;
@@ -2956,6 +3119,7 @@ bool parseEnSightGoldDoubleList(const QString& inlineValues,
                 return false;
             }
             values->append(value);
+            originalTokens->append(token);
         }
         if (values->size() == expectedCount) {
             return true;
@@ -3171,6 +3335,9 @@ bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* error
 
     QHash<int, int> fileSetToTimeSet;
     QSet<int> volumeTimeSets;
+    int singleGeometryTimeSet = 0;
+    QSet<QString> referencedPathIdentities;
+    QSet<QString> modelGeometryPathIdentities;
     source->referencedPaths.clear();
     source->modelGeometryPaths.clear();
     for (EnSightGoldReference& reference : source->references) {
@@ -3237,7 +3404,15 @@ bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* error
         if ((reference.role == EnSightGoldReference::Role::ModelGeometry
              || reference.role == EnSightGoldReference::Role::VolumeVariable)
             && reference.timeSetId > 0) {
-            volumeTimeSets.insert(reference.timeSetId);
+            // Fluent binds its fixed mesh to a one-step time set while the
+            // volume variables use the complete transient time set.  That
+            // geometry remains reusable at every variable frame.
+            if (reference.role == EnSightGoldReference::Role::ModelGeometry
+                && timeSet->declaredSteps == 1) {
+                singleGeometryTimeSet = reference.timeSetId;
+            } else {
+                volumeTimeSets.insert(reference.timeSetId);
+            }
         }
 
         reference.resolvedPaths.clear();
@@ -3245,6 +3420,7 @@ bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* error
         reference.expandedPatternNames.clear();
         reference.resolvedPatternPaths.reserve(reference.patterns.size());
         reference.expandedPatternNames.reserve(reference.patterns.size());
+        QSet<QString> referencePathIdentities;
         for (const QString& pattern : std::as_const(reference.patterns)) {
             QStringList expandedPatterns;
             const bool hasWildcard = pattern.contains(QLatin1Char('*'));
@@ -3355,15 +3531,19 @@ bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* error
             patternPaths.reserve(expandedPatterns.size());
             for (const QString& expanded : std::as_const(expandedPatterns)) {
                 const QString path = resolveEnSightGoldReferencedPath(*source, expanded);
+                const QString identity = sourcePathIdentityKey(path);
                 patternPaths.append(path);
-                if (!containsSourcePath(reference.resolvedPaths, path)) {
+                if (!referencePathIdentities.contains(identity)) {
+                    referencePathIdentities.insert(identity);
                     reference.resolvedPaths.append(path);
                 }
-                if (!containsSourcePath(source->referencedPaths, path)) {
+                if (!referencedPathIdentities.contains(identity)) {
+                    referencedPathIdentities.insert(identity);
                     source->referencedPaths.append(path);
                 }
                 if (reference.role == EnSightGoldReference::Role::ModelGeometry
-                    && !containsSourcePath(source->modelGeometryPaths, path)) {
+                    && !modelGeometryPathIdentities.contains(identity)) {
+                    modelGeometryPathIdentities.insert(identity);
                     source->modelGeometryPaths.append(path);
                 }
             }
@@ -3385,10 +3565,18 @@ bool finalizeEnSightGoldCaseSource(EnSightGoldCaseSource* source, QString* error
         }
         return false;
     }
-    if (volumeTimeSets.isEmpty()) {
+    if (volumeTimeSets.isEmpty() && singleGeometryTimeSet > 0) {
+        const EnSightGoldTimeSet& timeSet =
+            source->timeSets.constFind(singleGeometryTimeSet).value();
+        source->timeValues = timeSet.timeValues;
+        source->timeQuantum = enSightGoldDecimalTimeQuantum(timeSet.timeTokens);
+    } else if (volumeTimeSets.isEmpty()) {
         source->timeValues = {0.0};
     } else {
-        source->timeValues = source->timeSets.constFind(*volumeTimeSets.cbegin()).value().timeValues;
+        const EnSightGoldTimeSet& timeSet =
+            source->timeSets.constFind(*volumeTimeSets.cbegin()).value();
+        source->timeValues = timeSet.timeValues;
+        source->timeQuantum = enSightGoldDecimalTimeQuantum(timeSet.timeTokens);
     }
     if (source->timeValues.size() > Streamcenter::FlowDataProtocolLimits::MaximumResultFileCount) {
         if (errorMessage != nullptr) {
@@ -3419,9 +3607,9 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
         }
         return false;
     }
-    if (caseInfo.suffix().compare(QStringLiteral("case"), Qt::CaseInsensitive) != 0) {
+    if (!isEnSightGoldCaseSuffix(caseInfo.suffix())) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("EnSight Gold import expects a *.case file.");
+            *errorMessage = QStringLiteral("EnSight Gold import expects a *.case or *.encas file.");
         }
         return false;
     }
@@ -3676,6 +3864,7 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
                 if (!parseEnSightGoldDoubleList(value, currentTimeSet->declaredSteps,
                                                 lines, &lineIndex,
                                                 &currentTimeSet->timeValues,
+                                                &currentTimeSet->timeTokens,
                                                 errorMessage,
                                                 QStringLiteral("time values"))) {
                     return false;
@@ -3856,7 +4045,7 @@ bool parseEnSightGoldCaseSource(const QString& casePath,
     }
     if (!foundGoldFormat) {
         if (errorMessage != nullptr) {
-            *errorMessage = QStringLiteral("The selected *.case file is not an EnSight Gold case.");
+            *errorMessage = QStringLiteral("The selected file is not an EnSight Gold case.");
         }
         return false;
     }
@@ -3909,6 +4098,7 @@ bool buildEnSightGoldInventoryFromCases(
     inventory->clear();
     QStringList paths;
     QSet<QString> identities;
+    QHash<QString, QString> identityByPath;
     qint64 aggregatePathBytes = 0;
     auto appendPath = [&](const QString& path) {
         const QString normalized = normalizedPath(QFileInfo(path).absoluteFilePath());
@@ -3927,6 +4117,7 @@ bool buildEnSightGoldInventoryFromCases(
             return false;
         }
         identities.insert(identity);
+        identityByPath.insert(normalized, identity);
         paths.append(normalized);
         aggregatePathBytes += pathBytes;
         return true;
@@ -3942,8 +4133,8 @@ bool buildEnSightGoldInventoryFromCases(
             }
         }
     }
-    std::sort(paths.begin(), paths.end(), [](const QString& lhs, const QString& rhs) {
-        return sourcePathIdentityKey(lhs) < sourcePathIdentityKey(rhs);
+    std::sort(paths.begin(), paths.end(), [&](const QString& lhs, const QString& rhs) {
+        return identityByPath.value(lhs) < identityByPath.value(rhs);
     });
 
     inventory->reserve(paths.size());
@@ -3975,7 +4166,7 @@ bool buildEnSightGoldInventoryFromCases(
             inventory->clear();
             return false;
         }
-        QCryptographicHash hash(QCryptographicHash::Sha256);
+        StreamingFileSha256 hash(path);
         qint64 hashedBytes = 0;
         while (!file.atEnd()) {
             if (shouldCancel && shouldCancel()) {
@@ -3994,7 +4185,10 @@ bool buildEnSightGoldInventoryFromCases(
                 inventory->clear();
                 return false;
             }
-            hash.addData(chunk);
+            if (!hash.addData(chunk, errorMessage)) {
+                inventory->clear();
+                return false;
+            }
             hashedBytes += chunk.size();
             if (progress) {
                 const qint64 totalChunks = std::max<qint64>(1,
@@ -4026,7 +4220,12 @@ bool buildEnSightGoldInventoryFromCases(
         FlowDataSourceFingerprint fingerprint;
         fingerprint.path = sourcePathIdentity(path);
         fingerprint.size = before.size();
-        fingerprint.sha256Hex = QString::fromLatin1(hash.result().toHex());
+        QByteArray digest;
+        if (!hash.result(&digest, errorMessage)) {
+            inventory->clear();
+            return false;
+        }
+        fingerprint.sha256Hex = QString::fromLatin1(digest.toHex());
         inventory->append(fingerprint);
         if (progress) {
             progress(QStringLiteral("Hashing EnSight source dependencies"),
@@ -4038,17 +4237,8 @@ bool buildEnSightGoldInventoryFromCases(
 }
 
 bool enSightGoldSourceLooksLarge(const EnSightGoldCaseSource& source) {
-    QStringList resolvedPaths;
-    for (const EnSightGoldReference& reference : source.references) {
-        for (const QString& path : reference.resolvedPaths) {
-            if (!containsSourcePath(resolvedPaths, path)) {
-                resolvedPaths.append(path);
-            }
-        }
-    }
-
     qint64 aggregateBytes = 0;
-    for (const QString& path : std::as_const(resolvedPaths)) {
+    for (const QString& path : source.referencedPaths) {
         const qint64 bytes = QFileInfo(path).size();
         if (bytes >= kLargeEnSightGoldSingleFileBytes) {
             return true;
@@ -4072,6 +4262,17 @@ bool anyEnSightGoldSourceLooksLarge(const QVector<EnSightGoldCaseSource>& cases)
         }
     }
     return false;
+}
+
+double enSightGoldTimeQuantum(const QVector<EnSightGoldCaseSource>& cases) {
+    double quantum = std::numeric_limits<double>::infinity();
+    for (const EnSightGoldCaseSource& source : cases) {
+        if (!std::isfinite(source.timeQuantum) || source.timeQuantum <= 0.0) {
+            return 0.0;
+        }
+        quantum = std::min(quantum, source.timeQuantum);
+    }
+    return std::isfinite(quantum) ? quantum : 0.0;
 }
 
 QStringList arrayInfoNames(const QList<ArrayInfo>& arrays) {
@@ -4187,7 +4388,7 @@ bool loadEnSightGoldCaseSources(const QStringList& sources,
             continue;
         }
         if (errorMessage != nullptr) {
-            *errorMessage = QString("Duplicate EnSight Gold time code %1 was found in both:\n%2\n%3\nEach selected *.case frame must have a unique time code.")
+            *errorMessage = QString("Duplicate EnSight Gold time code %1 was found in both:\n%2\n%3\nEach selected case frame must have a unique time code.")
                                 .arg(formatDouble(current.timeValue),
                                      enSightGoldSourceName(*cases, previous.caseIndex),
                                      enSightGoldSourceName(*cases, current.caseIndex));
@@ -4241,7 +4442,7 @@ bool copyAndVerifySnapshotFile(const QString& sourcePath,
     }
 
     constexpr qint64 kCopyChunkBytes = 4 * 1024 * 1024;
-    QCryptographicHash hash(QCryptographicHash::Sha256);
+    StreamingFileSha256 hash(sourcePath);
     qint64 copiedBytes = 0;
     while (!source.atEnd()) {
         if (shouldCancel && shouldCancel()) {
@@ -4277,7 +4478,10 @@ bool copyAndVerifySnapshotFile(const QString& sourcePath,
             destination.cancelWriting();
             return false;
         }
-        hash.addData(chunk);
+        if (!hash.addData(chunk, errorMessage)) {
+            destination.cancelWriting();
+            return false;
+        }
         if (progress) {
             const qint64 totalChunks = std::max<qint64>(
                 1, (expected.size + kCopyChunkBytes - 1) / kCopyChunkBytes);
@@ -4293,7 +4497,12 @@ bool copyAndVerifySnapshotFile(const QString& sourcePath,
     }
     source.close();
     const QFileInfo after(sourcePath);
-    const QString copiedHash = QString::fromLatin1(hash.result().toHex());
+    QByteArray digest;
+    if (!hash.result(&digest, errorMessage)) {
+        destination.cancelWriting();
+        return false;
+    }
+    const QString copiedHash = QString::fromLatin1(digest.toHex());
     if (copiedBytes != expected.size || copiedHash != expected.sha256Hex
         || !after.exists() || !after.isFile() || after.isSymLink()
         || after.size() != before.size()
@@ -4801,8 +5010,13 @@ bool materializeEnSightGoldSnapshotCase(
             }
             QStringList timeValues;
             timeValues.reserve(timeSet.timeValues.size());
-            for (const double value : timeSet.timeValues) {
-                timeValues.append(formatMachineDouble(value));
+            for (qsizetype index = 0; index < timeSet.timeValues.size(); ++index) {
+                const QString originalToken = timeSet.timeTokens.value(index);
+                // Preserve the export precision used by the time-axis policy
+                // across the immutable snapshot. Long legal numeric tokens
+                // still need normalization for VTK's 254-byte line buffer.
+                timeValues.append(!originalToken.isEmpty() && originalToken.toUtf8().size() <= 254
+                    ? originalToken : formatMachineDouble(timeSet.timeValues.at(index)));
             }
             appendWrappedSnapshotValues(QStringLiteral("time values"),
                                         timeValues, &outputLines);
@@ -5022,8 +5236,7 @@ bool FlowDataInspector::materializeEnSightGoldSourceSnapshot(
             }
             return false;
         }
-        const QString suffix = QFileInfo(fingerprint.path).suffix()
-                                   .compare(QStringLiteral("case"), Qt::CaseInsensitive) == 0
+        const QString suffix = isEnSightGoldCaseSuffix(QFileInfo(fingerprint.path).suffix())
             ? QStringLiteral("case")
             : QStringLiteral("src");
         const QString copyPath = normalizedPath(
@@ -5491,7 +5704,7 @@ bool fingerprintStableRegularFile(
         return false;
     }
     constexpr qint64 kHashChunkBytes = 4 * 1024 * 1024;
-    QCryptographicHash hash(QCryptographicHash::Sha256);
+    StreamingFileSha256 hash(filePath);
     qint64 hashedBytes = 0;
     while (!file.atEnd()) {
         if (shouldCancel && shouldCancel()) {
@@ -5508,7 +5721,9 @@ bool fingerprintStableRegularFile(
             }
             return false;
         }
-        hash.addData(chunk);
+        if (!hash.addData(chunk, errorMessage)) {
+            return false;
+        }
         hashedBytes += chunk.size();
         if (progress) {
             constexpr int kProgressUnits = 1000;
@@ -5539,7 +5754,11 @@ bool fingerprintStableRegularFile(
     }
     fingerprint->path = sourcePathIdentity(filePath);
     fingerprint->size = before.size();
-    fingerprint->sha256Hex = QString::fromLatin1(hash.result().toHex());
+    QByteArray digest;
+    if (!hash.result(&digest, errorMessage)) {
+        return false;
+    }
+    fingerprint->sha256Hex = QString::fromLatin1(digest.toHex());
     return true;
 }
 
@@ -5645,6 +5864,8 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
     bool rootSeen = false;
     bool rootClosed = false;
     bool collectionSeen = false;
+    bool hasEnSightTimeQuantum = false;
+    double enSightTimeQuantum = 0.0;
     QXmlStreamReader xml(pvdPayload);
     while (!xml.atEnd()) {
         if (canceled()) {
@@ -5663,6 +5884,17 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
                         != QStringLiteral("Collection")) {
                     return reject(QStringLiteral(
                         "Converted PVD root must be exactly one VTKFile of type Collection."));
+                }
+                hasEnSightTimeQuantum = xml.attributes().hasAttribute(kEnSightTimeQuantumAttribute);
+                if (hasEnSightTimeQuantum) {
+                    bool quantumOk = false;
+                    enSightTimeQuantum = xml.attributes().value(kEnSightTimeQuantumAttribute)
+                        .toString().toDouble(&quantumOk);
+                    if (!quantumOk || !std::isfinite(enSightTimeQuantum)
+                        || enSightTimeQuantum <= 0.0) {
+                        return reject(QStringLiteral(
+                            "Converted PVD EnSight time quantum must be finite and positive."));
+                    }
                 }
                 rootSeen = true;
                 elementStack.append(elementName);
@@ -5812,29 +6044,16 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
     }
 
     double dt = 1.0;
-    if (timeValues.size() > 1) {
-        dt = timeValues.at(1) - timeValues.at(0);
-        if (!std::isfinite(dt) || dt <= 0.0) {
-            return reject(QStringLiteral(
-                "Converted PVD timesteps must be strictly increasing."));
-        }
-        for (qsizetype index = 2; index < timeValues.size(); ++index) {
-            const double current = timeValues.at(index);
-            const double previous = timeValues.at(index - 1);
-            const double expected = std::fma(static_cast<double>(index),
-                                             dt, timeValues.first());
-            const double magnitude = std::max(std::abs(current), std::abs(expected));
-            const double tolerance = std::abs(dt)
-                    * static_cast<double>(index) * 1.0e-10
-                + std::numeric_limits<double>::epsilon() * magnitude * 8.0
-                + std::numeric_limits<double>::denorm_min() * 16.0;
-            if (!std::isfinite(current) || !(current > previous)
-                || !std::isfinite(expected)
-                || std::abs(current - expected) > tolerance) {
-                return reject(QStringLiteral(
-                    "Converted PVD uses a non-uniform time axis that cannot be represented by one dt value."));
-            }
-        }
+    bool approximateTimeAxis = false;
+    QString timeAxisError;
+    if (!enSightTimeInterval(timeValues, enSightTimeQuantum, &dt,
+                             &approximateTimeAxis, &result.warningMessage,
+                             &timeAxisError, QStringLiteral("Converted PVD"))) {
+        return reject(timeAxisError);
+    }
+    if (hasEnSightTimeQuantum && !approximateTimeAxis) {
+        return reject(QStringLiteral(
+            "Converted PVD EnSight time quantum is only valid for an approximately uniform EnSight export time axis."));
     }
 
     auto effectiveDimension = [](const VtkDataSummary& summary) {
@@ -5851,6 +6070,7 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
     validatedFrameInfos.reserve(referencedFiles.size());
     QVector<FlowDataSourceFingerprint> preParseFrameFingerprints;
     preParseFrameFingerprints.reserve(referencedFiles.size());
+    bool movingMeshWarningReported = false;
     for (qsizetype index = 0; index < referencedFiles.size(); ++index) {
         if (canceled()) {
             return reject(QStringLiteral("Converted PVD staging validation interrupted."));
@@ -5919,9 +6139,10 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
                                   .arg(referencedFiles.at(index)));
             }
             if (coordinateCheck && !sameCoordinates(firstFrame, frame)
-                && result.warningMessage.isEmpty()) {
-                result.warningMessage = QStringLiteral(
-                    "Converted PVD contains changed mesh coordinates; dimensions and all frame field schemas were still validated.");
+                && !movingMeshWarningReported) {
+                appendScanWarning(&result.warningMessage, QStringLiteral(
+                    "Converted PVD contains changed mesh coordinates; dimensions and all frame field schemas were still validated."));
+                movingMeshWarningReported = true;
             }
         }
         validatedFrameInfos.append(frameAfter);
@@ -5967,7 +6188,7 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
                                       .arg(filePath, file.errorString());
             return false;
         }
-        QCryptographicHash hash(QCryptographicHash::Sha256);
+        StreamingFileSha256 hash(filePath);
         constexpr qint64 kHashChunkBytes = 4 * 1024 * 1024;
         qint64 hashedBytes = 0;
         while (!file.atEnd()) {
@@ -5983,7 +6204,9 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
                                           .arg(filePath, file.errorString());
                 return false;
             }
-            hash.addData(chunk);
+            if (!hash.addData(chunk, &result.errorMessage)) {
+                return false;
+            }
             hashedBytes += chunk.size();
             if (progress) {
                 constexpr int kProgressUnits = 1000;
@@ -6019,7 +6242,11 @@ FlowDataScanResult FlowDataInspector::scanConvertedPvdFolder(
         }
         fingerprint->path = sourcePathIdentity(filePath);
         fingerprint->size = before.size();
-        fingerprint->sha256Hex = QString::fromLatin1(hash.result().toHex());
+        QByteArray digest;
+        if (!hash.result(&digest, &result.errorMessage)) {
+            return false;
+        }
+        fingerprint->sha256Hex = QString::fromLatin1(digest.toHex());
         return true;
     };
 
@@ -6490,7 +6717,10 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         timeValues.append(frame.timeValue);
     }
     double dt = 0.0;
-    if (!uniformTimeInterval(timeValues, &dt, &result.errorMessage)) {
+    bool approximateTimeAxis = false;
+    if (!enSightTimeInterval(timeValues, enSightGoldTimeQuantum(cases), &dt,
+                             &approximateTimeAxis, &result.warningMessage,
+                             &result.errorMessage)) {
         return result;
     }
     result.entry.dt = formatDouble(dt);
@@ -6510,7 +6740,7 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
             for (int index = 1; index < cases.size(); ++index) {
                 commonFields = intersectFieldNames(commonFields, arrayInfoNames(cases.at(index).arrays));
                 if (commonFields.isEmpty()) {
-                    result.errorMessage = QStringLiteral("No numeric EnSight Gold variables are declared in every selected *.case file.");
+                    result.errorMessage = QStringLiteral("No numeric EnSight Gold variables are declared in every selected case file.");
                     return result;
                 }
             }
@@ -6530,13 +6760,13 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         result.entry.zRange.clear();
         if (result.termCandidates.isEmpty()) {
             result.errorMessage = commonFieldsOnly
-                ? QStringLiteral("No numeric EnSight Gold variables are declared in every selected *.case file.")
+                ? QStringLiteral("No numeric EnSight Gold variables are declared in every selected case file.")
                 : QStringLiteral("The EnSight Gold case does not declare numeric variables.");
             return result;
         }
-        result.warningMessage = coordinateCheck
-            ? QStringLiteral("EnSight Gold validation used *.case metadata only because the referenced native files are large. Coordinate ranges were not loaded during validation.")
-            : QStringLiteral("EnSight Gold validation used *.case metadata only because the referenced native files are large.");
+        appendScanWarning(&result.warningMessage, coordinateCheck
+            ? QStringLiteral("EnSight Gold validation used case metadata only because the referenced native files are large. Coordinate ranges were not loaded during validation.")
+            : QStringLiteral("EnSight Gold validation used case metadata only because the referenced native files are large."));
         if (progress) {
             progress(QStringLiteral("Validating EnSight Gold case"), 2, 2);
             if (canceled()) {
@@ -6604,6 +6834,7 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
         }
     }
 
+    bool movingMeshWarningReported = false;
     if (validateEveryFrame) {
         for (int index = 1; index < frames.size(); ++index) {
             if (canceled()) {
@@ -6618,13 +6849,14 @@ FlowDataScanResult FlowDataInspector::scanEnSightGoldCases(const QStringList& ca
                 result.errorMessage = frameError;
                 return result;
             }
-            if (coordinateCheck && coordinateSignature(frame) != firstCoordinateSignature &&
-                result.warningMessage.isEmpty()) {
-                result.warningMessage = QString("EnSight Gold frame coordinates differ from the first frame at time %1 in %2.\nFirst bounds: %3\nCurrent bounds: %4\nImport will continue; verify the combined dataset before analysis.")
+            if (coordinateCheck && coordinateSignature(frame) != firstCoordinateSignature
+                && !movingMeshWarningReported) {
+                appendScanWarning(&result.warningMessage, QString("EnSight Gold frame coordinates differ from the first frame at time %1 in %2.\nFirst bounds: %3\nCurrent bounds: %4\nImport will continue; verify the combined dataset before analysis.")
                                             .arg(formatDouble(frameSource.timeValue),
                                                  cases.at(frameSource.caseIndex).path,
                                                  firstBoundsText,
-                                                 boundsSummary(frame));
+                                                 boundsSummary(frame)));
+                movingMeshWarningReported = true;
             }
             if (commonFieldsOnly) {
                 commonFields = intersectFieldNames(commonFields, actualArrayNames(frame));
@@ -6806,6 +7038,18 @@ bool FlowDataInspector::convertEnSightGoldCasesToPvd(const QStringList& casePath
     if (frames.isEmpty()) {
         return fail(QStringLiteral("The EnSight Gold case does not contain any readable frames."));
     }
+    QVector<double> timeValues;
+    timeValues.reserve(frames.size());
+    for (const EnSightGoldFrameSource& frameSource : std::as_const(frames)) {
+        timeValues.append(frameSource.timeValue);
+    }
+    const double declaredTimeQuantum = enSightGoldTimeQuantum(cases);
+    double effectiveInterval = 0.0;
+    bool approximateTimeAxis = false;
+    if (!enSightTimeInterval(timeValues, declaredTimeQuantum, &effectiveInterval,
+                             &approximateTimeAxis, nullptr, &readerError)) {
+        return fail(readerError);
+    }
     QString geometryCompatibilityError;
     if (!checkEnSightGoldSourcesForVtk(cases, &geometryCompatibilityError)) {
         return fail(geometryCompatibilityError);
@@ -6815,8 +7059,6 @@ bool FlowDataInspector::convertEnSightGoldCasesToPvd(const QStringList& casePath
     }
 
     const QString baseName = pvdBaseName.trimmed().isEmpty() ? QStringLiteral("ensight_gold") : pvdBaseName.trimmed();
-    QVector<double> timeValues;
-    timeValues.reserve(frames.size());
     QStringList relativeFramePaths;
     relativeFramePaths.reserve(frames.size());
     for (int index = 0; index < frames.size(); ++index) {
@@ -6867,7 +7109,6 @@ bool FlowDataInspector::convertEnSightGoldCasesToPvd(const QStringList& casePath
                             .arg(index + 1)
                             .arg(framePath));
         }
-        timeValues.append(frameSource.timeValue);
         relativeFramePaths.append(frameName);
         if (progress) {
             progress(QStringLiteral("Converting EnSight Gold case"), index + 1, frames.size() + 1);
@@ -6876,7 +7117,8 @@ bool FlowDataInspector::convertEnSightGoldCasesToPvd(const QStringList& casePath
 
     const QString pvdPath = normalizedPath(QDir(destinationFolder).absoluteFilePath(baseName + QStringLiteral(".pvd")));
     QString pvdError;
-    if (!writePvdFile(pvdPath, timeValues, relativeFramePaths, &pvdError)) {
+    if (!writePvdFile(pvdPath, timeValues, relativeFramePaths, &pvdError,
+                      approximateTimeAxis ? declaredTimeQuantum : 0.0)) {
         return fail(pvdError);
     }
     if (progress) {

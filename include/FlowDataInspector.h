@@ -55,6 +55,10 @@ public:
                                                bool startEndFieldsOnly,
                                                const ProgressCallback& progress = {},
                                                const CancellationCallback& shouldCancel = {});
+    // Accepts .case and Fluent .encas descriptors. A one-step geometry time
+    // set is reusable with transient variables. Decimal export precision may
+    // support an explicitly warned effective dt; original native frame times
+    // remain unchanged through snapshots and PVD conversion.
     static FlowDataScanResult scanEnSightGoldCase(const QString& casePath,
                                                   FlowDataKind dataKind,
                                                   bool coordinateCheck,

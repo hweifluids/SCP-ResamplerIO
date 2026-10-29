@@ -8,8 +8,10 @@
 #include <vector>
 
 #include <vtkSmartPointer.h>
+#include <streamcenterplus/EnSightTimePolicy.h>
 
 class vtkDataArray;
+class vtkDataObject;
 class vtkDataSet;
 class vtkDoubleArray;
 class vtkPolyData;
@@ -113,6 +115,10 @@ struct DataSetFrame {
     // source-zone choice made while enumerating the manifest, so every frame
     // in a modal sequence uses identical reference topology.
     int multiZoneBackgroundIndex = -1;
+    // Present only after the complete EnSight source/PVD axis passed the
+    // bounded decimal-quantization policy. Original timestamps stay in time;
+    // this full-axis provenance survives contiguous or regular-stride subsets.
+    std::optional<ensight_time::TimeFrameProvenance> ensightTime;
 };
 
 struct ReadOptions {
@@ -138,6 +144,10 @@ struct ReadOptions {
     // fail-closed policy; ordinary single-grid reads retain their established
     // fast path and VTK error-handling behavior.
     bool failOnVtkXmlReadErrors = false;
+    // EnSight commonly exports a volume together with separate boundary parts.
+    // Analysis uses the 3-D parts when any exist; all parts remain available
+    // for surface-only sources or when this option is explicitly enabled.
+    bool includeEnSightBoundaryParts = false;
 };
 
 struct Nek5000SpectralMetadata {
@@ -319,6 +329,7 @@ private:
 };
 
 std::string ToString(DataSetFrameKind kind);
+std::optional<double> ValidatedEnSightTimeStep(const std::vector<DataSetFrame>& frames);
 bool IsSupportedDataSource(const std::filesystem::path& sourcePath);
 // Returns true only for a syntactically valid Streamcenter+ two-zone manifest.
 // A manifest is intentionally a source, rather than a new solver input type:
@@ -328,7 +339,10 @@ bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath);
 
 // Enumerates logical frames without converting the source to an intermediate
 // VTK file.  Direct sources include VTK data, Tecplot ASCII (.dat) and classic
-// binary PLT (.plt) finite-element data. A directory is treated as an OpenFOAM
+// binary PLT (.plt) finite-element data, Nek5000 descriptors, and EnSight Gold
+// descriptors (.case or Fluent .encas, with case-insensitive extensions).
+// EnSight frames retain native times, including a static geometry time set
+// shared by transient variable frames. A directory is treated as an OpenFOAM
 // case when it contains a *.foam marker (or a recognizable
 // system/constant/processor layout), and as a normal frame directory otherwise.
 // Exactly one .pvd collection in a normal frame directory is authoritative;
@@ -344,6 +358,16 @@ vtkSmartPointer<vtkDataSet> ReadDataSet(
     const ReadOptions& options = {});
 vtkSmartPointer<vtkDataSet> ReadDataSet(
     const DataSetFrame& frame,
+    const ReadOptions& options = {});
+
+// Shared EnSight assembly for native readers and conversion/import consumers.
+// A part is volumetric if any of its cell types has dimension three. If such
+// parts exist, separate lower-dimensional parts are excluded by default; cells
+// of different dimensions within a retained part are kept together. Pure 2-D
+// sources retain every part. Composite point boundaries and source-block IDs
+// follow ReadOptions, with original nonempty part ordinals retained as IDs.
+vtkSmartPointer<vtkDataSet> CollapseEnSightGoldDataObject(
+    vtkDataObject* object,
     const ReadOptions& options = {});
 
 // Returns true only when the complete Nek5000 metadata contract is present and

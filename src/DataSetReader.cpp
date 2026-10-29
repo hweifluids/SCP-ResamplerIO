@@ -2,6 +2,7 @@
 #include "TecplotReader.h"
 
 #include <streamcenterplus/VtkHdfIO.h>
+#include <streamcenterplus/EnSightHdfTimeMetadata.h>
 
 #include <vtkAppendFilter.h>
 #include <vtkBox.h>
@@ -10,6 +11,7 @@
 #include <vtkCellArray.h>
 #include <vtkCellSizeFilter.h>
 #include <vtkCellType.h>
+#include <vtkCellTypes.h>
 #include <vtkCallbackCommand.h>
 #include <vtkClipDataSet.h>
 #include <vtkContourFilter.h>
@@ -32,6 +34,7 @@
 #include <vtkIdList.h>
 #include <vtkIntArray.h>
 #include <vtkNew.h>
+#include <vtkMultiBlockDataSet.h>
 #include <vtkNonMergingPointLocator.h>
 #include <vtkOpenFOAMReader.h>
 #include <vtkPOpenFOAMReader.h>
@@ -67,6 +70,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -123,6 +127,10 @@ bool IsOrdinaryVtkExtension(const std::string& extension) {
 
 bool IsTecplotExtension(const std::string& extension) {
     return extension == ".dat" || extension == ".plt";
+}
+
+bool IsEnSightGoldExtension(const std::string& extension) {
+    return extension == ".case" || extension == ".encas";
 }
 
 bool IsDirectDataExtension(const std::string& extension) {
@@ -734,13 +742,18 @@ vtkSmartPointer<vtkDataSet> CloneDataSet(vtkDataSet* input) {
 }
 
 void CollectDataSets(vtkDataObject* object,
-                     std::vector<vtkSmartPointer<vtkDataSet>>* dataSets) {
+                     std::vector<vtkSmartPointer<vtkDataSet>>* dataSets,
+                     bool cloneDataSets = true) {
     if (object == nullptr || dataSets == nullptr) {
         return;
     }
     if (vtkDataSet* dataSet = vtkDataSet::SafeDownCast(object)) {
         if (dataSet->GetNumberOfPoints() > 0) {
-            dataSets->push_back(CloneDataSet(dataSet));
+            if (cloneDataSets) {
+                dataSets->push_back(CloneDataSet(dataSet));
+            } else {
+                dataSets->push_back(dataSet);
+            }
         }
         return;
     }
@@ -756,7 +769,7 @@ void CollectDataSets(vtkDataObject* object,
     iterator->SkipEmptyNodesOn();
     for (iterator->InitTraversal(); !iterator->IsDoneWithTraversal();
          iterator->GoToNextItem()) {
-        CollectDataSets(iterator->GetCurrentDataObject(), dataSets);
+        CollectDataSets(iterator->GetCurrentDataObject(), dataSets, cloneDataSets);
     }
 }
 
@@ -2353,7 +2366,11 @@ vtkSmartPointer<vtkGenericEnSightReader> CreateEnSightGoldReader(
     bool readAllArrays) {
     vtkSmartPointer<vtkGenericEnSightReader> reader =
         vtkSmartPointer<vtkGenericEnSightReader>::New();
-    reader->SetCaseFileName(casePath.string().c_str());
+    // VTK checks for '/' before '\\' rather than choosing the last separator
+    // of either kind. Filesystem joins on Windows can produce a mixed path.
+    const std::string normalizedCasePath =
+        std::filesystem::absolute(casePath).lexically_normal().generic_string();
+    reader->SetCaseFileName(normalizedCasePath.c_str());
     if (readAllArrays) {
         reader->ReadAllVariablesOn();
     } else {
@@ -2363,7 +2380,7 @@ vtkSmartPointer<vtkGenericEnSightReader> CreateEnSightGoldReader(
     const int version = reader->GetEnSightVersion();
     if (version != vtkGenericEnSightReader::ENSIGHT_GOLD &&
         version != vtkGenericEnSightReader::ENSIGHT_GOLD_BINARY) {
-        throw std::runtime_error("The .case source is not EnSight Gold: " +
+        throw std::runtime_error("The source is not EnSight Gold: " +
                                  casePath.string());
     }
     if (readAllArrays) {
@@ -2413,6 +2430,129 @@ std::vector<double> EnSightGoldTimeSteps(vtkGenericEnSightReader* reader) {
     return values;
 }
 
+struct EnSightTimeMetadata {
+    std::vector<double> times;
+    std::vector<std::string> tokens;
+};
+
+EnSightTimeMetadata ReadEnSightTimeMetadata(const std::filesystem::path& casePath) {
+    struct TimeSet {
+        int count = 0;
+        EnSightTimeMetadata axis;
+    };
+    std::ifstream input(casePath);
+    std::map<int, TimeSet> timeSets;
+    std::vector<int> geometrySets;
+    std::vector<int> variableSets;
+    std::string section;
+    int currentSet = 0;
+    bool collectingTimes = false;
+    const auto leadingId = [](const std::string& payload) {
+        std::istringstream stream(payload);
+        std::string token;
+        stream >> token;
+        try {
+            std::size_t consumed = 0;
+            const int value = std::stoi(token, &consumed);
+            return consumed == token.size() && value > 0 ? value : 0;
+        } catch (const std::exception&) {
+            return 0;
+        }
+    };
+    for (std::string line; std::getline(input, line);) {
+        line = StripComment(line);
+        if (line.empty()) {
+            continue;
+        }
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos &&
+            std::isalpha(static_cast<unsigned char>(line.front()))) {
+            section = ToLower(line);
+            collectingTimes = false;
+            continue;
+        }
+        const std::string key = colon == std::string::npos
+                                    ? std::string() : ToLower(TrimAscii(line.substr(0, colon)));
+        const std::string payload = colon == std::string::npos
+                                        ? line : TrimAscii(line.substr(colon + 1));
+        if (section == "geometry" && key == "model") {
+            if (const int id = leadingId(payload)) {
+                geometrySets.push_back(id);
+            }
+        } else if (section == "variable" &&
+                   (key.find("per node") != std::string::npos ||
+                    key.find("per element") != std::string::npos)) {
+            if (const int id = leadingId(payload)) {
+                variableSets.push_back(id);
+            }
+        } else if (section == "time") {
+            if (key == "time set") {
+                currentSet = leadingId(payload);
+                collectingTimes = false;
+            } else if (currentSet > 0 && key == "number of steps") {
+                const int count = leadingId(payload);
+                if (count <= 0 || count > 1000000) {
+                    return {};
+                }
+                timeSets[currentSet].count = count;
+            } else if (currentSet > 0 && (key == "time values" ||
+                                         (key.empty() && collectingTimes))) {
+                TimeSet& set = timeSets[currentSet];
+                if (set.count <= 0) {
+                    return {};
+                }
+                collectingTimes = true;
+                std::istringstream tokens(payload);
+                for (std::string token; tokens >> token;) {
+                    if (set.axis.times.size() >= static_cast<std::size_t>(set.count)) {
+                        return {};
+                    }
+                    try {
+                        std::size_t consumed = 0;
+                        const double value = std::stod(token, &consumed);
+                        if (consumed != token.size() || !std::isfinite(value)) {
+                            return {};
+                        }
+                        set.axis.times.push_back(value);
+                        set.axis.tokens.push_back(token);
+                    } catch (const std::exception&) {
+                        return {};
+                    }
+                }
+            } else if (!key.empty()) {
+                collectingTimes = false;
+            }
+        }
+    }
+    std::set<int> volumeSets(variableSets.begin(), variableSets.end());
+    int staticGeometrySet = 0;
+    for (int id : geometrySets) {
+        if (timeSets[id].count == 1) {
+            staticGeometrySet = id;
+        } else {
+            volumeSets.insert(id);
+        }
+    }
+    if (volumeSets.size() > 1) {
+        throw std::runtime_error(
+            "EnSight Gold volume geometry/variables use multiple asynchronous time sets: " +
+            casePath.string());
+    }
+    const int primarySet = volumeSets.empty() ? staticGeometrySet : *volumeSets.begin();
+    const auto selected = timeSets.find(primarySet);
+    if (selected == timeSets.end() || selected->second.count <= 0 ||
+        selected->second.axis.times.size() != static_cast<std::size_t>(selected->second.count)) {
+        return {};
+    }
+    for (std::size_t index = 1; index < selected->second.axis.times.size(); ++index) {
+        if (!(selected->second.axis.times[index] > selected->second.axis.times[index - 1])) {
+            throw std::runtime_error("EnSight Gold times must be finite and strictly increasing: " +
+                                     casePath.string());
+        }
+    }
+    return selected->second.axis;
+}
+
 vtkSmartPointer<vtkDataSet> ReadEnSightGold(const DataSetFrame& frame,
                                            const ReadOptions& options) {
     vtkSmartPointer<vtkGenericEnSightReader> reader =
@@ -2423,7 +2563,7 @@ vtkSmartPointer<vtkDataSet> ReadEnSightGold(const DataSetFrame& frame,
         throw std::runtime_error("VTK failed to read EnSight Gold time " +
                                  std::to_string(time) + " from " + frame.path.string());
     }
-    return CollapseDataObject(reader->GetOutputDataObject(0), options, frame.path);
+    return CollapseEnSightGoldDataObject(reader->GetOutputDataObject(0), options);
 }
 
 bool HostIsLittleEndian() {
@@ -4176,6 +4316,7 @@ std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
     }
     std::ostringstream text;
     text << input.rdbuf();
+    const auto timeQuantum = ensight_time::PvdTimeQuantum(text.str());
     const std::vector<PvdDataSetReference> references =
         ParsePvdDataSetReferences(text.str(), path);
     std::vector<DataSetFrame> frames;
@@ -4198,6 +4339,24 @@ std::vector<DataSetFrame> ParsePvd(const std::filesystem::path& path,
             frames.push_back(std::move(expanded.front()));
         } else {
             frames.insert(frames.end(), expanded.begin(), expanded.end());
+        }
+    }
+    if (timeQuantum.has_value()) {
+        std::vector<double> times;
+        for (const DataSetFrame& frame : frames) {
+            times.push_back(frame.time);
+        }
+        const auto assessment = ensight_time::AssessTimeAxis(times, *timeQuantum);
+        if (!assessment.valid || !assessment.approximate ||
+            references.size() != frames.size() ||
+            !std::all_of(references.begin(), references.end(),
+                         [](const PvdDataSetReference& ref) { return ref.timestep.has_value(); })) {
+            throw std::runtime_error("Invalid or unnecessary EnSight time quantum in PVD: " +
+                                     path.string());
+        }
+        for (std::size_t index = 0; index < frames.size(); ++index) {
+            frames[index].ensightTime = ensight_time::TimeFrameProvenance{
+                *timeQuantum, assessment.interval, times.front(), times.size(), index};
         }
     }
     return frames;
@@ -4273,7 +4432,7 @@ std::vector<DataSetFrame> EnumerateFolder(const std::filesystem::path& folder,
         }
         if (!IsDirectDataExtension(extension) && extension != ".nek5000" &&
             extension != ".nek" &&
-            extension != ".case") {
+            !IsEnSightGoldExtension(extension)) {
             continue;
         }
         const std::vector<DataSetFrame> local =
@@ -5335,6 +5494,61 @@ std::string ToString(DataSetFrameKind kind) {
     throw std::runtime_error("Unknown dataset frame kind.");
 }
 
+std::optional<double> ValidatedEnSightTimeStep(const std::vector<DataSetFrame>& frames) {
+    std::vector<double> times;
+    std::vector<ensight_time::TimeFrameProvenance> provenance;
+    for (const DataSetFrame& frame : frames) {
+        if (!frame.ensightTime.has_value()) {
+            return std::nullopt;
+        }
+        times.push_back(frame.time);
+        provenance.push_back(*frame.ensightTime);
+    }
+    return ensight_time::ValidatedTimeStep(times, provenance);
+}
+
+vtkSmartPointer<vtkDataSet> CollapseEnSightGoldDataObject(
+    vtkDataObject* object,
+    const ReadOptions& options) {
+    if (options.includeEnSightBoundaryParts) {
+        return CollapseDataObject(object, options, "EnSight Gold source");
+    }
+    // Inspect original parts before cloning: Fluent boundary parts can carry
+    // a full global point array despite containing only surface cells.
+    std::vector<vtkSmartPointer<vtkDataSet>> parts;
+    CollectDataSets(object, &parts, false);
+    vtkNew<vtkMultiBlockDataSet> volumeParts;
+    vtkNew<vtkCellTypes> cellTypes;
+    for (std::size_t partIndex = 0; partIndex < parts.size(); ++partIndex) {
+        vtkDataSet* part = parts[partIndex];
+        cellTypes->Reset();
+        part->GetCellTypes(cellTypes);
+        bool hasVolumeCell = false;
+        for (vtkIdType index = 0; index < cellTypes->GetNumberOfTypes(); ++index) {
+            if (vtkCellTypes::GetDimension(cellTypes->GetCellType(index)) == 3) {
+                hasVolumeCell = true;
+                break;
+            }
+        }
+        if (!hasVolumeCell) {
+            continue;
+        }
+        vtkSmartPointer<vtkDataSet> selectedPart;
+        selectedPart.TakeReference(vtkDataSet::SafeDownCast(part->NewInstance()));
+        if (selectedPart == nullptr) {
+            throw std::runtime_error("Cannot retain an EnSight Gold volume part.");
+        }
+        selectedPart->ShallowCopy(part);
+        if (options.attachSourceBlockIds) {
+            AttachSourceBlockId(selectedPart, static_cast<int>(partIndex));
+        }
+        volumeParts->SetBlock(volumeParts->GetNumberOfBlocks(), selectedPart);
+    }
+    return CollapseDataObject(volumeParts->GetNumberOfBlocks() > 0 ? volumeParts.GetPointer()
+                                                                  : object,
+                              options, "EnSight Gold source");
+}
+
 bool IsMultiZoneMeshManifest(const std::filesystem::path& sourcePath) {
     if (LowerExtension(sourcePath) != ".scpm") {
         return false;
@@ -5360,7 +5574,7 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
             const std::string extension = LowerExtension(entry.path());
             if (IsDirectDataExtension(extension) || extension == ".pvd" ||
                 extension == ".nek5000" || extension == ".nek" ||
-                extension == ".case") {
+                IsEnSightGoldExtension(extension)) {
                 return true;
             }
         }
@@ -5376,7 +5590,7 @@ bool IsSupportedDataSource(const std::filesystem::path& sourcePath) {
     }
     return IsDirectDataExtension(extension) || extension == ".pvd" ||
            (extension == ".nek5000" || extension == ".nek") ||
-           extension == ".case" ||
+           IsEnSightGoldExtension(extension) ||
            extension == ".foam";
 }
 
@@ -5472,10 +5686,14 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
         }
         return frames;
     }
-    if (extension == ".case") {
+    if (IsEnSightGoldExtension(extension)) {
         vtkSmartPointer<vtkGenericEnSightReader> reader =
             CreateEnSightGoldReader(sourcePath, true);
-        const std::vector<double> times = EnSightGoldTimeSteps(reader);
+        const EnSightTimeMetadata metadata = ReadEnSightTimeMetadata(sourcePath);
+        const std::vector<double> times = metadata.times.empty()
+                                              ? EnSightGoldTimeSteps(reader) : metadata.times;
+        const double quantum = ensight_time::DecimalTimeQuantum(metadata.tokens);
+        const auto assessment = ensight_time::AssessTimeAxis(times, quantum);
         std::vector<DataSetFrame> frames;
         frames.reserve(times.size());
         for (std::size_t i = 0; i < times.size(); ++i) {
@@ -5485,6 +5703,10 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
             frame.kind = DataSetFrameKind::EnSightGoldTimeStep;
             frame.readerTime = times[i];
             frame.sourceIndex = static_cast<int>(i);
+            if (assessment.valid && assessment.approximate) {
+                frame.ensightTime = ensight_time::TimeFrameProvenance{
+                    quantum, assessment.interval, times.front(), times.size(), i};
+            }
             frames.push_back(std::move(frame));
         }
         return frames;
@@ -5498,8 +5720,27 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
             : streamcenterplus::vtkhdf::ExpandTimeSteps(sourcePath);
     const bool isVtkHdf = streamcenterplus::vtkhdf::IsVtkHdfPath(sourcePath);
     std::vector<double> nativeTimes;
+    std::vector<double> fullNativeTimes;
+    std::optional<double> hdfQuantum;
+    ensight_time::TimeAxisAssessment hdfAssessment;
+    vtkIdType selectedHdfStep = -1;
     if (isVtkHdf) {
-        nativeTimes = streamcenterplus::vtkhdf::TimeValues(sourcePath);
+        fullNativeTimes = streamcenterplus::vtkhdf::TimeValues(sourcePath);
+        hdfQuantum = streamcenterplus::vtkhdf::EnSightTimeQuantum(sourcePath);
+        hdfAssessment = ensight_time::AssessTimeAxis(fullNativeTimes, hdfQuantum.value_or(0.0));
+        if (hdfQuantum.has_value() && (!hdfAssessment.valid || !hdfAssessment.approximate)) {
+            throw std::runtime_error("Invalid or unnecessary EnSight time quantum in VTKHDF: " +
+                                     sourcePath.string());
+        }
+        streamcenterplus::vtkhdf::ParseStepToken(sourcePath, nullptr, &selectedHdfStep);
+        if (selectedHdfStep >= 0) {
+            if (static_cast<std::size_t>(selectedHdfStep) >= fullNativeTimes.size()) {
+                throw std::runtime_error("VTKHDF selected time step is out of range.");
+            }
+            nativeTimes = {fullNativeTimes[static_cast<std::size_t>(selectedHdfStep)]};
+        } else {
+            nativeTimes = fullNativeTimes;
+        }
         if (nativeTimes.size() != expanded.size() ||
             !std::all_of(nativeTimes.cbegin(), nativeTimes.cend(), IsFiniteTime)) {
             throw std::runtime_error(
@@ -5520,6 +5761,12 @@ std::vector<DataSetFrame> EnumerateDataSetFrames(
         // overwrite non-uniform transient times.
         if (isVtkHdf) {
             frame.readerTime = nativeTimes[i];
+            if (hdfQuantum.has_value()) {
+                frame.ensightTime = ensight_time::TimeFrameProvenance{
+                    *hdfQuantum, hdfAssessment.interval, fullNativeTimes.front(),
+                    fullNativeTimes.size(), selectedHdfStep >= 0
+                                               ? static_cast<std::size_t>(selectedHdfStep) : i};
+            }
         }
         frame.sourceIndex = static_cast<int>(i);
         frames.push_back(std::move(frame));

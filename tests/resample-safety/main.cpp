@@ -365,10 +365,18 @@ void TestInvalidInputPreservesOutputs(const fs::path& root) {
     fs::create_directories(caseCollisionOutput);
     WriteText(caseCollisionOutput / "COLLISION.PVD", "keep-case-collision");
     params = BasicParameters(validInput, caseCollisionOutput, "collision");
-    ExpectThrows([&] { (void)resample::RunSolver(params); },
-                 "aliases an existing filesystem entry");
+    const std::string caseCollisionError =
+        ExpectThrows([&] { (void)resample::RunSolver(params); }, "");
+    // Case-insensitive filesystems reject the alias during canonicalization;
+    // case-sensitive ones reject the same reserved namespace during ownership
+    // preflight. Both must preserve the unowned file and produce no new frame.
+    Require(caseCollisionError.find("aliases an existing filesystem entry") != std::string::npos ||
+            caseCollisionError.find("namespace already contains files") != std::string::npos,
+            "A case collision was rejected for an unrelated reason: " + caseCollisionError);
     Require(ReadText(caseCollisionOutput / "COLLISION.PVD") == "keep-case-collision",
             "A case-insensitive unowned namespace collision was overwritten.");
+    Require(!fs::exists(caseCollisionOutput / "collision_f000000.vti"),
+            "A case collision produced output before ownership validation.");
 }
 
 void TestContentBoundResumeAndOwnedCleanup(const fs::path& root) {

@@ -357,6 +357,41 @@ bool TryVector3i(const std::map<std::string, std::string>& raw,
     return true;
 }
 
+void ParseClusterJobHints(const std::map<std::string, std::string>& raw,
+                          Parameters* params) {
+    if (params == nullptr) {
+        return;
+    }
+    auto& hints = params->cluster;
+    TryBool(raw,
+            {"cluster.package", "cluster.package_requested", "cluster.enabled",
+             "hpc.package", "hpc.enabled"},
+            &hints.packageRequested);
+    TryString(raw,
+              {"cluster.package_path", "cluster.output", "cluster.package_file",
+               "hpc.package_path", "hpc.output", "job_package"},
+              &hints.packagePath);
+    TryString(raw, {"cluster.payload_mode", "hpc.payload_mode"}, &hints.payloadMode);
+    TryString(raw, {"cluster.control_format", "hpc.control_format"}, &hints.controlFormat);
+    TryString(raw,
+              {"cluster.partition_mode", "hpc.partition_mode", "partition_mode"},
+              &hints.partitionMode);
+    TryString(raw, {"cluster.scheduler", "hpc.scheduler"}, &hints.scheduler);
+    TryString(raw, {"cluster.queue", "hpc.queue"}, &hints.queue);
+    TryString(raw, {"cluster.walltime", "hpc.walltime"}, &hints.walltime);
+    TryInt(raw, {"cluster.nodes", "hpc.nodes"}, &hints.nodes);
+    TryInt(raw, {"cluster.ranks", "hpc.ranks", "mpi_ranks"}, &hints.ranks);
+    TryInt(raw, {"cluster.gpus", "hpc.gpus"}, &hints.gpus);
+    TryInt(raw, {"cluster.gpus_per_node", "hpc.gpus_per_node"}, &hints.gpusPerNode);
+    TryInt(raw,
+           {"cluster.cpu_threads_per_rank", "hpc.cpu_threads_per_rank"},
+           &hints.cpuThreadsPerRank);
+    TryDouble(raw, {"cluster.memory_gb", "hpc.memory_gb"}, &hints.memoryGb);
+    if (!hints.packagePath.empty()) {
+        hints.packageRequested = true;
+    }
+}
+
 bool IsAutoText(const std::string& rawValue) {
     const std::string value = ToLower(StripQuotes(rawValue));
     return value == "all" || value == "auto" || value == "default" ||
@@ -647,6 +682,11 @@ void ValidateParametersImpl(Parameters* params) {
     }
     if (params->physicalDt <= 0.0 || !std::isfinite(params->physicalDt)) {
         throw std::runtime_error("physical_dt/dt must be positive when provided.");
+    }
+    if (params->cluster.nodes < 0 || params->cluster.ranks < 0 ||
+        params->cluster.gpus < 0 || params->cluster.gpusPerNode < 0 ||
+        params->cluster.cpuThreadsPerRank < 0 || params->cluster.memoryGb < 0.0) {
+        throw std::runtime_error("cluster resource hints must be non-negative.");
     }
     if (params->frameRange.start.has_value() && *params->frameRange.start < 0) {
         throw std::runtime_error("frame_range/T_range start must be non-negative.");
@@ -964,6 +1004,7 @@ Parameters LoadParameters(const std::filesystem::path& deckFile) {
               &params.kriging.fallbackIdwPower);
 
     ParseEnums(raw, &params);
+    ParseClusterJobHints(raw, &params);
     ValidateParameters(&params);
     return params;
 }
@@ -1016,6 +1057,26 @@ std::string PrettyPrint(const Parameters& params) {
     out << "Regularization:         " << FormatDouble(params.kriging.regularization) << "\n";
     out << "Fallback:               " << ToString(params.kriging.fallback) << "\n";
     out << "Fallback IDW power:     " << FormatDouble(params.kriging.fallbackIdwPower) << "\n";
+    if (streamcenterplus::HasClusterJobHints(params.cluster)) {
+        out << "\n=== Cluster Package Hints ===\n";
+        out << "Package requested:      " << FormatBool(params.cluster.packageRequested) << "\n";
+        out << "Package path:           "
+            << (params.cluster.packagePath.empty() ? "auto" : params.cluster.packagePath) << "\n";
+        out << "Payload mode:           " << params.cluster.payloadMode << "\n";
+        out << "Control format:         " << params.cluster.controlFormat << "\n";
+        out << "Partition mode:         " << params.cluster.partitionMode << "\n";
+        out << "Scheduler:              " << params.cluster.scheduler << "\n";
+        out << "Queue:                  "
+            << (params.cluster.queue.empty() ? "auto" : params.cluster.queue) << "\n";
+        out << "Walltime:               "
+            << (params.cluster.walltime.empty() ? "auto" : params.cluster.walltime) << "\n";
+        out << "Nodes:                  " << params.cluster.nodes << "\n";
+        out << "MPI ranks:              " << params.cluster.ranks << "\n";
+        out << "GPUs:                   " << params.cluster.gpus << "\n";
+        out << "GPUs per node:          " << params.cluster.gpusPerNode << "\n";
+        out << "CPU threads/rank:       " << params.cluster.cpuThreadsPerRank << "\n";
+        out << "Memory GB:              " << FormatDouble(params.cluster.memoryGb) << "\n";
+    }
     return out.str();
 }
 
